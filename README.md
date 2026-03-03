@@ -33,7 +33,6 @@ A fully local, privacy-first, autonomous OS-level AI agent for macOS — like JA
 
 ## Features
 
-- 🎤 **Full-duplex voice** — Barge-in interruption, streaming TTS, energy-based VAD
 - 🧠 **Local LLM** — Ollama `qwen2.5:3b` with streaming inference + native tool calling
 - 🗣️ **Streaming TTS** — Sentence-by-sentence speech; first words spoken while LLM still generates
 - 👁️ **Screen awareness** — Reads macOS accessibility trees, not screenshots
