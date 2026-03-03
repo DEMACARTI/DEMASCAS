@@ -1,0 +1,13 @@
+# DEMASCAS ignore rules
+
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+
+# Temporary audio files
+*.wav
+
+# OS files
+.DS_Store

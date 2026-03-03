@@ -1,0 +1,39 @@
+# DEMASCAS — Python Dependencies (Tool Server only)
+# Install with: pip install -r requirements.txt
+#
+# The C++ daemon handles audio capture (PortAudio), STT (whisper.cpp),
+# streaming LLM (libcurl), and TTS (macOS say) natively.
+# Python only runs the tool server that the daemon calls over HTTP.
+
+# Ollama client — used by tool server for learning context queries
+ollama
+
+# PDF summarization
+PyPDF2
+
+# File-system watcher (optional)
+watchdog
+
+# HTTP client (tool server internals)
+requests
+
+# Environment variables
+python-dotenv
+
+# Web browsing (Capability 2)
+ddgs
+beautifulsoup4
+
+# Persistent memory — ChromaDB RAG (Capability 3)
+chromadb
+
+# Tool micro-service for C++ daemon (Polyglot Architecture)
+flask
+
+# Audio buffer manipulation (used by sensors/vision numpy operations)
+numpy
+
+# MCP (Model Context Protocol) — OPTIONAL
+# DEMASCAS includes a built-in pure-Python MCP client (zero deps).
+# Only install the SDK if you want to build servers using the official SDK:
+# mcp                       # pip install mcp  (official Python MCP SDK)
