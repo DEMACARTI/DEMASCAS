@@ -11,3 +11,9 @@ __pycache__/
 
 # OS files
 .DS_Store
+
+# Whisper GGML models (auto-downloaded by scripts/build.sh)
+daemon/models/*.bin
+
+# C++ build artifacts
+daemon/build/
