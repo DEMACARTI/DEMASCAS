@@ -17,3 +17,11 @@ daemon/models/*.bin
 
 # C++ build artifacts
 daemon/build/
+
+# Large model directories (auto-downloaded by build.sh)
+daemon/models/kokoro-en-v0_19/
+daemon/models/sherpa-onnx/
+daemon/models/piper/
+
+# Shell config (personal)
+.zshrc

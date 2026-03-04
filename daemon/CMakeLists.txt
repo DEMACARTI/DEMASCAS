@@ -46,7 +46,7 @@ add_executable(demascas_daemon
     src/main.cpp
     src/audio_engine.cpp
     src/whisper_engine.cpp
-    src/ollama_client.cpp
+    src/llm_client.cpp
     src/tool_bridge.cpp
     src/tts.cpp
 )
@@ -62,6 +62,25 @@ target_link_libraries(demascas_daemon PRIVATE
     PkgConfig::PORTAUDIO
     nlohmann_json::nlohmann_json
 )
+
+# ── sherpa-onnx  (pre-built shared library — Kokoro neural TTS) ──────
+
+set(SHERPA_ONNX_DIR "${CMAKE_SOURCE_DIR}/models/sherpa-onnx")
+if(EXISTS "${SHERPA_ONNX_DIR}/lib")
+    message(STATUS "sherpa-onnx found at ${SHERPA_ONNX_DIR}")
+    target_include_directories(demascas_daemon PRIVATE "${SHERPA_ONNX_DIR}/include")
+    target_link_directories(demascas_daemon PRIVATE "${SHERPA_ONNX_DIR}/lib")
+    target_link_libraries(demascas_daemon PRIVATE sherpa-onnx-c-api)
+    target_compile_definitions(demascas_daemon PRIVATE HAS_SHERPA_ONNX=1)
+
+    # Embed rpath so the binary finds .dylibs without DYLD_LIBRARY_PATH
+    set_target_properties(demascas_daemon PROPERTIES
+        BUILD_RPATH   "${SHERPA_ONNX_DIR}/lib"
+        INSTALL_RPATH "${SHERPA_ONNX_DIR}/lib"
+    )
+else()
+    message(WARNING "sherpa-onnx NOT found — Kokoro TTS disabled, using macOS say")
+endif()
 
 # ── Apple Silicon optimisations ──────────────────────────────────────
 

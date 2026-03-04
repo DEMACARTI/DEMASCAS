@@ -26,11 +26,23 @@ public:
     AudioEngine(const AudioEngine&)            = delete;
     AudioEngine& operator=(const AudioEngine&) = delete;
 
-    /// Open the default input device and start capturing.
-    bool start();
+    /// Print all available audio input devices to stdout.
+    static void list_devices();
+
+    /// Open an input device and start capturing.
+    /// @param device_index  -1 = system default; otherwise a PortAudio device index.
+    bool start(int device_index = -1);
 
     /// Stop capturing and close the stream.
     void stop();
+
+    /// Check if the PortAudio stream is still active.
+    /// Returns false after macOS sleep/wake kills the audio device.
+    bool is_stream_healthy() const;
+
+    /// Full reinit: tear down PortAudio, re-enumerate devices, re-open stream.
+    /// Call this when is_stream_healthy() returns false (e.g. after sleep/wake).
+    bool reinit_on_wake(int device_index = -1);
 
     /// Record a fixed-duration chunk (for periodic wake-word scans).
     std::vector<float> capture_chunk(float seconds);
@@ -43,17 +55,16 @@ public:
     /// RMS energy of a buffer segment.
     static float rms(const float* data, size_t n);
 
+    /// Drain the ring buffer, returning all accumulated samples.
+    /// Used by barge-in detection to poll mic data while TTS plays.
+    std::vector<float> drain();
+
 private:
     /// PortAudio callback — runs on a high-priority audio thread.
-    /// NOTE: Uses a mutex (acceptable for 16 kHz voice on Apple
-    /// Silicon; swap for a lock-free ring if hard-RT is needed).
     static int pa_callback(const void* in, void* out,
                            unsigned long frames,
                            const PaStreamCallbackTimeInfo*,
                            PaStreamCallbackFlags, void* ud);
-
-    /// Drain the ring buffer, returning all accumulated samples.
-    std::vector<float> drain();
 
     PaStream*          stream_  = nullptr;
     std::vector<float> ring_;

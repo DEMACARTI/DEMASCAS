@@ -42,6 +42,10 @@ void WhisperEngine::shutdown() {
     if (base_) { whisper_free(base_); base_ = nullptr; }
 }
 
+void WhisperEngine::set_prompt(const std::string& prompt) {
+    prompt_ = prompt;
+}
+
 std::string WhisperEngine::transcribe_wake(const std::vector<float>& pcm) {
     return run(tiny_, pcm);
 }
@@ -65,6 +69,12 @@ std::string WhisperEngine::run(struct whisper_context* ctx,
     params.language         = "en";
     params.n_threads        = 4;   // M1 has 4 performance cores
     params.no_context       = true;
+
+    // Initial prompt — biases whisper towards expected vocabulary.
+    // Dramatically improves name recognition and reduces hallucinations.
+    if (!prompt_.empty()) {
+        params.initial_prompt = prompt_.c_str();
+    }
 
     if (whisper_full(ctx, params, pcm.data(),
                      static_cast<int>(pcm.size())) != 0) {

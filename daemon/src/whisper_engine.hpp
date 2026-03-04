@@ -37,9 +37,14 @@ public:
     /// Accurate transcription (base model, ~200 ms on M1).
     std::string transcribe_command(const std::vector<float>& pcm);
 
+    /// Set initial prompt context for better recognition.
+    void set_prompt(const std::string& prompt);
+
 private:
     std::string run(struct whisper_context* ctx,
                     const std::vector<float>& pcm);
+
+    std::string prompt_;
 
     struct whisper_context* tiny_ = nullptr;
     struct whisper_context* base_ = nullptr;

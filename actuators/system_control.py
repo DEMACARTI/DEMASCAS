@@ -11,14 +11,150 @@ OPTIMIZATIONS:
 """
 
 import subprocess
+import time
 
 # Timeout in seconds for AppleScript execution
 _ACTION_TIMEOUT = 10
+
+# ── Element Name Aliases ─────────────────────────────────────────────
+# Maps snake_case / LLM-hallucinated element names → ordered list of
+# visible labels the accessibility tree might use.
+# Used by normalize_element_name() to resolve LLM output to real UI names.
+
+ELEMENT_NAME_ALIASES: dict[str, list[str]] = {
+    # Gmail
+    "compose_button":         ["Compose", "Compose email", "New message"],
+    "compose":                ["Compose", "Compose email", "New message"],
+    "send_button":            ["Send", "Send ‪"],
+    "send":                   ["Send", "Send ‪"],
+    "to_field":               ["To", "To recipients", "Recipients"],
+    "subject_field":          ["Subject", "Subject field"],
+    "body_field":             ["Message Body", "Message body", "Body"],
+    "discard_draft":          ["Discard draft", "Discard", "Delete draft"],
+    "inbox":                  ["Inbox", "inbox"],
+    "starred":                ["Starred", "starred"],
+    "reply_button":           ["Reply", "Reply to sender"],
+    "reply_all_button":       ["Reply all", "Reply to all"],
+    "forward_button":         ["Forward", "Forward message"],
+    "archive_button":         ["Archive", "Move to Archive"],
+    "delete_button":          ["Delete", "Move to Trash", "Trash"],
+    "more_options":           ["More", "More options", "⋮"],
+    "attach_file":            ["Attach files", "Attach", "📎"],
+    # YouTube
+    "search_box":             ["Search", "Search YouTube", "search_box"],
+    "search_button":          ["Search", "Search button"],
+    "play_button":            ["Play", "Play video", "▶"],
+    "pause_button":           ["Pause", "Pause video", "⏸"],
+    "like_button":            ["Like", "Like this video", "👍"],
+    "subscribe_button":       ["Subscribe", "Subscribe to channel"],
+    # General browser
+    "address_bar":            ["Address and search bar", "URL bar", "Search or type URL"],
+    "back_button":            ["Back", "Go back", "Navigate back"],
+    "forward_nav":            ["Forward", "Go forward"],
+    "reload_button":          ["Reload", "Reload this page", "Refresh"],
+    "new_tab_button":         ["New Tab", "New tab"],
+    "close_tab":              ["Close", "Close tab"],
+    "downloads":              ["Downloads", "Show downloads"],
+    "bookmarks":              ["Bookmarks", "Show Bookmarks"],
+    "settings":               ["Settings", "Preferences"],
+    # General UI
+    "ok_button":              ["OK", "Ok", "ok"],
+    "cancel_button":          ["Cancel", "cancel"],
+    "close_button":           ["Close", "close", "✕", "×"],
+    "save_button":            ["Save", "Save file"],
+    "submit_button":          ["Submit", "Go", "Done"],
+    "next_button":            ["Next", "Continue", "next"],
+    "previous_button":        ["Previous", "Back", "Prev"],
+    "accept_button":          ["Accept", "Accept all", "I agree", "Allow"],
+    "decline_button":         ["Decline", "Reject", "Deny", "Block"],
+    "login_button":           ["Log in", "Login", "Sign in", "Sign In"],
+    "signup_button":          ["Sign up", "Sign Up", "Create account", "Register"],
+}
+
+
+def normalize_element_name(name: str) -> list[str]:
+    """
+    Given an element name (possibly snake_case or hallucinated),
+    return an ordered list of candidate names to try.
+
+    Order: exact name → alias expansions → title-cased → capitalized word forms.
+    """
+    candidates = [name]  # always try exact first
+    key = name.strip().lower().replace(" ", "_").replace("-", "_")
+
+    # Check aliases
+    if key in ELEMENT_NAME_ALIASES:
+        for alias in ELEMENT_NAME_ALIASES[key]:
+            if alias not in candidates:
+                candidates.append(alias)
+
+    # Also check the raw name lowered
+    if name.lower() in ELEMENT_NAME_ALIASES:
+        for alias in ELEMENT_NAME_ALIASES[name.lower()]:
+            if alias not in candidates:
+                candidates.append(alias)
+
+    # Auto-generate title case from snake_case: compose_button → Compose Button, Compose
+    if "_" in name:
+        words = name.split("_")
+        title = " ".join(w.capitalize() for w in words)
+        if title not in candidates:
+            candidates.append(title)
+        # Also just the first word capitalized (often the visible label)
+        first_word = words[0].capitalize()
+        if first_word not in candidates:
+            candidates.append(first_word)
+
+    return candidates
 
 
 def _sanitize_for_applescript(text: str) -> str:
     """Strip characters that could break or inject into AppleScript strings."""
     return text.replace('\\', '').replace('"', '').replace('\n', ' ').strip()
+
+
+def _build_key_command(keys: str) -> str:
+    """Build a single AppleScript key command for a shortcut string."""
+    parts = [p.strip().lower() for p in keys.split('+') if p.strip()]
+    if not parts:
+        raise ValueError("Empty keyboard shortcut")
+
+    key_char = parts[-1]
+    modifiers = parts[:-1]
+
+    modifier_map = {
+        'command': 'command down',
+        'cmd': 'command down',
+        'shift': 'shift down',
+        'option': 'option down',
+        'alt': 'option down',
+        'control': 'control down',
+        'ctrl': 'control down',
+    }
+
+    special_keys = {
+        'return': 36, 'enter': 36, 'escape': 53, 'esc': 53,
+        'tab': 48, 'space': 49, 'delete': 51, 'backspace': 51,
+        'forwarddelete': 117,
+        'up': 126, 'down': 125, 'left': 123, 'right': 124,
+        'home': 115, 'end': 119, 'pageup': 116, 'pagedown': 121,
+        'f1': 122, 'f2': 120, 'f3': 99, 'f4': 118, 'f5': 96,
+        'f6': 97, 'f7': 98, 'f8': 100, 'f9': 101, 'f10': 109,
+        'f11': 103, 'f12': 111,
+        'power': 127, 'volumeup': 72, 'volumedown': 73, 'mute': 74,
+    }
+
+    as_modifiers = ', '.join(modifier_map[m] for m in modifiers if m in modifier_map)
+
+    if key_char in special_keys:
+        code = special_keys[key_char]
+        if as_modifiers:
+            return f'key code {code} using {{{as_modifiers}}}'
+        return f'key code {code}'
+
+    if as_modifiers:
+        return f'keystroke "{key_char}" using {{{as_modifiers}}}'
+    return f'keystroke "{key_char}"'
 
 
 def click_ui_element(element_name: str) -> str:
@@ -29,13 +165,30 @@ def click_ui_element(element_name: str) -> str:
     Includes fast-path overrides for Apple's protected window controls
     (close, minimize, zoom).
 
+    Now supports element name normalization: tries the exact name first,
+    then alias expansions (compose_button → "Compose", "Compose email", etc.),
+    then auto-generated title-case variants.
+
     Args:
-        element_name: The exact name of the UI element as it appears in the
-                      accessibility tree (e.g. 'close button', 'Save').
+        element_name: The name of the UI element (exact or snake_case alias).
 
     Returns:
         A success/failure message string.
     """
+    candidates = normalize_element_name(element_name)
+
+    for candidate in candidates:
+        result = _click_ui_element_single(candidate)
+        if result.startswith("Success"):
+            return result
+
+    # All candidates failed
+    tried = ", ".join(f"'{c}'" for c in candidates[:5])
+    return f"Failed: Could not locate element. Tried: {tried}"
+
+
+def _click_ui_element_single(element_name: str) -> str:
+    """Click a single exact element name via AppleScript recursive search."""
     safe_name = _sanitize_for_applescript(element_name)
     print(f"[*] DEMASCAS is attempting to click: '{safe_name}'...")
 
@@ -99,6 +252,90 @@ def click_ui_element(element_name: str) -> str:
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
         return f"[-] Timeout: Click on '{safe_name}' took too long (app may be unresponsive)."
+    except subprocess.CalledProcessError as e:
+        return f"[-] Execution Error: {e.stderr}"
+
+
+def type_text(text: str, app_name: str = "", press_enter: bool = False,
+              focus_shortcut: str = "") -> str:
+    """
+    Types text into the currently focused field using keystroke injection.
+    Unlike type_text_into_element, this does NOT require knowing the exact
+    accessibility element name — it types into whatever is focused.
+
+    Optionally:
+      - Activates a specific app first (app_name)
+      - Presses a focus shortcut first (e.g. 'command+l' to focus Safari
+        address bar, 'command+k' for Spotlight in Slack, etc.)
+      - Presses Return/Enter after typing (press_enter)
+
+    Common patterns:
+      type_text("instagram.com", app_name="Safari",
+               focus_shortcut="command+l", press_enter=True)
+      → activates Safari, focuses address bar, types URL, presses Enter.
+
+    Args:
+        text: The string to type.
+        app_name: Optional app to activate before typing.
+        press_enter: If True, presses Return after typing.
+        focus_shortcut: Optional keyboard shortcut to press BEFORE typing
+                        (e.g. 'command+l' for address bar, 'command+a' to
+                        select all first). Uses same format as
+                        press_keyboard_shortcut.
+
+    Returns:
+        A success/failure message string.
+    """
+    safe_text = _sanitize_for_applescript(text)
+    print(f"[*] DEMASCAS is typing: '{safe_text}'" +
+          (f" in {app_name}" if app_name else "") +
+          (f" (focus: {focus_shortcut})" if focus_shortcut else "") +
+          (" + Enter" if press_enter else "") + "...")
+
+    # Build AppleScript
+    lines = []
+    lines.append('tell application "System Events"')
+
+    # Optionally activate the target app
+    if app_name:
+        safe_app = _sanitize_for_applescript(app_name)
+        lines.append(f'  tell application "{safe_app}" to activate')
+        lines.append('  delay 0.3')
+
+    # Optionally press a focus shortcut (e.g. Cmd+L for address bar)
+    if focus_shortcut:
+        try:
+            key_cmd = _build_key_command(focus_shortcut)
+            lines.append(f'  {key_cmd}')
+        except ValueError:
+            pass
+        lines.append('  delay 0.2')
+
+    # Type the text
+    lines.append(f'  keystroke "{safe_text}"')
+
+    # Optionally press Enter
+    if press_enter:
+        lines.append('  delay 0.1')
+        lines.append('  key code 36')  # Return key — 'keystroke return' causes -2741
+
+    lines.append('end tell')
+    if press_enter:
+        lines.append(f'return "Success: Typed \'{safe_text}\' + Enter."')
+    else:
+        lines.append(f'return "Success: Typed \'{safe_text}\'."')
+
+    applescript_code = '\n'.join(lines)
+
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', applescript_code],
+            capture_output=True, text=True, check=True,
+            timeout=_ACTION_TIMEOUT,
+        )
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "[-] Timeout: Typing took too long."
     except subprocess.CalledProcessError as e:
         return f"[-] Execution Error: {e.stderr}"
 
@@ -209,6 +446,82 @@ def open_application(app_name: str) -> str:
         return f"[-] Execution Error: {e.stderr}"
 
 
+def open_url(url: str, browser: str = "Safari") -> str:
+    """
+    Opens a URL in a macOS browser using AppleScript.
+    Activates the browser, then tells it to open the URL.
+
+    Args:
+        url: The URL to open (e.g. 'https://instagram.com', 'instagram.com').
+             A scheme (https://) is added automatically if missing.
+        browser: The browser app name (default 'Safari').
+                 Also supports 'Google Chrome', 'Firefox', etc.
+
+    Returns:
+        A success/failure message string.
+    """
+    safe_browser = _sanitize_for_applescript(browser)
+    # Sanitize URL — strip shell-dangerous chars but keep :// and standard URL chars
+    safe_url = url.replace('"', '').replace('\\', '').replace('`', '').strip()
+    if not safe_url.startswith(("http://", "https://")):
+        safe_url = "https://" + safe_url
+
+    print(f"[*] DEMASCAS is opening URL: '{safe_url}' in {safe_browser}...")
+
+    applescript_code = f"""
+    try
+        tell application "{safe_browser}"
+            activate
+            delay 0.3
+            open location "{safe_url}"
+        end tell
+        delay 0.5
+        return "Success: Opened '{safe_url}' in {safe_browser}."
+    on error errMsg
+        return "Failed: Could not open URL. Error: " & errMsg
+    end try
+    """
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', applescript_code],
+            capture_output=True, text=True, check=True,
+            timeout=_ACTION_TIMEOUT,
+        )
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return f"[-] Timeout: Opening URL in '{safe_browser}' took too long."
+    except subprocess.CalledProcessError as e:
+        return f"[-] Execution Error: {e.stderr}"
+
+
+def open_url_and_wait(url: str, browser: str = "Safari", wait_seconds: float = 3.0) -> str:
+    """
+    Opens a URL in a browser and waits for the page to stabilize.
+
+    Combines open_url with a screen stability check so the LLM can
+    reliably interact with the page after opening.
+
+    Args:
+        url: The URL to open (e.g. 'https://instagram.com').
+        browser: The browser app name (default 'Safari').
+        wait_seconds: Max seconds to wait for page load (default 3.0).
+
+    Returns:
+        Success/failure message with page load timing.
+    """
+    # Open the URL
+    result = open_url(url, browser)
+    if result.startswith("[-]"):
+        return result
+
+    # Wait for screen to settle (page loading → static)
+    stable_result = wait_for_screen_stable(
+        timeout=wait_seconds, interval=0.5, threshold=0.025
+    )
+
+    return f"{result} {stable_result}"
+
+
 def press_keyboard_shortcut(keys: str) -> str:
     """
     Sends a keyboard shortcut to the frontmost application.
@@ -222,47 +535,12 @@ def press_keyboard_shortcut(keys: str) -> str:
     """
     print(f"[*] DEMASCAS is pressing keyboard shortcut: '{keys}'...")
 
-    # Parse the combo into AppleScript modifiers + key
-    parts = [p.strip().lower() for p in keys.split('+')]
-    key_char = parts[-1]
-    modifiers = parts[:-1]
+    try:
+        key_cmd = _build_key_command(keys)
+    except ValueError:
+        return "[-] Invalid keyboard shortcut."
 
-    modifier_map = {
-        'command': 'command down',
-        'cmd': 'command down',
-        'shift': 'shift down',
-        'option': 'option down',
-        'alt': 'option down',
-        'control': 'control down',
-        'ctrl': 'control down',
-    }
-
-    # Special key names that need 'key code' instead of 'keystroke'
-    special_keys = {
-        'return': 36, 'enter': 36, 'escape': 53, 'esc': 53,
-        'tab': 48, 'space': 49, 'delete': 51, 'backspace': 51,
-        'forwarddelete': 117,
-        'up': 126, 'down': 125, 'left': 123, 'right': 124,
-        'home': 115, 'end': 119, 'pageup': 116, 'pagedown': 121,
-        'f1': 122, 'f2': 120, 'f3': 99, 'f4': 118, 'f5': 96,
-        'f6': 97, 'f7': 98, 'f8': 100, 'f9': 101, 'f10': 109,
-        'f11': 103, 'f12': 111,
-        'power': 127, 'volumeup': 72, 'volumedown': 73, 'mute': 74,
-    }
-
-    as_modifiers = ', '.join(modifier_map.get(m, '') for m in modifiers if m in modifier_map)
-
-    if key_char in special_keys:
-        code = special_keys[key_char]
-        if as_modifiers:
-            script = f'tell application "System Events" to key code {code} using {{{as_modifiers}}}'
-        else:
-            script = f'tell application "System Events" to key code {code}'
-    else:
-        if as_modifiers:
-            script = f'tell application "System Events" to keystroke "{key_char}" using {{{as_modifiers}}}'
-        else:
-            script = f'tell application "System Events" to keystroke "{key_char}"'
+    script = f'tell application "System Events" to {key_cmd}'
 
     try:
         subprocess.run(
@@ -580,3 +858,499 @@ def drag_element(from_element: str, to_element: str) -> str:
         return f"[-] Timeout during drag operation."
     except subprocess.CalledProcessError as e:
         return f"[-] Drag execution error: {e.stderr}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NEW AGENTIC TOOLS — human-like OS control for multi-step workflows
+# ══════════════════════════════════════════════════════════════════════
+
+
+def wait_for_element(element_name: str, timeout: int = 10) -> str:
+    """
+    Waits for a named UI element to appear in the frontmost app's
+    accessibility tree. Polls every 0.5s up to timeout.
+
+    Args:
+        element_name: The exact name of the UI element to wait for.
+        timeout:      Max seconds to wait (default 10).
+
+    Returns:
+        Success/failure message.
+    """
+    safe_name = _sanitize_for_applescript(element_name)
+    timeout = max(1, min(int(timeout), 30))
+    print(f"[*] DEMASCAS is waiting for element: '{safe_name}' (max {timeout}s)...")
+
+    applescript_code = f"""
+    tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        set targetName to "{safe_name}"
+
+        tell window 1 of frontApp
+            script Finder
+                on searchElement(parentElement, targetName)
+                    try
+                        set theElements to UI elements of parentElement
+                        repeat with elem in theElements
+                            try
+                                if name of elem is targetName then
+                                    return true
+                                end if
+                            end try
+                            if my searchElement(elem, targetName) is true then
+                                return true
+                            end if
+                        end repeat
+                    end try
+                    return false
+                end searchElement
+            end script
+
+            return Finder's searchElement(it, targetName)
+        end tell
+    end tell
+    """
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            result = subprocess.run(
+                ['osascript', '-e', applescript_code],
+                capture_output=True, text=True, check=True,
+                timeout=5,
+            )
+            if "true" in result.stdout.strip().lower():
+                return f"Success: Element '{safe_name}' found."
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            pass
+        time.sleep(0.5)
+
+    return f"[-] Timeout: Element '{safe_name}' not found after {timeout}s."
+
+
+def wait_for_app_ready(app_name: str, timeout: int = 10) -> str:
+    """
+    Waits for an application to be running and have at least one window.
+    Useful after open_application to ensure the app is fully loaded.
+
+    Args:
+        app_name: The application name to wait for.
+        timeout:  Max seconds to wait (default 10).
+
+    Returns:
+        Success/failure message.
+    """
+    safe_name = _sanitize_for_applescript(app_name)
+    timeout = max(1, min(int(timeout), 30))
+    print(f"[*] DEMASCAS is waiting for app: '{safe_name}' (max {timeout}s)...")
+
+    applescript_code = f"""
+    tell application "System Events"
+        try
+            set p to first application process whose name is "{safe_name}"
+            if (count of windows of p) > 0 then
+                return "ready"
+            else
+                return "no_window"
+            end if
+        on error
+            return "not_running"
+        end try
+    end tell
+    """
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            result = subprocess.run(
+                ['osascript', '-e', applescript_code],
+                capture_output=True, text=True, check=True,
+                timeout=5,
+            )
+            if "ready" in result.stdout.strip().lower():
+                return f"Success: '{safe_name}' is running with windows open."
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            pass
+        time.sleep(0.5)
+
+    return f"[-] Timeout: '{safe_name}' not ready after {timeout}s."
+
+
+def get_clipboard() -> str:
+    """
+    Returns the current contents of the macOS clipboard (text only).
+
+    Returns:
+        The clipboard text, or a failure message.
+    """
+    print("[*] DEMASCAS is reading clipboard...")
+    try:
+        result = subprocess.run(
+            ['pbpaste'],
+            capture_output=True, text=True, check=True,
+            timeout=_ACTION_TIMEOUT,
+        )
+        text = result.stdout
+        if not text:
+            return "Clipboard is empty."
+        # Truncate very long clipboard content
+        if len(text) > 2000:
+            text = text[:2000] + "... (truncated)"
+        return f"Clipboard contents: {text}"
+    except subprocess.TimeoutExpired:
+        return "[-] Timeout reading clipboard."
+    except subprocess.CalledProcessError as e:
+        return f"[-] Error reading clipboard: {e.stderr}"
+
+
+def set_clipboard(text: str) -> str:
+    """
+    Sets the macOS clipboard to the given text.
+
+    Args:
+        text: The text to copy to the clipboard.
+
+    Returns:
+        Success/failure message.
+    """
+    print(f"[*] DEMASCAS is setting clipboard to: '{text[:50]}...'")
+    try:
+        subprocess.run(
+            ['pbcopy'],
+            input=text, text=True, check=True,
+            timeout=_ACTION_TIMEOUT,
+        )
+        return f"Success: Copied text to clipboard ({len(text)} chars)."
+    except subprocess.TimeoutExpired:
+        return "[-] Timeout setting clipboard."
+    except subprocess.CalledProcessError as e:
+        return f"[-] Error setting clipboard: {e.stderr}"
+
+
+def find_and_click(search_text: str) -> str:
+    """
+    Searches the frontmost window's accessibility tree for ANY element
+    whose name contains search_text (case-insensitive partial match),
+    then clicks the first match. More forgiving than click_ui_element
+    which requires exact name match.
+
+    Args:
+        search_text: Partial text to search for in element names.
+
+    Returns:
+        Success/failure message.
+    """
+    safe_text = _sanitize_for_applescript(search_text)
+    print(f"[*] DEMASCAS is searching and clicking: '{safe_text}'...")
+
+    applescript_code = f"""
+    tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        set searchText to "{safe_text}"
+
+        tell window 1 of frontApp
+            script Finder
+                on searchAndClick(parentElement, searchText)
+                    try
+                        set theElements to UI elements of parentElement
+                        repeat with elem in theElements
+                            try
+                                set elemName to name of elem
+                                if elemName is not missing value then
+                                    -- Case-insensitive contains check
+                                    considering case
+                                        -- Convert to lowercase for comparison
+                                    end considering
+                                    ignoring case
+                                        if elemName contains searchText then
+                                            click elem
+                                            return elemName
+                                        end if
+                                    end ignoring
+                                end if
+                            end try
+                            set deeper to my searchAndClick(elem, searchText)
+                            if deeper is not "" then return deeper
+                        end repeat
+                    end try
+                    return ""
+                end searchAndClick
+            end script
+
+            set foundName to Finder's searchAndClick(it, searchText)
+            if foundName is not "" then
+                return "Success: Clicked element '" & foundName & "' (matched '" & searchText & "')"
+            else
+                return "Failed: No element containing '" & searchText & "' found in the UI tree."
+            end if
+        end tell
+    end tell
+    """
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', applescript_code],
+            capture_output=True, text=True, check=True,
+            timeout=_ACTION_TIMEOUT,
+        )
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return f"[-] Timeout: Search for '{safe_text}' took too long."
+    except subprocess.CalledProcessError as e:
+        return f"[-] Execution Error: {e.stderr}"
+
+
+def right_click_element(element_name: str) -> str:
+    """
+    Right-clicks (context menu click) a named UI element in the
+    frontmost app. Locates the element, gets its position, then
+    sends a right-click via CoreGraphics.
+
+    Args:
+        element_name: The exact name of the UI element to right-click.
+
+    Returns:
+        Success/failure message.
+    """
+    safe_name = _sanitize_for_applescript(element_name)
+    print(f"[*] DEMASCAS is right-clicking: '{safe_name}'...")
+
+    # Step 1: Find element position
+    applescript_code = f"""
+    tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        tell window 1 of frontApp
+            script Finder
+                on findPosition(parentElement, targetName)
+                    try
+                        set theElements to UI elements of parentElement
+                        repeat with elem in theElements
+                            try
+                                if name of elem is targetName then
+                                    set pos to position of elem
+                                    set sz to size of elem
+                                    set cx to (item 1 of pos) + (item 1 of sz) / 2
+                                    set cy to (item 2 of pos) + (item 2 of sz) / 2
+                                    return (cx as text) & "," & (cy as text)
+                                end if
+                            end try
+                            set deeper to my findPosition(elem, targetName)
+                            if deeper is not "" then return deeper
+                        end repeat
+                    end try
+                    return ""
+                end findPosition
+            end script
+
+            set pos to Finder's findPosition(it, "{safe_name}")
+            if pos is "" then
+                return "FAIL:NOT_FOUND"
+            end if
+            return pos
+        end tell
+    end tell
+    """
+
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', applescript_code],
+            capture_output=True, text=True, check=True,
+            timeout=_ACTION_TIMEOUT,
+        )
+        output = result.stdout.strip()
+
+        if output == "FAIL:NOT_FOUND":
+            return f"[-] Could not locate element: '{safe_name}'"
+
+        coords = output.split(",")
+        cx, cy = float(coords[0]), float(coords[1])
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
+            ValueError, IndexError) as e:
+        return f"[-] Failed to locate element: {e}"
+
+    # Step 2: Right-click via CoreGraphics
+    jxa_code = f"""
+    ObjC.import('CoreGraphics');
+    var x = {cx}, y = {cy};
+    var down = $.CGEventCreateMouseEvent(null, $.kCGEventRightMouseDown, $.CGPointMake(x, y), $.kCGMouseButtonRight);
+    $.CGEventPost($.kCGHIDEventTap, down);
+    delay(0.1);
+    var up = $.CGEventCreateMouseEvent(null, $.kCGEventRightMouseUp, $.CGPointMake(x, y), $.kCGMouseButtonRight);
+    $.CGEventPost($.kCGHIDEventTap, up);
+    """
+
+    try:
+        subprocess.run(
+            ['osascript', '-l', 'JavaScript', '-e', jxa_code],
+            capture_output=True, text=True, check=True,
+            timeout=_ACTION_TIMEOUT,
+        )
+        return f"Success: Right-clicked '{safe_name}'."
+    except subprocess.TimeoutExpired:
+        return f"[-] Timeout during right-click."
+    except subprocess.CalledProcessError as e:
+        return f"[-] Right-click error: {e.stderr}"
+
+
+def type_and_submit(text: str, app_name: str = "",
+                    focus_shortcut: str = "") -> str:
+    """
+    Types text and presses Enter — convenience wrapper for type_text
+    with press_enter=True. Common for search bars, address bars, forms.
+
+    Args:
+        text:           The text to type.
+        app_name:       Optional app to activate first.
+        focus_shortcut: Optional shortcut to press before typing
+                        (e.g. 'command+l' for address bar).
+
+    Returns:
+        Success/failure message.
+    """
+    return type_text(text, app_name=app_name, press_enter=True,
+                     focus_shortcut=focus_shortcut)
+
+
+def switch_tab(direction: str = "next") -> str:
+    """
+    Switches to the next or previous browser/app tab.
+
+    Args:
+        direction: 'next' (Cmd+Shift+]) or 'previous' (Cmd+Shift+[).
+                   Also accepts 'right'/'forward' for next,
+                   'left'/'back' for previous.
+
+    Returns:
+        Success/failure message.
+    """
+    direction = direction.strip().lower()
+    print(f"[*] DEMASCAS is switching tab: {direction}")
+
+    if direction in ("next", "right", "forward"):
+        keys = "command+shift+]"
+    elif direction in ("previous", "prev", "left", "back"):
+        keys = "command+shift+["
+    else:
+        return f"[-] Invalid direction: '{direction}'. Use 'next' or 'previous'."
+
+    return press_keyboard_shortcut(keys)
+
+
+def scroll_to_element(element_name: str, max_scrolls: int = 10) -> str:
+    """
+    Scrolls down in the frontmost window until a named element becomes
+    visible in the accessibility tree, then returns success.
+
+    Args:
+        element_name: The exact name of the element to scroll to.
+        max_scrolls:  Maximum number of scroll increments to try.
+
+    Returns:
+        Success/failure message.
+    """
+    safe_name = _sanitize_for_applescript(element_name)
+    max_scrolls = max(1, min(int(max_scrolls), 30))
+    print(f"[*] DEMASCAS is scrolling to find: '{safe_name}'...")
+
+    check_script = f"""
+    tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        tell window 1 of frontApp
+            script Finder
+                on searchElement(parentElement, targetName)
+                    try
+                        set theElements to UI elements of parentElement
+                        repeat with elem in theElements
+                            try
+                                if name of elem is targetName then return true
+                            end try
+                            if my searchElement(elem, targetName) is true then return true
+                        end repeat
+                    end try
+                    return false
+                end searchElement
+            end script
+            return Finder's searchElement(it, "{safe_name}")
+        end tell
+    end tell
+    """
+
+    for i in range(max_scrolls):
+        # Check if element is visible
+        try:
+            result = subprocess.run(
+                ['osascript', '-e', check_script],
+                capture_output=True, text=True, check=True,
+                timeout=5,
+            )
+            if "true" in result.stdout.strip().lower():
+                return f"Success: Found '{safe_name}' after {i} scrolls."
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            pass
+
+        # Scroll down
+        scroll_direction("down", clicks=3)
+        time.sleep(0.3)
+
+    return f"[-] Could not find '{safe_name}' after {max_scrolls} scrolls."
+
+
+# ── Smart waiting — replace fixed sleep() with active screen watching ──
+
+def wait_for_screen_stable(timeout: float = 5.0, interval: float = 0.5,
+                           threshold: float = 0.025) -> str:
+    """
+    Wait until the screen stops changing (UI has settled).
+    Takes repeated screenshots and compares pixel differences.
+
+    Uses macOS screencapture for zero-dependency operation.
+
+    Args:
+        timeout:   Maximum seconds to wait.
+        interval:  Seconds between comparison snapshots.
+        threshold: Fraction of pixels that must change to consider "unstable".
+
+    Returns:
+        Success message with how long it took, or timeout message.
+    """
+    import tempfile
+    import hashlib
+    import os
+
+    tmp_a = tempfile.mktemp(suffix='.png')
+    tmp_b = tempfile.mktemp(suffix='.png')
+
+    try:
+        # Take initial screenshot
+        subprocess.run(
+            ['screencapture', '-x', '-C', '-t', 'png', tmp_a],
+            capture_output=True, timeout=5,
+        )
+
+        start = time.time()
+        while time.time() - start < timeout:
+            time.sleep(interval)
+
+            # Take comparison screenshot
+            subprocess.run(
+                ['screencapture', '-x', '-C', '-t', 'png', tmp_b],
+                capture_output=True, timeout=5,
+            )
+
+            # Compare file hashes (fast, no PIL needed)
+            hash_a = hashlib.md5(open(tmp_a, 'rb').read()).hexdigest()
+            hash_b = hashlib.md5(open(tmp_b, 'rb').read()).hexdigest()
+
+            if hash_a == hash_b:
+                elapsed = time.time() - start
+                return f"Screen stable after {elapsed:.1f}s."
+
+            # Swap — new screenshot becomes the baseline
+            os.replace(tmp_b, tmp_a)
+
+        return f"Screen still changing after {timeout}s timeout."
+    except Exception as e:
+        return f"[-] wait_for_screen_stable error: {e}"
+    finally:
+        for f in [tmp_a, tmp_b]:
+            if os.path.exists(f):
+                os.unlink(f)

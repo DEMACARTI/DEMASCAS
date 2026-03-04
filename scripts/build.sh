@@ -70,6 +70,53 @@ for model in tiny base; do
     fi
 done
 
+# ── 3b. Download sherpa-onnx pre-built library (native arm64 TTS) ────
+
+echo "[3b/5] Checking sherpa-onnx library..."
+SHERPA_DIR="daemon/models/sherpa-onnx"
+SHERPA_VER="v1.12.28"
+
+if [ ! -d "$SHERPA_DIR/lib" ]; then
+    SHERPA_ASSET="sherpa-onnx-${SHERPA_VER}-osx-universal2-shared.tar.bz2"
+    SHERPA_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/${SHERPA_VER}/${SHERPA_ASSET}"
+    echo "     Downloading sherpa-onnx shared library (${SHERPA_ASSET})..."
+    curl -L --progress-bar -o "/tmp/sherpa-onnx.tar.bz2" "$SHERPA_URL"
+
+    mkdir -p "$SHERPA_DIR"
+    tar -xjf "/tmp/sherpa-onnx.tar.bz2" -C "$SHERPA_DIR" --strip-components=1
+    rm -f "/tmp/sherpa-onnx.tar.bz2"
+
+    if [ -d "$SHERPA_DIR/lib" ]; then
+        echo "     sherpa-onnx library ✓  (native arm64 + x86_64)"
+    else
+        echo "     ⚠️  sherpa-onnx download failed — will use macOS 'say' as fallback"
+    fi
+else
+    echo "     sherpa-onnx library ✓"
+fi
+
+# ── 3c. Download Kokoro TTS voice model ──────────────────────────────
+
+echo "[3c/5] Checking Kokoro TTS model..."
+KOKORO_DIR="daemon/models/kokoro-en-v0_19"
+
+if [ ! -f "$KOKORO_DIR/model.onnx" ]; then
+    KOKORO_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2"
+    echo "     Downloading Kokoro-82M voice model (~335 MB)..."
+    curl -L --progress-bar -o "/tmp/kokoro.tar.bz2" "$KOKORO_URL"
+
+    tar -xjf "/tmp/kokoro.tar.bz2" -C "daemon/models/"
+    rm -f "/tmp/kokoro.tar.bz2"
+
+    if [ -f "$KOKORO_DIR/model.onnx" ]; then
+        echo "     Kokoro model ✓  (82 M params, 24 kHz, 11 voices)"
+    else
+        echo "     ⚠️  Kokoro download failed — will use macOS 'say' as fallback"
+    fi
+else
+    echo "     Kokoro model ✓"
+fi
+
 # ── 4. Install Python dependencies ──────────────────────────────────
 
 echo "[4/5] Checking Python dependencies..."

@@ -5,10 +5,6 @@
  * The C++ daemon sends JSON payloads to localhost:5001; the Python
  * Flask server executes the tool and returns the result.  Latency
  * is sub-millisecond on loopback.
- *
- * Learning endpoints:
- *   GET  /context?query=...  — fetch learned context before Ollama call
- *   POST /learn              — log interaction after command completes
  */
 
 #pragma once
@@ -26,7 +22,7 @@ public:
     /// Block until the Python tool server responds to /health.
     bool wait_for_server(int max_retries = 10);
 
-    /// GET /tools — fetch Ollama-compatible tool schemas.
+    /// GET /tools — fetch tool schemas (OpenAI function-calling format).
     nlohmann::json fetch_tool_schemas();
 
     /// POST /tool — execute a named tool with JSON arguments.
@@ -48,7 +44,43 @@ public:
                          const std::string& result,
                          bool success = true);
 
-    // ── Static HTTP helpers (used by OllamaClient too) ─────────
+    // ── Tool filtering ──────────────────────────────────────────
+
+    /// POST /tools_for_query — fetch filtered tool schemas for a specific query.
+    /// Returns only the most relevant 3-8 tools instead of all 30.
+    nlohmann::json fetch_filtered_tools(const std::string& query,
+                                         int max_tools = 8);
+
+    // ── Screen context (PATH 4) ─────────────────────────────────
+
+    /// GET /screen_context — fetch structured screen digest.
+    /// Returns context_block string for system prompt injection.
+    std::string fetch_screen_context(bool force = false);
+
+    /// POST /deep_intent — fetch deep intent analysis for a command.
+    /// Returns task_type, task-specific prompt, people context, screen context.
+    struct DeepIntentResult {
+        std::string task_type;          // "compose_email", "smart_reply", etc.
+        std::string task_prompt;        // task-specific system prompt
+        std::string deep_intent_prompt; // deep intent system prompt
+        std::string screen_context;
+        std::string user_profile;
+        std::string people_context;
+    };
+    DeepIntentResult fetch_deep_intent(const std::string& command);
+
+    // ── Screen state extraction ─────────────────────────────────
+
+    /// Execute a tool and return both result and screen_state (if present).
+    /// screen_state is auto-captured by the server for UI-mutating tools.
+    struct ToolResult {
+        std::string result;
+        std::string screen_state;  // empty if not a UI-mutating tool
+    };
+    ToolResult execute_with_screen(const std::string& name,
+                                    const nlohmann::json& args);
+
+    // ── Static HTTP helpers (used by LLMClient too) ──────────
     static std::string http_post(const std::string& url,
                                   const std::string& body);
     static std::string http_get(const std::string& url);

@@ -129,6 +129,56 @@ std::string ToolBridge::execute(const std::string& name,
     }
 }
 
+// ── Tool execution with screen state ────────────────────────────────
+
+ToolBridge::ToolResult ToolBridge::execute_with_screen(
+    const std::string& name, const json& args) {
+
+    json payload = {{"name", name}, {"arguments", args}};
+    auto resp = http_post(cfg::TOOL_EXEC_URL, payload.dump());
+
+    ToolResult tr;
+    if (resp.empty()) {
+        tr.result = "[-] Tool server did not respond.";
+        return tr;
+    }
+
+    try {
+        auto j = json::parse(resp);
+        if (j.contains("error")) {
+            tr.result = "[-] " + j["error"].get<std::string>();
+            return tr;
+        }
+        tr.result = j.value("result", "[-] No result in response.");
+        tr.screen_state = j.value("screen_state", "");
+    } catch (...) {
+        tr.result = "[-] Invalid JSON from tool server.";
+    }
+
+    return tr;
+}
+
+// ── Filtered tool fetch ─────────────────────────────────────────────
+
+json ToolBridge::fetch_filtered_tools(const std::string& query,
+                                       int max_tools) {
+    json payload = {{"query", query}, {"max_tools", max_tools}};
+    auto resp = http_post(cfg::TOOL_SERVER_BASE + "/tools_for_query",
+                          payload.dump());
+    if (resp.empty()) return json::array();
+    try {
+        auto j = json::parse(resp);
+        if (j.is_array()) {
+            std::cout << "[ROUTER] Filtered to " << j.size()
+                      << " tools for query.\n";
+            return j;
+        }
+        return json::array();
+    } catch (...) {
+        return json::array();
+    }
+}
+
 // ── Learning: fetch learned context ─────────────────────────────────
 
 std::string ToolBridge::fetch_learned_context(const std::string& query) {
@@ -173,6 +223,48 @@ void ToolBridge::log_interaction(const std::string& command,
 
     // Fire-and-forget — ignore errors
     http_post(cfg::TOOL_SERVER_BASE + "/learn", payload.dump());
+}
+
+// ── Screen context fetch (PATH 4) ───────────────────────────────────
+
+std::string ToolBridge::fetch_screen_context(bool force) {
+    std::string url = cfg::TOOL_SERVER_BASE + "/screen_context";
+    if (force) url += "?force=true";
+
+    auto resp = http_get(url);
+    if (resp.empty()) return "";
+
+    try {
+        auto j = json::parse(resp);
+        return j.value("context_block", "");
+    } catch (...) {
+        return "";
+    }
+}
+
+// ── Deep intent analysis (PATH 4) ───────────────────────────────────
+
+ToolBridge::DeepIntentResult ToolBridge::fetch_deep_intent(
+    const std::string& command) {
+
+    DeepIntentResult result;
+    json payload = {{"command", command}};
+    auto resp = http_post(cfg::TOOL_SERVER_BASE + "/deep_intent",
+                          payload.dump());
+
+    if (resp.empty()) return result;
+
+    try {
+        auto j = json::parse(resp);
+        result.task_type          = j.value("task_type", "general");
+        result.task_prompt        = j.value("task_prompt", "");
+        result.deep_intent_prompt = j.value("deep_intent_prompt", "");
+        result.screen_context     = j.value("screen_context", "");
+        result.user_profile       = j.value("user_profile", "");
+        result.people_context     = j.value("people_context", "");
+    } catch (...) {}
+
+    return result;
 }
 
 }  // namespace demascas
