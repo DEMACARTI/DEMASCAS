@@ -1,0 +1,81 @@
+# DEMASCAS ignore rules
+
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary audio files
+*.wav
+*.mp3
+*.ogg
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Whisper GGML models (auto-downloaded by scripts/build.sh)
+daemon/models/*.bin
+
+# C++ build artifacts
+daemon/build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Large model directories (auto-downloaded by build.sh)
+daemon/models/kokoro-en-v0_19/
+daemon/models/sherpa-onnx/
+daemon/models/piper/
+daemon/models/ggml-*.bin
+
+# Memory and user data (contains personal information)
+.memory/
+~/.demascas/
+~/.cache/demascas/
+
+# Shell config (personal)
+.zshrc
+.bashrc
+.profile
+
+# Logs
+*.log
+logs/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+/tmp/demascas*
+/tmp/*.tmp
+
+# Local configuration with sensitive data
+config.json
+*.json.local
+
+# Disk image files (if any)
+*.img
+*.iso
+
+# CMake cache
+CMakeCache.txt
+CMakeFiles/
+
+# Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+env/
+.venv/
+env.bak/
+venv.bak/
