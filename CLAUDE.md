@@ -4,18 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Quick Start
 
+### macOS
+
 ```bash
 # Build the C++ daemon (first time or after C++ changes)
-./scripts/build.sh
+./scripts/build_mac.sh
 
 # Run full stack (4 processes: MLX text server + tool server + C++ daemon)
 source ../venv/bin/activate
 ./scripts/run.sh
 ```
 
+### Linux (Arch Linux)
+
+```bash
+# Build the C++ daemon (installs deps: xdotool, libatspi2, espeak-ng, xclip)
+./scripts/build_linux_arch.sh
+
+# Run full stack
+source ../venv/bin/activate
+./scripts/run.sh
+```
+
 ## Architecture Overview
 
-DEMASCAS is a **polyglot C++/Python** voice-controlled macOS agent — like JARVIS for your Mac. All processing runs 100% locally on Apple Silicon.
+DEMASCAS is a **polyglot C++/Python** voice-controlled agent — like JARVIS for your computer. Runs 100% locally on Apple Silicon (macOS) or x86_64/aarch64 (Linux).
 
 ### Four Processes
 
@@ -48,11 +61,13 @@ core/
   prompt_templates.py — Task-specific prompts for deep intent
 
 actuators/
-  system_control.py — Click, type, shortcuts, drag, scroll, clipboard
-  browser.py        — Brave Browser automation via JS injection (~720 lines)
-  web_agent.py      — Autonomous web agent (~430 lines)
-  file_system.py    — PDF summary, file create/delete/find/open
-  communication.py  — Email compose/read, smart reply
+  system_control.py       — macOS: Click, type, shortcuts via AppleScript
+  system_control_linux.py — Linux: Click, type, shortcuts via xdotool + AT-SPI2
+  browser.py              — macOS: Brave Browser automation via AppleScript
+  browser_linux.py        — Linux: Cross-platform browser automation via Playwright
+  web_agent.py            — Autonomous web agent (~430 lines)
+  file_system.py          — PDF summary, file create/delete/find/open
+  communication.py        — Email compose/read, smart reply
 
 daemon/src/
   main.cpp          — State machine: SLEEPING→LISTENING→PROCESSING→CONFIRMING
@@ -115,13 +130,36 @@ After changing config, rebuild: `./scripts/build.sh`
 | ChromaDB + Python server | ~110MB |
 | **Total** | **~4.4GB** (with VLM) / **~2.8GB** (without) |
 
+### Linux RAM Budget (varies by model)
+
+| Component | RAM |
+|-----------|-----|
+| Ollama (gemma4:31b-cloud or local model) | ~2-18GB (model-dependent) |
+| whisper.cpp models | ~222MB |
+| Kokoro TTS | ~335MB |
+| ChromaDB + Python server | ~110MB |
+| **Total** | **~3-20GB** (depends on LLM choice) |
+
 ## Troubleshooting
+
+### macOS
 
 | Problem | Solution |
 |---------|----------|
 | Port 8081/5001 in use | `lsof -ti:PORT | xargs kill` |
-| Daemon not built | `./scripts/build.sh` |
+| Daemon not built | `./scripts/build_mac.sh` |
 | No mic input | System Settings → Privacy → Microphone → Terminal |
 | Accessibility denied | System Settings → Privacy → Accessibility → Terminal |
 | TTS falls back to `say` | Check `USE_KOKORO=true` in `config.hpp`, verify model files |
-| PDF summarization fails | Requires Ollama: `brew install ollama && ollama pull qwen2.5:3b` |
+| PDF summarization fails | Requires Ollama: `brew install ollama && ollama pull gemma4:31b-cloud` |
+
+### Linux (Arch)
+
+| Problem | Solution |
+|---------|----------|
+| Build fails | Run `./scripts/build_linux_arch.sh` with sudo (installs deps) |
+| TTS silent | Install espeak-ng: `sudo pacman -S espeak-ng` |
+| UI automation fails | Install: `sudo pacman -S xdotool libatspi2 python-pyatspi xclip` |
+| Browser automation fails | Run: `playwright install chromium` |
+| No mic input | Check PulseAudio/PipeWire: `pavucontrol` |
+| Accessibility denied | Enable AT-SPI2: ensure `at-spi2-core` is installed |

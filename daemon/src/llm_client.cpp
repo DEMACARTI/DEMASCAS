@@ -559,7 +559,7 @@ void LLMClient::prewarm() {
     std::string health = ToolBridge::http_get(base + "/v1/models");
     if (health.empty()) {
         std::cerr << "[!] LLM server not responding.\n";
-        std::cerr << "    Linux:   ollama run qwen2.5:3b\n";
+        std::cerr << "    Linux:   ollama run gemma4:31b-cloud\n";
         std::cerr << "    macOS:   python -m mlx_lm.server --model mlx-community/Qwen2.5-3B-Instruct-4bit --port 8081\n";
         return;
     }

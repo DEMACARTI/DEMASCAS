@@ -35,31 +35,71 @@ from actuators.file_system import (
     find_file, open_file,
 )
 from actuators.network import search_web, read_webpage
-from actuators.system_control import (
-    click_ui_element,
-    open_application,
-    open_url,
-    open_url_and_wait,
-    press_keyboard_shortcut,
-    type_text,
-    type_text_into_element,
-    quit_application,
-    activate_application,
-    list_running_applications,
-    scroll_direction,
-    drag_element,
-    wait_for_element,
-    wait_for_app_ready,
-    get_clipboard,
-    set_clipboard,
-    find_and_click,
-    right_click_element,
-    type_and_submit,
-    switch_tab,
-    scroll_to_element,
-)
+
+# Platform-specific system control imports
+if sys.platform.startswith('linux'):
+    from actuators.system_control_linux import (
+        click_ui_element,
+        open_application,
+        open_url,
+        open_url_and_wait,
+        press_keyboard_shortcut,
+        type_text,
+        type_text_into_element,
+        quit_application,
+        activate_application,
+        list_running_applications,
+        scroll_direction,
+        drag_element,
+        wait_for_element,
+        wait_for_app_ready,
+        get_clipboard,
+        set_clipboard,
+        find_and_click,
+        right_click_element,
+        type_and_submit,
+        switch_tab,
+        scroll_to_element,
+    )
+else:
+    from actuators.system_control import (
+        click_ui_element,
+        open_application,
+        open_url,
+        open_url_and_wait,
+        press_keyboard_shortcut,
+        type_text,
+        type_text_into_element,
+        quit_application,
+        activate_application,
+        list_running_applications,
+        scroll_direction,
+        drag_element,
+        wait_for_element,
+        wait_for_app_ready,
+        get_clipboard,
+        set_clipboard,
+        find_and_click,
+        right_click_element,
+        type_and_submit,
+        switch_tab,
+        scroll_to_element,
+    )
 from core.memory import save_memory, retrieve_memories
-from sensors.vision import get_active_window_tree, list_open_windows, vision_execute
+
+# Platform-specific vision/screen imports
+if sys.platform.startswith('linux'):
+    # Linux uses AT-SPI2 for accessibility tree (via system_control_linux)
+    from actuators.system_control_linux import (
+        get_active_window_tree,
+        list_open_windows,
+    )
+    # vision_execute requires VLM + screenshot - not available on Linux yet
+    def vision_execute(goal: str) -> str:
+        return "Error: vision_execute not available on Linux. Use get_active_window_tree instead."
+else:
+    from sensors.vision import get_active_window_tree, list_open_windows, vision_execute
+
 from core.toolbox import TOOLS as NATIVE_TOOL_SCHEMAS
 from server.tool_router import select_tools_for_query
 from actuators.communication import (
@@ -71,25 +111,48 @@ from actuators.communication import (
     web_research_and_report,
 )
 from actuators.smart_search import smart_search, get_weather, get_news
-from actuators.browser import (
-    browser_execute_js,
-    browser_get_url, browser_get_title,
-    browser_navigate, browser_navigate_and_wait,
-    browser_new_tab, browser_close_tab,
-    browser_list_tabs, browser_switch_to_tab,
-    browser_back, browser_forward, browser_reload,
-    browser_get_page_text, browser_get_page_html,
-    browser_get_links, browser_get_inputs,
-    browser_click, browser_click_text, browser_click_xpath,
-    browser_type, browser_type_by_label, browser_press_key,
-    browser_scroll, browser_scroll_to_element as browser_scroll_to_el,
-    browser_fill_form, browser_select_option,
-    browser_check_checkbox, browser_submit_form,
-    browser_wait_for_element as browser_wait_el,
-    browser_wait_for_page_load, browser_element_exists,
-    browser_get_dom_summary,
-    gmail_compose_draft, gmail_read_email,
-)
+
+# Platform-specific browser imports
+if sys.platform.startswith('linux'):
+    from actuators.browser_linux import (
+        browser_execute_js,
+        browser_get_url, browser_get_title,
+        browser_navigate, browser_navigate_and_wait,
+        browser_new_tab, browser_close_tab,
+        browser_list_tabs, browser_switch_to_tab,
+        browser_back, browser_forward, browser_reload,
+        browser_get_page_text, browser_get_page_html,
+        browser_get_links, browser_get_inputs,
+        browser_click, browser_click_text, browser_click_xpath,
+        browser_type, browser_type_by_label, browser_press_key,
+        browser_scroll, browser_scroll_to_element as browser_scroll_to_el,
+        browser_fill_form, browser_select_option,
+        browser_check_checkbox, browser_submit_form,
+        browser_wait_for_element as browser_wait_el,
+        browser_wait_for_page_load, browser_element_exists,
+        browser_get_dom_summary,
+        gmail_compose_draft, gmail_read_email,
+    )
+else:
+    from actuators.browser import (
+        browser_execute_js,
+        browser_get_url, browser_get_title,
+        browser_navigate, browser_navigate_and_wait,
+        browser_new_tab, browser_close_tab,
+        browser_list_tabs, browser_switch_to_tab,
+        browser_back, browser_forward, browser_reload,
+        browser_get_page_text, browser_get_page_html,
+        browser_get_links, browser_get_inputs,
+        browser_click, browser_click_text, browser_click_xpath,
+        browser_type, browser_type_by_label, browser_press_key,
+        browser_scroll, browser_scroll_to_element as browser_scroll_to_el,
+        browser_fill_form, browser_select_option,
+        browser_check_checkbox, browser_submit_form,
+        browser_wait_for_element as browser_wait_el,
+        browser_wait_for_page_load, browser_element_exists,
+        browser_get_dom_summary,
+        gmail_compose_draft, gmail_read_email,
+    )
 from actuators.web_agent import (
     web_analyze_page, web_scan_for_obstacles, web_handle_obstacle,
     web_search, web_read_article, web_research,

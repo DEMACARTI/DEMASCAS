@@ -26,7 +26,7 @@ VLM_SERVER="scripts/start_vlm_server.py"
 VENV_DIR="$(cd "$PROJECT_ROOT/.." && pwd)/venv"
 
 # LLM configuration
-OLLAMA_MODEL="qwen2.5:3b"
+OLLAMA_MODEL="gemma4:31b-cloud"
 OLLAMA_PORT=11434
 MLX_TEXT_MODEL="mlx-community/Qwen2.5-3B-Instruct-4bit"
 MLX_TEXT_PORT=8081

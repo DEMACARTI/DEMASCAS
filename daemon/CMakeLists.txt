@@ -82,18 +82,42 @@ else()
     message(WARNING "sherpa-onnx NOT found — Kokoro TTS disabled, using macOS say")
 endif()
 
-# ── Apple Silicon optimisations ──────────────────────────────────────
+# ── whisper.cpp library paths for RPATH ──────────────────────────────
+set(WHISPER_LIB_DIR "${whisper_BINARY_DIR}/src")
+set(GGML_LIB_DIR "${whisper_BINARY_DIR}/ggml/src")
+
+# ── Platform-specific libraries ──────────────────────────────────────
 
 if(APPLE)
+    # macOS: Apple Silicon optimizations
     target_link_libraries(demascas_daemon PRIVATE
         "-framework Accelerate"            # BLAS for whisper.cpp
         "-framework CoreAudio"
         "-framework AudioToolbox"
     )
-    # Ensure we build a universal or native ARM binary
+    # Ensure we build native ARM binary
     if(NOT CMAKE_OSX_ARCHITECTURES)
         set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "" FORCE)
     endif()
+elseif(UNIX AND NOT APPLE)
+    # Linux: Link against required system libraries
+    find_package(Threads REQUIRED)
+    target_link_libraries(demascas_daemon PRIVATE
+        Threads::Threads
+        rt  # Real-time extensions
+    )
+
+    # Linux x86_64 architecture
+    if(NOT CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64")
+    endif()
+
+    # Linux: Set RPATH to find whisper and ggml libraries at runtime
+    set_target_properties(demascas_daemon PROPERTIES
+        BUILD_RPATH   "${WHISPER_LIB_DIR};${GGML_LIB_DIR};${SHERPA_ONNX_DIR}/lib"
+        INSTALL_RPATH "${WHISPER_LIB_DIR};${GGML_LIB_DIR};${SHERPA_ONNX_DIR}/lib"
+        BUILD_WITH_INSTALL_RPATH TRUE
+    )
 endif()
 
 # ── Release build flags ──────────────────────────────────────────────

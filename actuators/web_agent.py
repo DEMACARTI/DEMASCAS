@@ -19,16 +19,27 @@ import re
 import urllib.request
 import urllib.parse
 import urllib.error
+import sys
 from typing import Optional
 
-from actuators.browser import (
-    browser_execute_js, browser_get_url, browser_get_title,
-    browser_get_page_text, browser_get_links, browser_get_inputs,
-    browser_get_dom_summary, browser_click, browser_click_text,
-    browser_type, browser_type_by_label, browser_scroll,
-    browser_navigate_and_wait, browser_wait_for_page_load,
-    browser_element_exists, browser_press_key,
-)
+if sys.platform.startswith('linux'):
+    from actuators.browser_linux import (
+        browser_execute_js, browser_get_url, browser_get_title,
+        browser_get_page_text, browser_get_links, browser_get_inputs,
+        browser_get_dom_summary, browser_click, browser_click_text,
+        browser_type, browser_type_by_label, browser_scroll,
+        browser_navigate_and_wait, browser_wait_for_page_load,
+        browser_element_exists, browser_press_key,
+    )
+else:
+    from actuators.browser import (
+        browser_execute_js, browser_get_url, browser_get_title,
+        browser_get_page_text, browser_get_links, browser_get_inputs,
+        browser_get_dom_summary, browser_click, browser_click_text,
+        browser_type, browser_type_by_label, browser_scroll,
+        browser_navigate_and_wait, browser_wait_for_page_load,
+        browser_element_exists, browser_press_key,
+    )
 from memory.web_memory import (
     get_site_memory, save_site_memory, record_visit,
     learn_element, get_learned_selector, learn_obstacle,

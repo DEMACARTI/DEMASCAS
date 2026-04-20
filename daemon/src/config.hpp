@@ -19,16 +19,15 @@ inline const std::string WHISPER_TINY_MODEL = "models/ggml-tiny.bin";
 inline const std::string WHISPER_BASE_MODEL = "models/ggml-base.bin";
 
 // ─── LLM servers ─────────────────────────────────────────────────
-// macOS: MLX (mlx-lm + mlx-vlm, native Apple Silicon)
-// Linux: Ollama (qwen2.5:3b on port 11434)
+// Unified cloud model: gemma4:31b-cloud (vision + text via Ollama)
 // Both use OpenAI-compatible /v1/chat/completions endpoints.
 
 #ifdef __linux__
-// Linux (Ollama)
+// Linux (Ollama - Cloud model)
 inline const std::string MLX_TEXT_URL     = "http://127.0.0.1:11434/v1/chat/completions";
-inline const std::string MLX_VL_URL       = "http://127.0.0.1:11435/v1/chat/completions";  // reserved for future VLM
-inline const std::string MLX_TEXT_MODEL   = "qwen2.5:3b";
-inline const std::string MLX_VL_MODEL     = "qwen2.5-vl:3b";
+inline const std::string MLX_VL_URL       = "http://127.0.0.1:11434/v1/chat/completions";  // unified with LLM
+inline const std::string MLX_TEXT_MODEL   = "gemma4:31b-cloud";
+inline const std::string MLX_VL_MODEL     = "gemma4:31b-cloud";
 #else
 // macOS (MLX)
 inline const std::string MLX_TEXT_URL     = "http://127.0.0.1:8081/v1/chat/completions";

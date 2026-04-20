@@ -22,15 +22,29 @@ RAM BUDGET: 0 MB extra.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
+import sys
 from typing import Optional
 
-from sensors.vision import (
-    take_screenshot_base64,
-    vision_query,
-    get_active_window_tree,
-)
+# Platform-specific vision imports
+if sys.platform.startswith('linux'):
+    from actuators.system_control_linux import get_active_window_tree
+
+    # Linux stubs for VLM functions (not yet implemented on Linux)
+    def take_screenshot_base64() -> str:
+        return ""  # Not implemented on Linux yet
+
+    def vision_query(image_base64: str, prompt: str) -> str:
+        return "Error: VLM not available on Linux"
+else:
+    from sensors.vision import (
+        take_screenshot_base64,
+        vision_query,
+        get_active_window_tree,
+    )
+
 from actuators.network import search_web, read_webpage
 
 
@@ -134,7 +148,7 @@ def compose_email(
 
     try:
         llm_endpoint = os.environ.get("DEMASCAS_LLM_ENDPOINT", "http://127.0.0.1:11434")
-        llm_model = os.environ.get("DEMASCAS_LLM_MODEL", "qwen2.5:3b")
+        llm_model = os.environ.get("DEMASCAS_LLM_MODEL", "gemma4:31b-cloud")
         resp = requests.post(
             f"{llm_endpoint}/v1/chat/completions",
             json={
@@ -228,7 +242,7 @@ def smart_reply(
 
     try:
         llm_endpoint = os.environ.get("DEMASCAS_LLM_ENDPOINT", "http://127.0.0.1:11434")
-        llm_model = os.environ.get("DEMASCAS_LLM_MODEL", "qwen2.5:3b")
+        llm_model = os.environ.get("DEMASCAS_LLM_MODEL", "gemma4:31b-cloud")
         resp = requests.post(
             f"{llm_endpoint}/v1/chat/completions",
             json={
@@ -457,7 +471,7 @@ def web_research_and_report(
 
     try:
         llm_endpoint = os.environ.get("DEMASCAS_LLM_ENDPOINT", "http://127.0.0.1:11434")
-        llm_model = os.environ.get("DEMASCAS_LLM_MODEL", "qwen2.5:3b")
+        llm_model = os.environ.get("DEMASCAS_LLM_MODEL", "gemma4:31b-cloud")
         resp = requests.post(
             f"{llm_endpoint}/v1/chat/completions",
             json={

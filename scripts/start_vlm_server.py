@@ -4,7 +4,7 @@ DEMASCAS — scripts/start_vlm_server.py
 Start the Vision-Language Model server for screen analysis.
 
 For Ollama (Linux/macOS):
-    Pulls and serves qwen2.5-vl:3b via Ollama
+    Pulls and serves gemma4:31b-cloud via Ollama (unified LLM+VLM)
 
 For MLX (macOS only):
     Falls back to mlx-vlm if Ollama is not available
@@ -20,7 +20,7 @@ import time
 import pathlib
 
 # Ollama configuration
-OLLAMA_MODEL = "qwen2.5-vl:3b"
+OLLAMA_MODEL = "gemma4:31b-cloud"
 OLLAMA_PORT = 11434
 OLLAMA_HOST = "http://127.0.0.1"
 

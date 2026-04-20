@@ -24,6 +24,9 @@ python-dotenv
 ddgs
 beautifulsoup4
 
+# Cross-platform browser automation (Linux + macOS)
+playwright
+
 # Persistent memory — ChromaDB RAG (Capability 3)
 chromadb
 

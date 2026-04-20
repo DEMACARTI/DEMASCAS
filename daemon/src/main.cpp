@@ -490,12 +490,11 @@ int main() {
     }
     whisper.set_prompt(cfg::WHISPER_PROMPT);
 
-    std::cout << "\n[*] DEMASCAS is ready.  Say \"" << cfg::WAKE_WORD
-              << "\" to activate!\n\n";
+    std::cout << "\n[*] DEMASCAS is ready and listening.\n\n";
 
     // ── State machine loop ──────────────────────────────────────
 
-    State state = State::SLEEPING;
+    State state = State::LISTENING;
     std::string current_command;
     std::atomic<bool> cancel_llm{false};   // set to cancel streaming
     int consecutive_blank = 0;             // hallucinations since last real command
@@ -621,8 +620,24 @@ int main() {
                           << "\"  (energy=" << energy << ")\n";
             }
 
-            if (is_wake_phrase(transcript)) {
-                std::cout << "[🔊 WAKE WORD] \"" << transcript << "\"\n";
+            // Wake-word gate preserved here for easy restoration if needed.
+            // if (is_wake_phrase(transcript)) {
+            //     std::cout << "[🔊 WAKE WORD] \"" << transcript << "\"\n";
+            //     tts.play_sound("Glass");
+            //     tts.enqueue("At your service.");
+            //     tts.wait_done();
+            //     // Anti-echo: wait + drain so mic doesn't hear our own voice
+            //     last_tts_done = clk::now();
+            //     std::this_thread::sleep_for(
+            //         std::chrono::milliseconds(500));
+            //     audio.drain();
+            //     state = State::LISTENING;
+            // }
+
+            // Wake on any non-artifact speech while the activation-word gate
+            // is disabled.
+            if (!is_artifact) {
+                std::cout << "[🔊 WAKE BY SPEECH] \"" << transcript << "\"\n";
                 tts.play_sound("Glass");
                 tts.enqueue("At your service.");
                 tts.wait_done();

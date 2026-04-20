@@ -7,6 +7,7 @@ and the watchdog-based file observer for automated document processing.
 import glob
 import os
 import subprocess
+import sys
 import time
 
 import ollama
@@ -18,7 +19,7 @@ from core.utils import resolve_safe_path
 # Configuration
 # ---------------------------------------------------------------------------
 WATCH_DIRECTORY = os.path.expanduser("~/Desktop/DEMASCAS_Inbox")
-OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_MODEL = "gemma4:31b-cloud"
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +186,8 @@ def delete_file(file_path: str) -> str:
     if not os.path.exists(expanded):
         return f"Failed: '{file_path}' does not exist."
 
-    try:
-        # Prefer Trash via Finder (recoverable) over hard delete
+    if sys.platform.startswith('darwin'):
+        # macOS: Prefer Trash via Finder (recoverable) over hard delete
         result = subprocess.run(
             ['osascript', '-e',
              f'tell application "Finder" to delete '
@@ -196,7 +197,8 @@ def delete_file(file_path: str) -> str:
         if result.returncode == 0:
             return f"Success: Moved '{file_path}' to Trash."
 
-        # Fallback: hard delete
+    # Fallback: hard delete (used on Linux or if Finder fails)
+    try:
         if os.path.isfile(expanded):
             os.remove(expanded)
         elif os.path.isdir(expanded) and not os.listdir(expanded):
@@ -374,9 +376,11 @@ def open_file(file_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def send_mac_notification(title: str, text: str) -> None:
-    """Triggers a native macOS notification with a sound."""
-    script = f'display notification "{text}" with title "{title}" sound name "Glass"'
-    subprocess.run(["osascript", "-e", script])
+    """Triggers a native notification with a sound (macOS only)."""
+    if sys.platform.startswith('darwin'):
+        script = f'display notification "{text}" with title "{title}" sound name "Glass"'
+        subprocess.run(["osascript", "-e", script])
+    # Linux: notifications not implemented yet (would require notify-send)
 
 
 # ---------------------------------------------------------------------------

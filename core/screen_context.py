@@ -18,14 +18,32 @@ from __future__ import annotations
 
 import json
 import time
+import sys
 from typing import Optional
 
-from sensors.vision import (
-    get_active_window_tree,
-    compress_tree,
-    take_screenshot_base64,
-    vision_query,
-)
+# Platform-specific vision/screen imports
+if sys.platform.startswith('linux'):
+    # Linux uses AT-SPI2 for accessibility tree
+    from actuators.system_control_linux import (
+        get_active_window_tree,
+        list_open_windows,
+    )
+    # Linux stubs for VLM functions (not yet implemented on Linux)
+    def compress_tree(tree: str) -> str:
+        return tree  # No compression on Linux yet
+
+    def take_screenshot_base64() -> str:
+        return ""  # Not implemented on Linux yet
+
+    def vision_query(image_base64: str, prompt: str) -> str:
+        return "Error: VLM not available on Linux"
+else:
+    from sensors.vision import (
+        get_active_window_tree,
+        compress_tree,
+        take_screenshot_base64,
+        vision_query,
+    )
 
 
 # ── Caching — avoid re-scanning if screen hasn't changed ─────────

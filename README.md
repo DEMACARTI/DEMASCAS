@@ -234,11 +234,8 @@ pip install -r requirements.txt
 # Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
 
-# Pull the Qwen2.5 model
-ollama pull qwen2.5:3b
-
-# Optional: Pull vision model for screen analysis
-ollama pull qwen2.5-vl:3b
+# Pull the Gemma 4 model (unified LLM + VLM)
+ollama pull gemma4:31b-cloud
 ```
 
 **For macOS (MLX - Native Apple Silicon):**
@@ -292,7 +289,7 @@ source ../venv/bin/activate
 The run script automatically detects your platform and starts:
 
 **Linux (Ollama):**
-1. **Ollama server** on `localhost:11434` — qwen2.5:3b
+1. **Ollama server** on `localhost:11434` — gemma4:31b-cloud (unified LLM+VLM)
 2. **Python tool server** on `localhost:5001` — 88 tools + MCP + learning
 3. **C++ daemon** in foreground — audio → whisper.cpp → Ollama → Kokoro TTS
 
@@ -331,7 +328,7 @@ If you prefer to run the processes separately (useful for debugging):
 ```bash
 # Linux (Ollama):
 ollama serve
-ollama run qwen2.5:3b
+ollama run gemma4:31b-cloud
 
 # macOS (MLX):
 source ../venv/bin/activate
@@ -449,9 +446,9 @@ DEMASCAS supports multiple LLM backends for cross-platform compatibility:
 
 | Platform | Backend | Model | RAM | Port | Role |
 |----------|---------|-------|-----|------|------|
-| **Linux** | Ollama | `qwen2.5:3b` | ~2 GB | 11434 | All interactions: OS tools, shortcuts, Q&A, planning |
+| **Linux** | Ollama (Cloud) | `gemma4:31b-cloud` | 0 GB (cloud) | 11434 | All interactions: OS tools, shortcuts, Q&A, planning + Vision |
 | **macOS** | MLX | `Qwen2.5-3B-Instruct-4bit` | ~1.8 GB | 8081 | All interactions: OS tools, shortcuts, Q&A, planning |
-| **Both** | Ollama (optional) | `qwen2.5-vl:3b` | ~2 GB | 11434 | Screenshot-based screen understanding (optional) |
+| **Both** | Ollama (optional) | `gemma4:31b-cloud` | 0 GB (cloud) | 11434 | Unified vision + text understanding (optional) |
 
 Both backends expose OpenAI-compatible `/v1/chat/completions` endpoints. The C++ daemon communicates via streaming HTTP (libcurl SSE).
 
@@ -490,8 +487,8 @@ User speaks → PortAudio → whisper.cpp (Metal GPU)
 │                LLM SERVER (cross-platform)                      │
 │                                                                │
 │  Linux: Ollama (port 11434)     macOS: MLX (port 8081)        │
-│  qwen2.5:3b                    Qwen2.5-3B-Instruct-4bit       │
-│  ~2 GB (text)                  ~1.8 GB (text)                  │
+│  gemma4:31b-cloud              Qwen2.5-3B-Instruct-4bit       │
+│  0 GB (cloud)                  ~1.8 GB (text)                  │
 │  OpenAI-compatible /v1/chat/completions                        │
 └───────────────────────────┬────────────────────────────────────┘
                             │ HTTP streaming
@@ -900,8 +897,8 @@ All 37 tuning knobs live in a single header: `daemon/src/config.hpp`
 |------|---------------|---------------|-------------|
 | `MLX_TEXT_URL` | `"http://127.0.0.1:11434/v1/chat/completions"` | `"http://127.0.0.1:8081/v1/chat/completions"` | LLM endpoint (Ollama/MLX) |
 | `MLX_VL_URL` | `"http://127.0.0.1:11434/v1/chat/completions"` | `"http://127.0.0.1:8082/v1/chat/completions"` | VLM endpoint |
-| `MLX_TEXT_MODEL` | `"qwen2.5:3b"` | `"mlx-community/Qwen2.5-3B-Instruct-4bit"` | Text LLM model |
-| `MLX_VL_MODEL` | `"qwen2.5-vl:3b"` | `"mlx-community/Qwen2.5-VL-3B-Instruct-4bit"` | Vision LLM model |
+| `MLX_TEXT_MODEL` | `"gemma4:31b-cloud"` | `"mlx-community/Qwen2.5-3B-Instruct-4bit"` | Text LLM model |
+| `MLX_VL_MODEL` | `"gemma4:31b-cloud"` | `"mlx-community/Qwen2.5-VL-3B-Instruct-4bit"` | Vision LLM model |
 | `TOOL_CTX` | `2048` | `2048` | Context window for tool-calling path |
 | `TOOL_PREDICT` | `200` | `200` | Max tokens for tool-calling responses |
 | `FAST_CTX` | `1024` | `1024` | Context window for simple Q&A |
@@ -1026,7 +1023,7 @@ After changing config, rebuild with `./scripts/build.sh`.
 | **"Open Google" goes to LLM instead of URL** | Fixed — 18 site aliases resolve bare names (google, youtube, etc.) deterministically |
 | **Tool server errors in daemon** | Check tool server terminal logs; ensure `python main.py` is running |
 | **Learning not working** | Check `~/.demascas/` exists; run `cat ~/.demascas/user_profile.json` |
-| **PDF summarization fails** | This feature requires Ollama: `brew install ollama && ollama pull qwen2.5:3b` |
+| **PDF summarization fails** | This feature requires Ollama: `brew install ollama && ollama pull gemma4:31b-cloud` |
 
 ---
 

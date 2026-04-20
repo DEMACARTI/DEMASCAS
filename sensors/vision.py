@@ -331,7 +331,7 @@ def take_screenshot_base64() -> str:
 _VLM_ENDPOINT_FILE = os.path.join(str(pathlib.Path.home()), ".demascas", "vlm_endpoint.txt")
 # Default to Ollama port, override with DEMASCAS_VLM_ENDPOINT env var
 _VLM_BASE = os.environ.get("DEMASCAS_VLM_ENDPOINT", "http://127.0.0.1:11434")
-_VLM_MODEL = os.environ.get("DEMASCAS_VLM_MODEL", "qwen2.5-vl:3b")
+_VLM_MODEL = os.environ.get("DEMASCAS_VLM_MODEL", "gemma4:31b-cloud")
 
 
 def _get_vlm_url() -> str:
@@ -426,7 +426,7 @@ def vision_query(prompt: str, screenshot_b64: str | None = None) -> str:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
     except requests.exceptions.ConnectionError:
-        return "[-] VLM server not running. Start with: ollama run qwen2.5-vl:3b"
+        return "[-] VLM server not running. Start with: ollama run gemma4:31b-cloud"
     except Exception as e:
         return f"[-] VLM query failed: {e}"
 
