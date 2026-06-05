@@ -51,6 +51,7 @@ public:
     /// Streaming fast-path: calls on_sentence for each sentence as generated.
     /// Cancel via cancel flag (atomic bool).
     std::string fast_chat_streaming(const std::string& user_msg,
+                                     ToolBridge& bridge,
                                      SentenceCallback on_sentence,
                                      std::atomic<bool>& cancel);
 
@@ -80,6 +81,11 @@ public:
 
     /// Check if a command requires multiple steps (heuristic).
     bool is_multi_step_command(const std::string& command) const;
+
+    /// Check if a command should use the Structured Task Executor.
+    /// Subsumes is_multi_step_command + detects task-oriented commands
+    /// like "write email", "compose", "search on youtube", etc.
+    bool is_structured_task(const std::string& command) const;
 
     /// Use the LLM to decompose a complex command into ordered steps.
     /// Returns a vector of step descriptions (natural language).
@@ -125,10 +131,11 @@ public:
 private:
     /// Build the agentic system prompt with tool list embedded as text.
     nlohmann::json build_tool_prompt(const nlohmann::json& tool_schemas,
+                                      ToolBridge& bridge,
                                       const std::string& learned_context = "") const;
 
     /// Build the simple Q&A system prompt (no tools).
-    nlohmann::json build_simple_prompt() const;
+    nlohmann::json build_simple_prompt(ToolBridge& bridge) const;
 
     /// POST to MLX /v1/chat/completions with SSE stream=true.
     /// Calls on_sentence for each sentence boundary.

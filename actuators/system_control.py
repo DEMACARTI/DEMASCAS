@@ -12,6 +12,7 @@ OPTIMIZATIONS:
 
 import subprocess
 import time
+from core.preferences import get_all_preferences
 
 # Timeout in seconds for AppleScript execution
 _ACTION_TIMEOUT = 10
@@ -286,6 +287,8 @@ def type_text(text: str, app_name: str = "", press_enter: bool = False,
     Returns:
         A success/failure message string.
     """
+    if text is None:
+        text = ""
     safe_text = _sanitize_for_applescript(text)
     print(f"[*] DEMASCAS is typing: '{safe_text}'" +
           (f" in {app_name}" if app_name else "") +
@@ -446,7 +449,7 @@ def open_application(app_name: str) -> str:
         return f"[-] Execution Error: {e.stderr}"
 
 
-def open_url(url: str, browser: str = "Safari") -> str:
+def open_url(url: str, browser: str = "") -> str:
     """
     Opens a URL in a macOS browser using AppleScript.
     Activates the browser, then tells it to open the URL.
@@ -454,18 +457,41 @@ def open_url(url: str, browser: str = "Safari") -> str:
     Args:
         url: The URL to open (e.g. 'https://instagram.com', 'instagram.com').
              A scheme (https://) is added automatically if missing.
-        browser: The browser app name (default 'Safari').
-                 Also supports 'Google Chrome', 'Firefox', etc.
+        browser: The browser app name (e.g. 'Brave Browser', 'Safari').
+                 If not provided, uses the user's preferred default_browser
+                 from preferences.json, or falls back to system 'open'.
 
     Returns:
         A success/failure message string.
     """
-    safe_browser = _sanitize_for_applescript(browser)
+    # 1. Determine which browser to use
+    target_browser = browser.strip() if browser else ""
+    if not target_browser:
+        prefs = get_all_preferences()
+        target_browser = prefs.get("default_browser", "")
+
     # Sanitize URL — strip shell-dangerous chars but keep :// and standard URL chars
     safe_url = url.replace('"', '').replace('\\', '').replace('`', '').strip()
     if not safe_url.startswith(("http://", "https://")):
         safe_url = "https://" + safe_url
 
+    # 2. If no browser is specified anywhere, use macOS system default via `open`
+    if not target_browser:
+        print(f"[*] DEMASCAS is opening URL: '{safe_url}' using system default...")
+        try:
+            result = subprocess.run(
+                ['open', safe_url],
+                capture_output=True, text=True, check=True,
+                timeout=_ACTION_TIMEOUT,
+            )
+            return f"Success: Opened '{safe_url}' using system default browser."
+        except subprocess.TimeoutExpired:
+            return "[-] Timeout: Opening URL took too long."
+        except subprocess.CalledProcessError as e:
+            return f"[-] Execution Error: {e.stderr}"
+
+    # 3. Otherwise, use AppleScript to target the specific browser
+    safe_browser = _sanitize_for_applescript(target_browser)
     print(f"[*] DEMASCAS is opening URL: '{safe_url}' in {safe_browser}...")
 
     applescript_code = f"""
@@ -494,7 +520,7 @@ def open_url(url: str, browser: str = "Safari") -> str:
         return f"[-] Execution Error: {e.stderr}"
 
 
-def open_url_and_wait(url: str, browser: str = "Safari", wait_seconds: float = 3.0) -> str:
+def open_url_and_wait(url: str, browser: str = "", wait_seconds: float = 3.0) -> str:
     """
     Opens a URL in a browser and waits for the page to stabilize.
 
@@ -503,7 +529,7 @@ def open_url_and_wait(url: str, browser: str = "Safari", wait_seconds: float = 3
 
     Args:
         url: The URL to open (e.g. 'https://instagram.com').
-        browser: The browser app name (default 'Safari').
+        browser: The browser app name (optional). If empty, uses preference/system default.
         wait_seconds: Max seconds to wait for page load (default 3.0).
 
     Returns:

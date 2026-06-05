@@ -31,6 +31,30 @@ set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(whisper)
 
+# Reduce warning noise from Apple SDK headers pulled by whisper.cpp's
+# Objective-C Metal source. Keep project warnings for our own daemon target.
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(_DEMASCAS_THIRDPARTY_WARNING_SUPPRESS
+        -Wno-pedantic
+        -Wno-invalid-utf8
+        -Wno-variadic-macro-arguments-omitted
+        -Wno-extra-semi
+    )
+
+    foreach(_tgt ggml-metal ggml whisper)
+        if(TARGET ${_tgt})
+            target_compile_options(${_tgt} PRIVATE ${_DEMASCAS_THIRDPARTY_WARNING_SUPPRESS})
+        endif()
+    endforeach()
+
+    if(TARGET ggml-metal)
+        target_compile_options(ggml-metal PRIVATE
+            -Wno-missing-method-return-type
+            -Wno-deprecated-declarations
+        )
+    endif()
+endif()
+
 # nlohmann/json — header-only JSON (used for Ollama API payloads)
 FetchContent_Declare(
     json

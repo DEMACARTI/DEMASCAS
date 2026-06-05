@@ -176,7 +176,7 @@ All tools are defined as JSON schemas in `core/toolbox.py` and mapped to Python 
 ## 6. Current Config Values (`config.hpp`)
 
 ```
-Model:           qwen2.5:3b (Ollama, ~1.9 GB, pinned with keep_alive=-1)
+Model:           mlx-community/Phi-4-mini-instruct-4bit (MLX, ~1.9 GB, port 8081)
 Context (tools): 4096 tokens, 300 max predict
 Context (fast):  2048 tokens, 100 max predict
 Batch size:      256
@@ -275,7 +275,7 @@ Answer concisely in 1-3 spoken sentences. No markdown, no code blocks. Be natura
 - Kokoro neural TTS with double-buffered synthesis
 
 ### Potential Issues
-- **Tool path latency:** ~5-8s for full ReAct loop with qwen2.5:3b. The system prompt + 21 tool schemas + memory context consume significant context window
+- **Tool path latency:** ~5-8s for full ReAct loop with Phi-4-mini-instruct-4bit. The system prompt + 21 tool schemas + memory context consume significant context window
 - **LLM tool reliability:** Qwen 3B sometimes generates text describing an action instead of emitting a `tool_calls` JSON. The compact system prompt + deterministic fast-paths mitigate this but complex multi-step commands still depend on LLM behavior
 - **Bluetooth speaker latency:** JBL Clip 4 (default output) has a Bluetooth handshake delay on first audio
 - **Whisper hallucinations:** Tiny model hallucinates on background noise. Extensive filter list mitigates but doesn't eliminate

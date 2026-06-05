@@ -3,7 +3,7 @@
 # DEMASCAS — Run Script
 #
 # Starts the full polyglot stack (4 processes):
-#   1. MLX text server        (localhost:8081)  — Qwen2.5-3B-Instruct-4bit
+#   1. MLX text server        (localhost:8081)  — Phi-4-mini-instruct-4bit
 #   2. MLX vision server      (localhost:8082)  — Qwen2.5-VL-3B (optional)
 #   3. Python tool micro-service  (localhost:5001)
 #   4. C++ bare-metal daemon      (audio → whisper.cpp → MLX → TTS)
@@ -26,9 +26,12 @@ VLM_SERVER="scripts/start_vlm_server.py"
 VENV_DIR="$(cd "$PROJECT_ROOT/.." && pwd)/venv"
 
 # MLX model names (must match config.hpp)
-MLX_TEXT_MODEL="mlx-community/Qwen2.5-3B-Instruct-4bit"
+MLX_TEXT_MODEL="mlx-community/Phi-4-mini-instruct-4bit"
 MLX_TEXT_PORT=8081
 MLX_VL_PORT=8082
+
+# Keep every Python caller aligned with the text server model.
+export DEMASCAS_MLX_TEXT_MODEL="$MLX_TEXT_MODEL"
 
 # ── Track PIDs for cleanup ──────────────────────────────────────────
 
@@ -93,12 +96,25 @@ fi
 # ── 1. Start MLX text server ────────────────────────────────────────
 
 echo "[*] Starting MLX text server (localhost:${MLX_TEXT_PORT})..."
-python -m mlx_lm.server \
-    --model "$MLX_TEXT_MODEL" \
-    --port "$MLX_TEXT_PORT" &
-TEXT_PID=$!
-PIDS+=($TEXT_PID)
-echo "    PID: $TEXT_PID"
+
+if curl -s "http://127.0.0.1:${MLX_TEXT_PORT}/v1/models" > /dev/null 2>&1; then
+    echo "[✓] Reusing existing MLX text server on port ${MLX_TEXT_PORT}."
+else
+    # If the port is occupied but /v1/models is not healthy, stop early with clear guidance.
+    if lsof -nP -iTCP:"${MLX_TEXT_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "❌  Port ${MLX_TEXT_PORT} is already in use by a non-MLX process."
+        echo "    Free the port or stop that process, then run ./scripts/run.sh again."
+        exit 1
+    fi
+
+    # New CLI form (avoids deprecation warning): python -m mlx_lm server ...
+    python -m mlx_lm server \
+        --model "$MLX_TEXT_MODEL" \
+        --port "$MLX_TEXT_PORT" &
+    TEXT_PID=$!
+    PIDS+=($TEXT_PID)
+    echo "    PID: $TEXT_PID"
+fi
 
 # Wait for MLX text server to be ready
 echo "[*] Waiting for MLX text server..."

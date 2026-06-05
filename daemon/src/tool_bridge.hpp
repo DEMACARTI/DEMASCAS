@@ -11,6 +11,9 @@
 
 #include <string>
 #include <vector>
+#include <chrono>
+#include <mutex>
+#include <condition_variable>
 #include <nlohmann/json.hpp>
 
 namespace demascas {
@@ -57,6 +60,21 @@ public:
     /// Returns context_block string for system prompt injection.
     std::string fetch_screen_context(bool force = false);
 
+    struct AgentResult {
+        bool        success;
+        std::string summary;
+        int         steps_taken;
+        std::string error;
+        std::string raw_json;
+    };
+
+    AgentResult execute_agent(const std::string& command,
+                              const std::string& context_json = "{}");
+    std::string fetch_active_context();
+
+    /// Fetch user preferences and rules from the Python server
+    std::string fetch_preferences();
+
     /// POST /deep_intent — fetch deep intent analysis for a command.
     /// Returns task_type, task-specific prompt, people context, screen context.
     struct DeepIntentResult {
@@ -80,10 +98,29 @@ public:
     ToolResult execute_with_screen(const std::string& name,
                                     const nlohmann::json& args);
 
+    // ── Structured Task Executor (STE) ──────────────────────────
+
+    /// POST /plan_and_execute — plan and execute a multi-step task.
+    /// Returns structured result with spoken progress updates.
+    struct TaskExecResult {
+        std::string status;              // "ok" | "partial" | "failed" | "clarifying"
+        std::string result;              // final result text
+        int steps_completed = 0;         // how many steps successfully ran
+        int total_steps = 0;             // total planned steps
+        std::vector<std::string> spoken; // progress messages for TTS
+        // For CLARIFYING state (find_file multi-match)
+        std::vector<std::pair<std::string, std::string>> file_choices; // {name, path}
+    };
+    TaskExecResult execute_task(const std::string& command);
+
     // ── Static HTTP helpers (used by LLMClient too) ──────────
     static std::string http_post(const std::string& url,
                                   const std::string& body);
     static std::string http_get(const std::string& url);
+    /// Last known user preferences block
+    std::string last_preferences_;
+    std::chrono::steady_clock::time_point last_prefs_fetch_;
+
 };
 
 }  // namespace demascas

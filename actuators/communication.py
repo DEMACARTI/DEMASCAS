@@ -22,6 +22,7 @@ RAM BUDGET: 0 MB extra.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from typing import Optional
@@ -32,6 +33,35 @@ from sensors.vision import (
     get_active_window_tree,
 )
 from actuators.network import search_web, read_webpage
+
+
+MLX_TEXT_MODEL = os.getenv("DEMASCAS_MLX_TEXT_MODEL", "mlx-community/Phi-4-mini-instruct-4bit")
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    """Extract and parse the first balanced JSON object found in text."""
+    if not text:
+        return None
+
+    depth = 0
+    start = -1
+    for idx, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidate = text[start:idx + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        continue
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -136,7 +166,7 @@ def compose_email(
         resp = requests.post(
             "http://127.0.0.1:8081/v1/chat/completions",
             json={
-                "model": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+                "model": MLX_TEXT_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},
@@ -150,11 +180,9 @@ def compose_email(
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
 
-        # Try to extract JSON
-        first_brace = content.find("{")
-        last_brace = content.rfind("}")
-        if first_brace >= 0 and last_brace > first_brace:
-            parsed = json.loads(content[first_brace:last_brace + 1])
+        # Try to extract first valid JSON object from potentially noisy output
+        parsed = _extract_first_json_object(content)
+        if parsed is not None:
             # Ensure required fields
             result = {
                 "subject": parsed.get("subject", subject or "No subject"),
@@ -228,7 +256,7 @@ def smart_reply(
         resp = requests.post(
             "http://127.0.0.1:8081/v1/chat/completions",
             json={
-                "model": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+                "model": MLX_TEXT_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},
@@ -242,11 +270,9 @@ def smart_reply(
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
 
-        # Parse reply JSON
-        first_brace = content.find("{")
-        last_brace = content.rfind("}")
-        if first_brace >= 0 and last_brace > first_brace:
-            parsed = json.loads(content[first_brace:last_brace + 1])
+        # Parse first valid JSON object from potentially noisy output
+        parsed = _extract_first_json_object(content)
+        if parsed is not None:
             result = {
                 "reply": parsed.get("reply", content),
                 "tone": parsed.get("tone", tone or "matched"),
@@ -455,7 +481,7 @@ def web_research_and_report(
         resp = requests.post(
             "http://127.0.0.1:8081/v1/chat/completions",
             json={
-                "model": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+                "model": MLX_TEXT_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},

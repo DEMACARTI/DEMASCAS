@@ -150,17 +150,14 @@ TOOLS = [
         "function": {
             "name": "type_text",
             "description": (
-                "Types text into the currently focused field using keystroke injection. "
-                "Does NOT require knowing the UI element name — types into whatever is focused. "
-                "Can optionally: (1) activate a specific app first, (2) press a focus shortcut "
-                "before typing (e.g. command+l to focus Safari/Chrome address bar), "
-                "(3) press Enter/Return after typing. "
+                "Use this tool to blindly type text exactly where the user's cursor currently is. "
+                "Use this IMMEDIATELY when the user says 'type [text]', 'write [text]', or 'put [text] here'. "
+                "DO NOT use type_text_into_element unless the user explicitly names a target box or button. "
+                "Does NOT require knowing the UI element name or app name — types into whatever is focused. "
+                "Can optionally press Enter/Return after typing. "
                 "COMMON PATTERNS: "
-                "'type instagram.com in Safari address bar and press enter' → "
-                "type_text(text='instagram.com', app_name='Safari', focus_shortcut='command+l', press_enter=true). "
-                "'write hello in Notes' → type_text(text='hello', app_name='Notes'). "
-                "'type my email and press enter' → type_text(text='user@example.com', press_enter=true). "
-                "Use this instead of type_text_into_element when you don't know the exact UI element name."
+                "'type hello' → type_text(text='hello')\n"
+                "'type instagram.com and press enter' → type_text(text='instagram.com', press_enter=true)"
             ),
             "parameters": {
                 "type": "object",
@@ -226,6 +223,27 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_selected_pdf",
+            "description": (
+                "Summarizes the PDF currently selected in Finder. "
+                "If file_path is provided, summarizes that PDF path instead. "
+                "Use this when user says 'summarize selected PDF' or 'summarize this highlighted file'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional explicit PDF path (supports ~/...). Leave empty to use Finder selection.",
+                    }
+                },
                 "required": [],
             },
         },
@@ -316,6 +334,28 @@ TOOLS = [
                 "type": "object",
                 "properties": {},
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_default_browser",
+            "description": (
+                "Sets the default web browser on macOS. "
+                "Use this when the user asks to change or set their default browser. "
+                "Valid options include 'brave', 'safari', 'chrome', 'firefox', 'edge'. "
+                "NOTE: This changes the actual OS configuration, it does not just save a preference."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "browser_name": {
+                        "type": "string",
+                        "description": "The name of the browser (e.g. 'brave', 'safari', 'chrome').",
+                    }
+                },
+                "required": ["browser_name"],
             },
         },
     },
@@ -463,9 +503,11 @@ TOOLS = [
             "name": "save_memory",
             "description": (
                 "Saves a piece of information to DEMASCAS's long-term memory. "
-                "Use when the user tells you to remember something, states a "
-                "preference, or shares personal info like their name, schedule, "
-                "or favourite things."
+                "Use when the user tells you to remember personal info like their "
+                "name, schedule, history, or favourite things. "
+                "IMPORTANT: DO NOT use this for system rules or app preferences! "
+                "If the user says 'always do X' or 'never do Y' or gives a rule, "
+                "you MUST use 'set_preference' instead."
             ),
             "parameters": {
                 "type": "object",
@@ -1775,9 +1817,181 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "web_youtube_play_first",
-            "description": "Play the first video from YouTube search results in Brave.",
+            "name": "web_ecommerce_search",
+            "description": "Search Amazon for a product in Brave Browser.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product": {
+                        "type": "string",
+                        "description": "Product name.",
+                    }
+                },
+                "required": ["product"],
+            },
+        },
+    },
+
+    # ==================================================================
+    # System and Intelligence
+    # ==================================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_command",
+            "description": (
+                "Executes a strictly allowlisted read-only shell command on macOS. "
+                "Use this to answer questions about system processes, disk space, "
+                "uptime, network, etc. Safe commands include: ps, top, df, uptime, "
+                "whoami, sw_vers, system_profiler, networksetup, pmset, sysctl, "
+                "launchctl list, ifconfig, which, cat, head, tail, wc, sort, grep, "
+                "find, ls, echo, date, cal. Commands not on the allowlist are rejected."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute (e.g., 'ps aux', 'df -h').",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_system_info",
+            "description": (
+                "Returns a pre-formatted summary of the system's current state: "
+                "OS version, uptime, CPU usage, memory, disk space, battery, and "
+                "active user. Use this when the user asks for a general system status."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_preference",
+            "description": (
+                "Saves a persistent user preference or rule. "
+                "Use this specifically when the user says 'always do X', 'never do Y', "
+                "'remember my preference', or explicitly states a rule. "
+                "Supported keys:\n"
+                "- 'humor_level' (0-100)\n"
+                "- 'default_browser' (e.g. 'Brave Browser', 'Safari')\n"
+                "- 'custom_instruction' (for arbitrary behaviour rules)"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The preference key (e.g., 'default_browser', 'custom_instruction', 'humor_level').",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The preference value (e.g., 'Brave Browser', 'Always use dark mode').",
+                    }
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_preference",
+            "description": "Remove an existing user preference or rule by key.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The preference key to remove.",
+                    }
+                },
+                "required": ["key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_humor_level",
+            "description": (
+                "Sets DEMASCAS's humor and personality level (0-100). "
+                "0 = professional, 50 = friendly, 100 = full comedian. "
+                "Use this when the user asks to increase/decrease humor or personality."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "integer",
+                        "description": "Humor level from 0 to 100.",
+                    }
+                },
+                "required": ["level"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_user_preference",
+            "description": (
+                "Use this tool ONLY when the user explicitly tells you to remember "
+                "a preference, favorite app, or personal rule. "
+                "Examples: 'remember that I prefer Brave', 'always use dark mode', "
+                "'my favorite editor is VS Code'. "
+                "Do NOT call this tool for general memory storage or facts — "
+                "use save_memory for those. This is strictly for preferences and rules."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "The preference category (e.g. 'browser', 'editor', "
+                            "'music_app', 'rule', 'theme', 'workflow')."
+                        ),
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": (
+                            "The preference value (e.g. 'always use Brave', "
+                            "'Spotify', 'dark mode')."
+                        ),
+                    },
+                },
+                "required": ["category", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "architect_plan",
+            "description": (
+                "CRITICAL: Use this tool FIRST when asked to do a complex task, "
+                "open an app and do something inside it, or perform multiple steps "
+                "(like 'open PowerPoint AND create a presentation'). "
+                "It will generate a step-by-step execution plan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "The user's exact original request.",
+                    },
+                },
+                "required": ["goal"],
+            },
         },
     },
 ]

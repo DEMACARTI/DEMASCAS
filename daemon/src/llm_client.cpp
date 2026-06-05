@@ -35,6 +35,8 @@ namespace demascas {
 namespace cfg = config;
 using json = nlohmann::json;
 
+static constexpr size_t LEARNED_CONTEXT_MAX_CHARS = 1200;
+
 // ── IST time helpers (UTC+5:30) ─────────────────────────────────────
 
 static std::string ist_time_str() {
@@ -95,17 +97,13 @@ std::string LLMClient::format_tools_as_text(const json& schemas) const {
 // ── System prompts ──────────────────────────────────────────────────
 
 json LLMClient::build_tool_prompt(const json& tool_schemas,
+                                    ToolBridge& bridge,
                                     const std::string& learned_context) const {
     std::string tools_text = format_tools_as_text(tool_schemas);
 
-    std::string profile_block;
-    if (!learned_context.empty()) {
-        profile_block = "\n[CONTEXT] " + learned_context;
-    }
-
-    std::string content =
-        "You are DEMASCAS, a macOS voice assistant. "
-        + ist_date_str() + ", " + ist_time_str() + " IST.\n\n"
+    // ── STATIC CONTENT (stable across turns — maximises KV cache reuse) ──
+    std::string static_content =
+        "You are DEMASCAS, a macOS voice assistant.\n\n"
         "RULES:\n"
         "1. To ACT on macOS (click, type, scroll, open, read screen, manage files) → CALL a tool. "
         "Text alone does nothing. NEVER say \"I will click\" — just CALL the tool.\n"
@@ -136,36 +134,72 @@ json LLMClient::build_tool_prompt(const json& tool_schemas,
         "gmail_compose_draft handles opening compose + filling To/Subject/Body in one call.\n"
         "12. EMAIL COLLECTION: If the user says 'email X' but doesn't provide the email address, "
         "ask them for it with {\"done\":true,\"say\":\"What's their email address?\"}. "
-        "Do NOT guess email addresses.\n\n"
+        "Do NOT guess email addresses.\n"
+        "13. EXPLICIT LEARNING: If the user explicitly asks you to remember a rule, preference, "
+        "or fact (e.g. 'always use Brave', 'remember I like X'), use set_preference or save_memory. "
+        "DO NOT execute the action they mention unless they also tell you to do it right now.\n\n"
         "OUTPUT FORMAT — reply with EXACTLY ONE JSON object per turn:\n"
         "  To call a tool:    {\"tool\":\"tool_name\",\"args\":{\"key\":\"value\"}}\n"
         "  When finished:     {\"done\":true,\"say\":\"spoken answer here\"}\n\n"
-        "AVAILABLE TOOLS:\n" + tools_text
-        + profile_block;
+        "AVAILABLE TOOLS:\n" + tools_text;
 
-    return {{"role", "system"}, {"content", content}};
+    // ── DYNAMIC CONTENT (changes every turn — placed at the bottom) ──
+    std::string dynamic_content = "\n--- CURRENT CONTEXT ---\n";
+    dynamic_content += "Date: " + ist_date_str() + "\n";
+    dynamic_content += "Time: " + ist_time_str() + " IST\n";
+
+    if (!learned_context.empty()) {
+        std::string trimmed = learned_context;
+        if (trimmed.size() > LEARNED_CONTEXT_MAX_CHARS) {
+            trimmed = trimmed.substr(0, LEARNED_CONTEXT_MAX_CHARS);
+            trimmed += "\n... [context truncated]";
+        }
+        dynamic_content += "\n[CONTEXT]\n" + trimmed;
+    }
+
+    // Preferences block contains user rules and humor personality
+    try {
+        std::string prefs_block = bridge.fetch_preferences();
+        if (!prefs_block.empty()) {
+            dynamic_content += "\n" + prefs_block;
+        }
+    } catch (...) {}
+
+    return {{"role", "system"}, {"content", static_content + dynamic_content}};
 }
 
-json LLMClient::build_simple_prompt() const {
+json LLMClient::build_simple_prompt(ToolBridge& bridge) const {
+    // ── STATIC CONTENT (stable across turns — maximises KV cache reuse) ──
+    std::string static_content =
+        "You are DEMASCAS, a personal AI voice assistant — like JARVIS from Iron Man. "
+        "Answer concisely in 1-3 spoken sentences. No markdown, no code blocks.\n\n"
+        "GENERAL GUIDELINES:\n"
+        "- You are a CHARACTER with your own voice. You speak DIRECTLY to the user and anyone present.\n"
+        "- Never say 'you can say X' or 'try saying X'. YOU are the one talking.\n"
+        "- If the user says 'greet my friend', YOU greet them. If they say 'tell a joke', YOU tell it.\n"
+        "- Be warm, confident, and slightly witty. Show personality.\n"
+        "- Understand context: if someone is introduced to you, acknowledge THEM by name.\n"
+        "- The user is Daksh, your creator. Treat anyone they introduce as a friend.\n\n"
+        "IMPORTANT: You are on the FAST Q&A path — you have NO tools. "
+        "If the user asks you to compose an email, click something, fill a form, "
+        "open a website, or take any OS action, say 'Let me handle that for you' "
+        "and the system will re-route to the tool path. NEVER pretend to perform actions.\n";
+
+    // ── DYNAMIC CONTENT (changes every turn — placed at the bottom) ──
+    std::string dynamic_content = "\n--- CURRENT CONTEXT ---\n";
+    dynamic_content += "Current date: " + ist_date_str() + "\n";
+    dynamic_content += "Current time (IST): " + ist_time_str() + "\n";
+
+    try {
+        std::string prefs_block = bridge.fetch_preferences();
+        if (!prefs_block.empty()) {
+            dynamic_content += "\n" + prefs_block + "\n";
+        }
+    } catch (...) {}
+
     return {
         {"role", "system"},
-        {"content",
-            "You are DEMASCAS, a personal AI voice assistant — like JARVIS from Iron Man. "
-            "Current date: " + ist_date_str() + ". "
-            "Current time (IST): " + ist_time_str() + ". "
-            "Answer concisely in 1-3 spoken sentences. No markdown, no code blocks.\n\n"
-            "PERSONALITY:\n"
-            "- You are a CHARACTER with your own voice. You speak DIRECTLY to the user and anyone present.\n"
-            "- Never say 'you can say X' or 'try saying X'. YOU are the one talking.\n"
-            "- If the user says 'greet my friend', YOU greet them. If they say 'tell a joke', YOU tell it.\n"
-            "- Be warm, confident, and slightly witty. Show personality.\n"
-            "- Understand context: if someone is introduced to you, acknowledge THEM by name.\n"
-            "- The user is Daksh, your creator. Treat anyone they introduce as a friend.\n\n"
-            "IMPORTANT: You are on the FAST Q&A path — you have NO tools. "
-            "If the user asks you to compose an email, click something, fill a form, "
-            "open a website, or take any OS action, say 'Let me handle that for you' "
-            "and the system will re-route to the tool path. NEVER pretend to perform actions.\n"
-        }
+        {"content", static_content + dynamic_content}
     };
 }
 
@@ -571,13 +605,14 @@ void LLMClient::prewarm() {
 // ── Streaming fast chat (no tools) ──────────────────────────────────
 
 std::string LLMClient::fast_chat_streaming(const std::string& user_msg,
+                                            ToolBridge& bridge,
                                             SentenceCallback on_sentence,
                                             std::atomic<bool>& cancel) {
     trim_history();
     history_.push_back({{"role", "user"}, {"content", user_msg}});
 
     json messages;
-    messages.push_back(build_simple_prompt());
+    messages.push_back(build_simple_prompt(bridge));
 
     int start = std::max(0, static_cast<int>(history_.size()) - cfg::MAX_HISTORY);
     for (int i = start; i < static_cast<int>(history_.size()); ++i)
@@ -645,12 +680,70 @@ std::string LLMClient::chat_with_tools_streaming(
     history_.push_back({{"role", "user"}, {"content", enriched}});
 
     // Build system prompt with tool list embedded as text
-    auto sys = build_tool_prompt(filtered_schemas, learned_context);
+    auto sys = build_tool_prompt(filtered_schemas, bridge, learned_context);
 
     // ── ReAct loop ──────────────────────────────────────────────
     int depth = 0;
     std::string final_text;
     error_count_ = 0;  // reset per-command error counter
+
+    // Deterministic high-confidence path: selected/highlighted PDF summary.
+    {
+        std::string lower_msg = user_msg;
+        std::transform(lower_msg.begin(), lower_msg.end(), lower_msg.begin(), ::tolower);
+
+        bool gmail_open_req =
+            (lower_msg.find("open gmail") != std::string::npos) ||
+            (lower_msg.find("gmail in browser") != std::string::npos);
+        if (gmail_open_req) {
+            auto direct = bridge.execute("open_url_and_wait", {
+                {"url", "https://mail.google.com"},
+                {"browser", "Brave Browser"},
+                {"wait_seconds", 4}
+            });
+            if (!is_tool_error(direct)) {
+                std::string say = "Opened Gmail in Brave Browser.";
+                on_sentence(say);
+                return say;
+            }
+        }
+
+        bool compose_req =
+            ((lower_msg.find("compose") != std::string::npos ||
+              lower_msg.find("draft") != std::string::npos ||
+              lower_msg.find("write") != std::string::npos ||
+              lower_msg.find("new") != std::string::npos) &&
+             (lower_msg.find("email") != std::string::npos ||
+              lower_msg.find("mail") != std::string::npos));
+        if (compose_req) {
+            auto open_res = bridge.execute("open_url_and_wait", {
+                {"url", "https://mail.google.com"},
+                {"browser", "Brave Browser"},
+                {"wait_seconds", 4}
+            });
+            auto draft_res = bridge.execute("gmail_compose_draft", json::object());
+            if (!is_tool_error(open_res) && !is_tool_error(draft_res)) {
+                std::string say = "Opened Gmail and started a new draft.";
+                on_sentence(say);
+                return say;
+            }
+        }
+
+        bool selected_pdf_req =
+            (lower_msg.find("summarize") != std::string::npos || lower_msg.find("summarise") != std::string::npos) &&
+            (lower_msg.find("selected pdf") != std::string::npos ||
+             lower_msg.find("selected file") != std::string::npos ||
+             lower_msg.find("highlighted file") != std::string::npos);
+
+        if (selected_pdf_req) {
+            auto direct = bridge.execute("summarize_selected_pdf", json::object());
+            if (!direct.empty() && direct.rfind("[-]", 0) != 0 && direct.rfind("Failed:", 0) != 0) {
+                on_sentence(direct);
+                return direct;
+            }
+            // If this direct path fails, continue with normal tool-planning below.
+        }
+    }
     std::string prev_tool;   // for dedup detection
     json        prev_args;   // for dedup detection
 
@@ -825,6 +918,35 @@ bool LLMClient::is_multi_step_command(const std::string& command) const {
     return verb_count >= 2;
 }
 
+bool LLMClient::is_structured_task(const std::string& command) const {
+    std::string cmd = command;
+    std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
+
+    // ── Task-oriented phrases that always need structured execution ──
+    static const char* TASK_PHRASES[] = {
+        "write an email", "write a mail", "write email", "write mail",
+        "send an email", "send a mail", "send email", "send mail",
+        "compose email", "compose mail", "compose a", "draft email",
+        "reply to", "respond to", "forward email", "forward mail",
+        "search on youtube", "search youtube", "play on youtube",
+        "search on google", "google for", "search google",
+        "log into", "log in to", "sign into", "sign in to",
+        "open gmail and", "open youtube and", "open google and",
+        "go to gmail", "go to youtube",
+        "download from", "upload to",
+        "fill out", "fill in the", "submit the form",
+        "book a", "order a", "purchase",
+    };
+
+    for (auto& phrase : TASK_PHRASES) {
+        if (cmd.find(phrase) != std::string::npos)
+            return true;
+    }
+
+    // ── Also catch everything is_multi_step_command catches ──
+    return is_multi_step_command(command);
+}
+
 std::vector<std::string> LLMClient::plan_steps(
     const std::string& command,
     ToolBridge& bridge,
@@ -899,6 +1021,8 @@ std::vector<std::string> LLMClient::plan_steps(
                         "type_text_into_element", "quit_application",
                         "list_files_in_folder", "wait_for_element",
                         "scroll_direction", "vision_execute",
+                        "browser_click_text", "browser_type",
+                        "gmail_compose_draft",
                     };
 
                     // Store parsed step data for result substitution
@@ -1065,6 +1189,8 @@ std::vector<json> LLMClient::plan_steps_structured(
                     "type_text_into_element", "quit_application",
                     "list_files_in_folder", "wait_for_element",
                     "scroll_direction", "vision_execute",
+                    "browser_click_text", "browser_type",
+                    "gmail_compose_draft",
                 };
 
                 for (auto& item : arr) {

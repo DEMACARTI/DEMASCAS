@@ -19,14 +19,14 @@ inline const std::string WHISPER_TINY_MODEL = "models/ggml-tiny.bin";
 inline const std::string WHISPER_BASE_MODEL = "models/ggml-base.bin";
 
 // ─── MLX LLM servers (mlx-lm + mlx-vlm, native Apple Silicon) ──
-// Text model:  Qwen2.5-3B-Instruct-4bit on port 8081
+// Text model:  Phi-4-mini-instruct-4bit on port 8081
 // Vision model: Qwen2.5-VL-3B-Instruct-4bit on port 8082
 // Both use OpenAI-compatible /v1/chat/completions endpoints.
 // RAM budget: ~1.8 GB text + ~1.6 GB vision = ~3.4 GB model RAM.
 
 inline const std::string MLX_TEXT_URL     = "http://127.0.0.1:8081/v1/chat/completions";
 inline const std::string MLX_VL_URL       = "http://127.0.0.1:8082/v1/chat/completions";
-inline const std::string MLX_TEXT_MODEL   = "mlx-community/Qwen2.5-3B-Instruct-4bit";
+inline const std::string MLX_TEXT_MODEL   = "mlx-community/Phi-4-mini-instruct-4bit";
 inline const std::string MLX_VL_MODEL     = "mlx-community/Qwen2.5-VL-3B-Instruct-4bit";
 constexpr int            TOOL_CTX         = 2048;     // context window for tool-calling path
 constexpr int            TOOL_PREDICT     = 200;      // max tokens for tool-calling responses
@@ -57,6 +57,7 @@ constexpr float SCREEN_STABLE_THRESHOLD = 0.025f;  // fraction of pixels changed
 // ─── Tool execution limits ─────────────────────────────────────
 constexpr int   TOOL_TIMEOUT_MS      = 8000;    // max ms for a single tool call
 constexpr int   REACT_MAX_ERRORS     = 3;       // consecutive tool errors before hard stop
+constexpr long  TASK_EXEC_TIMEOUT_SEC = 60L;    // max seconds for STE /plan_and_execute (longer due to multi-step waits)
 
 // ─── Hallucination / sleep-back ────────────────────────────────
 constexpr int   MAX_CONSECUTIVE_BLANKS = 2;     // blanks before returning to SLEEPING

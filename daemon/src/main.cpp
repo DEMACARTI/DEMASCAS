@@ -408,6 +408,44 @@ static std::string normalize_transcription(const std::string& raw) {
     while (!s.empty() && s.front() == ' ') s.erase(s.begin());
     while (!s.empty() && s.back() == ' ')  s.pop_back();
 
+    // ── STEP 6: Targeted speech autocorrections for common domains ──
+    {
+        std::string sl = to_lower(s);
+
+        // lofi query normalization from common ASR variants
+        auto repl_all = [](std::string& x, const std::string& from, const std::string& to) {
+            size_t pos = 0;
+            while ((pos = x.find(from, pos)) != std::string::npos) {
+                x.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        };
+        repl_all(sl, "low five", "lofi");
+        repl_all(sl, "low fi", "lofi");
+        repl_all(sl, "lo fi", "lofi");
+
+        // Canonical Bennett LMS normalization for noisy transcripts
+        if (sl.find("lms") != std::string::npos) {
+            static const std::vector<std::string> bennett_variants = {
+                "bennit", "benit", "bennet", "benned", "bewewd", "penit", "bennett"
+            };
+            bool looks_bennett = false;
+            for (const auto& v : bennett_variants) {
+                if (sl.find(v) != std::string::npos) { looks_bennett = true; break; }
+            }
+            if (looks_bennett) {
+                sl = std::regex_replace(sl, std::regex(R"(lms\.[a-z0-9.-]+)", std::regex::icase),
+                                        "lms.bennett.edu.in");
+            }
+
+            // TLD truncations from speech models
+            sl = std::regex_replace(sl, std::regex(R"(\.edu\.n\b)", std::regex::icase), ".edu.in");
+            sl = std::regex_replace(sl, std::regex(R"(\.edu\.i\b)", std::regex::icase), ".edu.in");
+        }
+
+        s = sl;
+    }
+
     return s;
 }
 
@@ -446,7 +484,7 @@ int main() {
               << "╔══════════════════════════════════════════════╗\n"
               << "║  DEMASCAS — Bare-Metal C++ Daemon             ║\n"
               << "║  Apple Silicon • whisper.cpp • MLX              ║\n"
-              << "║  Qwen2.5-3B-4bit • Kokoro TTS • streaming      ║\n"
+              << "║  Phi-4-mini-4bit • Kokoro TTS • streaming      ║\n"
               << "╚══════════════════════════════════════════════╝\n\n";
 
     // ── 1. Connect to the Python tool micro-service ─────────────
@@ -531,6 +569,12 @@ int main() {
             }
         }
 
+        // Filter plain-text tool-call leaks like: open_url_and_wait({'url': ...})
+        if (std::regex_search(sentence, std::regex(R"(^\s*[a-z_]+\s*\(\{.*\}\)\s*$)", std::regex::icase))) {
+            std::cout << "[🔊 TTS] (filtered tool-call text) " << sentence.substr(0, 80) << "...\n";
+            return;
+        }
+
         // ── Skip low-level technical narration ──────────────
         // Phrases the LLM generates that describe internal actions
         // rather than providing useful info to the user.
@@ -602,13 +646,35 @@ int main() {
             }
 
             auto chunk = audio.capture_chunk(cfg::WAKE_LISTEN_WINDOW);
-            if (chunk.empty()) break;
+            if (chunk.empty()) {
+                std::cout << "[DEBUG] capture_chunk returned empty\n";
+                break;
+            }
 
             // VAD gate — skip whisper if the chunk is silence
             float energy = demascas::AudioEngine::rms(
                 chunk.data(), chunk.size());
-            if (energy < cfg::VAD_ENERGY_THRESHOLD * 0.5f) {
-                break;
+            
+            // Debug: show energy level periodically so user can
+            // verify mic is working and calibrate threshold
+            {
+                static int vad_skip_count = 0;
+                if (energy < cfg::VAD_ENERGY_THRESHOLD * 0.3f) {
+                    ++vad_skip_count;
+                    // Log every 5th skip so console isn't flooded
+                    if (vad_skip_count % 5 == 1) {
+                        std::cout << "[VAD] silence (energy=" << energy
+                                  << ", threshold=" << (cfg::VAD_ENERGY_THRESHOLD * 0.3f)
+                                  << ", skips=" << vad_skip_count << ")\n";
+                    }
+                    break;
+                }
+                // Reset skip counter when speech detected
+                if (vad_skip_count > 0) {
+                    std::cout << "[VAD] speech detected after " << vad_skip_count
+                              << " silent chunks (energy=" << energy << ")\n";
+                    vad_skip_count = 0;
+                }
             }
 
             auto transcript = whisper.transcribe_wake(chunk);
@@ -773,6 +839,7 @@ int main() {
             std::string reply;
             std::string path_taken;
             cancel_llm = false;
+            const std::string& normalized_command = current_command;
 
             // ── Continuation detection ─────────────────────────
             // If we have pending file choices from a previous turn,
@@ -901,304 +968,50 @@ int main() {
                           << current_command << " → " << *shortcut << "\n";
                 bridge.execute("press_keyboard_shortcut",
                                {{"keys", *shortcut}});
-                reply = llm.fast_chat_streaming(
-                    current_command, on_sentence, cancel_llm);
+                reply = "Done.";
+                on_sentence(reply);
             }
-            // PATH 1.5: URL detection — open websites deterministically
-            //   Bypasses the LLM for reliability.  Qwen 3B often picks
-            //   the wrong tool (open_application instead of open_url).
-            //   Guard: skip if user is ASKING ABOUT a URL, not requesting navigation.
-            else if ([&]() {
-                // Check if this is a question ABOUT a URL, not a navigation request
-                std::string cl = to_lower(current_command);
-                static const char* QUESTION_ABOUT_URL[] = {
-                    "why did you open", "why did you go to", "why are you on",
-                    "what is", "what's", "close", "stop", "don't open",
-                    "i didn't want", "i didn't ask", "go back",
-                    "why did you", "i said", "that's wrong",
-                    "why is", "who told you",
-                };
-                for (auto& q : QUESTION_ABOUT_URL) {
-                    if (cl.find(q) != std::string::npos) return false;
-                }
-                return shortcuts.extract_url(current_command).has_value();
-            }()) {
-                auto url_match = shortcuts.extract_url(current_command);
-                path_taken = "url";
-                std::cout << "[🌐 URL PATH] " << url_match->url;
-                if (!url_match->browser.empty())
-                    std::cout << " (" << url_match->browser << ")";
-                std::cout << "\n";
+            // PATH 2.5: Domain Agent (specialized, multi-step, memory-aware)
+            else if (demascas::is_agent_command(normalized_command)) {
+                path_taken = "PATH_3.5_AGENT";
+                std::string context_json = "{}";
+                try {
+                    auto ctx = bridge.fetch_active_context();
+                    if (!ctx.empty()) context_json = ctx;
+                } catch (...) {}
 
-                nlohmann::json url_args = {{"url", url_match->url}};
-                if (!url_match->browser.empty())
-                    url_args["browser"] = url_match->browser;
+                auto agent_result = bridge.execute_agent(normalized_command, context_json);
 
-                auto result = bridge.execute("open_url", url_args);
-                std::cout << "[TOOL RESULT] " << result << "\n";
-
-                // Concise spoken confirmation
-                std::string domain = url_match->url;
-                if (domain.rfind("https://", 0) == 0)
-                    domain = domain.substr(8);
-                std::string confirm = "Opening " + domain;
-                if (!url_match->browser.empty())
-                    confirm += " in " + url_match->browser;
-                confirm += ".";
-                on_sentence(confirm);
-                reply = confirm;
-            }
-            // PATH 1.6: App open — deterministic, bypasses LLM
-            //   "open Safari", "launch Chrome", etc. → instant & reliable.
-            else if (auto app_open = shortcuts.extract_app_open(current_command)) {
-                path_taken = "app_open";
-                std::cout << "[🚀 APP OPEN] " << app_open->app_name << "\n";
-
-                auto result = bridge.execute("open_application",
-                                              {{"app_name", app_open->app_name}});
-                std::cout << "[TOOL RESULT] " << result << "\n";
-
-                std::string confirm = "Opening " + app_open->app_name + ".";
-                on_sentence(confirm);
-                reply = confirm;
-            }
-            // PATH 1.7: App close — deterministic, bypasses LLM
-            //   "close Safari", "quit Chrome" → instant.
-            //   "close window"/"close tab" still go through shortcut map.
-            else if (auto app_close = shortcuts.extract_app_close(current_command)) {
-                path_taken = "app_close";
-                std::cout << "[🛑 APP CLOSE] " << app_close->app_name << "\n";
-
-                auto result = bridge.execute("quit_application",
-                                              {{"app_name", app_close->app_name}});
-                std::cout << "[TOOL RESULT] " << result << "\n";
-
-                std::string confirm = "Closing " + app_close->app_name + ".";
-                on_sentence(confirm);
-                reply = confirm;
-            }
-            // PATH 1.8: Macro fast-path — pre-built multi-step sequences
-            //   "open gmail", "open youtube", "google X" → instant, no LLM.
-            else if (auto macro = demascas::try_macro(current_command)) {
-                path_taken = "macro";
-                std::cout << "[📦 MACRO] " << macro->description << "\n";
-
-                for (auto& step : macro->steps) {
-                    try {
-                        auto args = nlohmann::json::parse(step.args_json);
-                        auto result = bridge.execute(step.tool, args);
-                        std::cout << "[MACRO STEP] " << step.tool << " → " << result << "\n";
-                    } catch (const std::exception& e) {
-                        std::cerr << "[!] Macro step failed: " << e.what() << "\n";
+                if (!agent_result.summary.empty()) {
+                    std::string buf;
+                    for (char c : agent_result.summary) {
+                        buf += c;
+                        if ((c == '.' || c == '!' || c == '?') && buf.size() > 10) {
+                            on_sentence(buf);
+                            buf.clear();
+                        }
                     }
-                    if (step.delay_ms > 0)
-                        std::this_thread::sleep_for(std::chrono::milliseconds(step.delay_ms));
+                    if (!buf.empty()) on_sentence(buf);
+                    reply = agent_result.summary;
+                } else if (!agent_result.error.empty()) {
+                    std::string err = agent_result.error.substr(0, 80);
+                    on_sentence("I ran into an issue: " + err);
+                    reply = "I ran into an issue: " + err;
                 }
-                on_sentence(macro->description);
-                reply = macro->description;
+
+                bridge.log_interaction(
+                    normalized_command, "PATH_3.5_AGENT", {},
+                    agent_result.summary, agent_result.success
+                );
             }
             // PATH 2: Simple question (streaming fast LLM, no tool schemas)
             else if (shortcuts.is_simple_question(current_command)) {
                 path_taken = "fast";
                 std::cout << "[⚡ FAST PATH] Simple question — streaming.\n";
                 reply = llm.fast_chat_streaming(
-                    current_command, on_sentence, cancel_llm);
-            }
-            // PATH 2.5: Multi-step planner — decompose and execute sequentially
-            //   "search for cats on youtube" → open Safari → go to youtube.com → search
-            else if (llm.is_multi_step_command(current_command)) {
-                path_taken = "planner";
-                std::cout << "[📋 PLANNER] Multi-step command detected.\n";
-
-                std::string learned_ctx;
-                try {
-                    learned_ctx = bridge.fetch_learned_context(current_command);
-                } catch (...) {}
-
-                // Decompose into structured steps (JSON format)
-                auto plan = llm.plan_steps_structured(current_command, bridge, cancel_llm);
-
-                if (plan.empty() || cancel_llm.load()) {
-                    // Fallback to single tool call if planner fails
-                    std::cout << "[PLANNER] No steps — falling back to tool path.\n";
-                    reply = llm.chat_with_tools_streaming(
-                        current_command, bridge, on_sentence, cancel_llm,
-                        learned_ctx);
-                } else {
-                    // ── Execute with inter-step result passing ──────
-                    std::map<int, std::string> step_results;
-                    std::string last_reply;
-                    bool had_failure = false;
-
-                    for (size_t i = 0; i < plan.size() && !cancel_llm.load(); ++i) {
-                        auto& step = plan[i];
-                        std::string tool = step.value("tool", "");
-                        auto args = step.value("args", nlohmann::json::object());
-
-                        // Substitute {result_of_step_N} tokens in args
-                        std::string args_str = args.dump();
-                        for (auto& [step_num, result_val] : step_results) {
-                            std::string token = "{result_of_step_" + std::to_string(step_num) + "}";
-                            size_t pos;
-                            while ((pos = args_str.find(token)) != std::string::npos) {
-                                args_str.replace(pos, token.size(), result_val);
-                            }
-                        }
-
-                        // Re-parse substituted args
-                        nlohmann::json resolved_args;
-                        try {
-                            resolved_args = nlohmann::json::parse(args_str);
-                        } catch (...) {
-                            resolved_args = args;
-                        }
-
-                        std::cout << "[PLANNER STEP " << (i + 1) << "/"
-                                  << plan.size() << "] " << tool
-                                  << "(" << resolved_args.dump() << ")\n";
-
-                        auto result = bridge.execute(tool, resolved_args);
-                        std::cout << "[STEP RESULT] " << result << "\n";
-
-                        // Extract first_match_path from find_file results for chaining
-                        std::string stored_result = result;
-                        if (tool == "find_file") {
-                            std::string extracted = extract_first_file_path(result);
-                            if (!extracted.empty()) {
-                                stored_result = extracted;
-                                std::cout << "[PLANNER] Extracted path: " << stored_result << "\n";
-                            } else {
-                                // Check if count > 1 (multiple matches — need clarification)
-                                bool has_matches = result.find("\"found\": true") != std::string::npos
-                                                || result.find("\"found\":true") != std::string::npos
-                                                || result.find("'found': True") != std::string::npos;
-                                if (!has_matches) {
-                                    // No matches at all — stop and report
-                                    std::string msg = "No files found.";
-                                    // Try to get the message from the result
-                                    try {
-                                        auto rj = nlohmann::json::parse(result);
-                                        msg = rj.value("message", msg);
-                                    } catch (...) {
-                                        // Try string extraction
-                                        auto mpos = result.find("'message':");
-                                        if (mpos == std::string::npos) mpos = result.find("\"message\":");
-                                        if (mpos != std::string::npos) {
-                                            mpos += 10;
-                                            while (mpos < result.size() && (result[mpos] == ' ' || result[mpos] == '\'' || result[mpos] == '"'))
-                                                ++mpos;
-                                            char q = '\'';
-                                            auto mend = result.find(q, mpos);
-                                            if (mend != std::string::npos)
-                                                msg = result.substr(mpos, mend - mpos);
-                                        }
-                                    }
-                                    on_sentence(msg);
-                                    last_reply = msg;
-                                    had_failure = true;
-                                    break;
-                                } else {
-                                    // found=True but no first_match_path => multiple matches, need clarification
-                                    // Extract count
-                                    int result_count = 0;
-                                    try {
-                                        auto rj = nlohmann::json::parse(result);
-                                        result_count = rj.value("count", 0);
-                                    } catch (...) {}
-                                    
-                                    if (result_count > 1) {
-                                        // Enter CLARIFYING state: speak choices, wait for user
-                                        std::string msg;
-                                        try {
-                                            auto rj = nlohmann::json::parse(result);
-                                            msg = rj.value("message", "I found multiple files. Which one did you mean?");
-                                            // Extract file choices for CLARIFYING state
-                                            pending_file_choices.clear();
-                                            clarifying_goal = current_command;
-                                            if (rj.contains("matches") && rj["matches"].is_array()) {
-                                                for (auto& m : rj["matches"]) {
-                                                    std::string fn = m.value("name", "?");
-                                                    std::string fp = m.value("path", "?");
-                                                    pending_file_choices.push_back({fn, fp});
-                                                }
-                                            }
-                                        } catch (...) {
-                                            msg = "I found multiple files. Which one did you mean?";
-                                        }
-                                        on_sentence(msg);
-                                        last_reply = msg;
-                                        if (!pending_file_choices.empty()) {
-                                            state = State::CLARIFYING;
-                                            reply = last_reply;
-                                            // Log interaction
-                                            try {
-                                                bridge.log_interaction(
-                                                    current_command, "planner",
-                                                    llm.last_tools_used(),
-                                                    reply
-                                                );
-                                            } catch (...) {}
-                                            break;  // exit planner loop, go to CLARIFYING
-                                        }
-                                        had_failure = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check for tool errors
-                        if (result.find("[-]") == 0 || result.find("\"success\": false") != std::string::npos ||
-                            result.find("\"success\":false") != std::string::npos) {
-                            std::cout << "[PLANNER] Step " << (i + 1) << " failed — stopping.\n";
-                            on_sentence("I ran into an issue. " + result.substr(0, 150));
-                            last_reply = result;
-                            had_failure = true;
-                            break;
-                        }
-
-                        step_results[static_cast<int>(i + 1)] = stored_result;
-                    }
-
-                    if (!had_failure) {
-                        on_sentence("Done.");
-                        last_reply = "Done.";
-                    }
-                    reply = last_reply.empty() ? "Done." : last_reply;
-
-                    // If planner transitioned to CLARIFYING, exit PROCESSING now
-                    if (state == State::CLARIFYING) break;
-                }
-            }
-            // PATH 4: Deep intent — communication, research, complex tasks
-            //   3-phase: Understand → Plan → Execute
-            //   "reply to that email", "compose email to John", "research X"
-            else if (llm.is_deep_intent_command(current_command)) {
-                path_taken = "deep_intent";
-                std::cout << "[🧠 DEEP INTENT] Complex task detected.\n";
-
-                reply = llm.deep_intent_streaming(
                     current_command, bridge, on_sentence, cancel_llm);
-
-                // Check if deep intent returned a confirmation request
-                // (pending_confirmation status from confirm_and_execute tool)
-                try {
-                    auto rj = nlohmann::json::parse(reply);
-                    if (rj.contains("status") &&
-                        rj.value("status", "") == "pending_confirmation") {
-                        pending_tool = rj.value("pending_tool", "");
-                        pending_args = rj.value("pending_args", nlohmann::json::object());
-                        pending_description = rj.value("confirm_speech",
-                            "Should I proceed?");
-                        // The confirmation speech was already spoken by on_sentence
-                        state = State::CONFIRMING;
-                        break;  // exit PROCESSING, enter CONFIRMING
-                    }
-                } catch (...) {
-                    // reply wasn't JSON — continue normally
-                }
             }
-            // PATH 3: Full streaming tool-calling ReAct loop
+            // PATH 3: Tool ReAct (default fallback for everything else)
             else {
                 path_taken = "tool";
                 std::cout << "[🔧 TOOL PATH] Full processing — streaming.\n";
@@ -1211,6 +1024,23 @@ int main() {
                 reply = llm.chat_with_tools_streaming(
                     current_command, bridge, on_sentence, cancel_llm,
                     learned_ctx);
+
+                // Check if the tool path returned a confirmation request
+                // (pending_confirmation status from confirm_and_execute tool)
+                try {
+                    auto rj = nlohmann::json::parse(reply);
+                    if (rj.contains("status") &&
+                        rj.value("status", "") == "pending_confirmation") {
+                        pending_tool = rj.value("pending_tool", "");
+                        pending_args = rj.value("pending_args", nlohmann::json::object());
+                        pending_description = rj.value("confirm_speech",
+                            "Should I proceed?");
+                        state = State::CONFIRMING;
+                        break;  // exit PROCESSING, enter CONFIRMING
+                    }
+                } catch (...) {
+                    // reply wasn't JSON — continue normally
+                }
             }
 
             // Stop barge-in monitor

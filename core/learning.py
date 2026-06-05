@@ -45,6 +45,7 @@ _PROFILE_PATH = os.path.join(_DEMASCAS_DIR, "user_profile.json")
 # Episode limits — keeps ChromaDB lean on 8 GB
 _MAX_EPISODES = 500
 _COMPRESS_THRESHOLD = 550  # when we hit this, compress down to _MAX_EPISODES
+_LEARNED_CONTEXT_CHAR_BUDGET = 1200
 
 # Lazy-loaded ChromaDB collection for episodes
 _episodes_collection = None
@@ -534,7 +535,7 @@ def get_learned_context(query: str) -> str:
         sections.append(f"[USER PROFILE]\n{profile_str}")
 
     # ── Similar past interactions ────────────────────────────────
-    episodes = get_relevant_episodes(query, top_k=3)
+    episodes = get_relevant_episodes(query, top_k=2)
     if episodes:
         ep_lines = []
         for ep in episodes:
@@ -549,7 +550,10 @@ def get_learned_context(query: str) -> str:
     if not sections:
         return ""
 
-    return "\n\n".join(sections)
+    ctx = "\n\n".join(sections)
+    if len(ctx) > _LEARNED_CONTEXT_CHAR_BUDGET:
+        return ctx[:_LEARNED_CONTEXT_CHAR_BUDGET].rstrip() + "\n... [context truncated]"
+    return ctx
 
 
 def get_context_for_http(query: str) -> dict:
@@ -612,6 +616,44 @@ def before_command(query: str) -> str:
         return ""
 
 
+def save_preference(category: str, value: str) -> str:
+    """
+    Save an explicit user preference to the user profile.
+    Called via the save_user_preference tool when the user explicitly
+    asks DEMASCAS to remember a preference, favorite app, or personal rule.
+
+    Args:
+        category: The preference category (e.g. 'browser', 'music_app', 'rule').
+        value: The preference value (e.g. 'always use Brave', 'Spotify').
+
+    Returns:
+        Confirmation string.
+    """
+    if not category or not value:
+        return "[-] Both category and value are required."
+
+    profile = _load_profile()
+    facts = profile.get("facts", [])
+
+    fact_entry = f"{category}: {value}"
+
+    # Replace existing fact with the same category prefix if present
+    updated = False
+    for i, f in enumerate(facts):
+        if f.lower().startswith(category.lower() + ":"):
+            facts[i] = fact_entry
+            updated = True
+            break
+
+    if not updated:
+        facts.append(fact_entry)
+
+    # Cap at 30 facts
+    profile["facts"] = facts[:30]
+    _save_profile(profile)
+    _flush_profile_now()
+
+    return f"Saved preference: {fact_entry}"
 # ═══════════════════════════════════════════════════════════════════════
 # 5. MACRO AUTO-PROMOTION  — learns multi-step sequences over time
 # ═══════════════════════════════════════════════════════════════════════

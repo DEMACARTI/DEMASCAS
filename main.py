@@ -31,6 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def main() -> None:
+    host = os.getenv("DEMASCAS_HOST", "127.0.0.1")
+    port = int(os.getenv("DEMASCAS_PORT", "5001"))
+
     print("========================================")
     print("   DEMASCAS SYSTEM CORE INITIALIZED     ")
     print("========================================")
@@ -43,7 +46,7 @@ def main() -> None:
 
     # Run the Flask tool server — the C++ daemon talks to this.
     # threaded=True so the daemon can make concurrent tool calls.
-    app.run(host="127.0.0.1", port=5001, threaded=True)
+    app.run(host=host, port=port, threaded=True)
 
 
 if __name__ == "__main__":

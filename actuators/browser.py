@@ -313,7 +313,16 @@ def browser_get_page_text(max_chars: int = 5000) -> dict:
         return text.substring(0, {max_chars});
     }})()
     '''
-    return browser_execute_js(js)
+    result = browser_execute_js(js)
+    if not result.get("success", False):
+        return result
+
+    text = str(result.get("value", result.get("message", "")))
+    MAX_CHARS = 2000
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS] + f"\n[... truncated, {len(text) - MAX_CHARS} chars remaining]"
+
+    return {"success": True, "message": text, "value": text}
 
 
 def browser_get_page_html(max_chars: int = 10000) -> dict:
@@ -672,6 +681,14 @@ def browser_press_key(key: str, selector: str = "") -> dict:
     Returns:
         {"success": bool, "message": str}
     """
+    if not isinstance(key, str) or not key.strip():
+        return {"success": False, "message": "[-] browser_press_key: 'key' argument is required"}
+
+    if selector is None:
+        selector = ""
+    elif not isinstance(selector, str):
+        selector = str(selector)
+
     safe_key = key.replace("'", "\\'")
     if selector:
         safe_sel = selector.replace("'", "\\'")

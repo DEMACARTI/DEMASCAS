@@ -19,6 +19,8 @@ Start:
 import atexit
 import sys
 import os
+import logging
+import re
 
 # Ensure the DEMASCAS package root is on the path so we can import
 # actuators/, sensors/, core/, and mcp/ directly.
@@ -32,7 +34,7 @@ from flask import Flask, request, jsonify
 
 from actuators.file_system import (
     summarize_latest_pdf, list_files_in_folder, create_file, delete_file,
-    find_file, open_file,
+    find_file, open_file, summarize_selected_pdf,
 )
 from actuators.network import search_web, read_webpage
 from actuators.system_control import (
@@ -71,6 +73,11 @@ from actuators.communication import (
     web_research_and_report,
 )
 from actuators.smart_search import smart_search, get_weather, get_news
+from actuators.system_commands import run_shell_command, get_system_info, set_default_browser
+from core.preferences import set_preference, remove_preference, get_all_preferences, set_humor_level
+from core.learning import save_preference as learning_save_preference
+from core.orchestrator import architect_plan
+
 from actuators.browser import (
     browser_execute_js,
     browser_get_url, browser_get_title,
@@ -99,6 +106,18 @@ from actuators.web_agent import (
 )
 from core.screen_context import get_screen_context_block, get_screen_digest
 from core.utils import resolve_safe_path
+
+logger = logging.getLogger(__name__)
+
+# Agent system
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(__file__))
+try:
+    from agents import run_agent, should_use_agent, route_command, get_dispatcher
+    _AGENTS_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Agent system unavailable: {e}")
+    _AGENTS_AVAILABLE = False
 
 
 # ── Safe click wrapper (3-tier fallback) ─────────────────────────────
@@ -161,6 +180,7 @@ TOOL_MAP = {
     "open_application":          open_application,
     "press_keyboard_shortcut":   press_keyboard_shortcut,
     "summarize_latest_pdf":      summarize_latest_pdf,
+    "summarize_selected_pdf":    summarize_selected_pdf,
     "get_active_window_tree":    get_active_window_tree,
     "quit_application":          quit_application,
     "activate_application":      activate_application,
@@ -184,6 +204,18 @@ TOOL_MAP = {
     "wait_for_app_ready":        wait_for_app_ready,
     "get_clipboard":             get_clipboard,
     "set_clipboard":             set_clipboard,
+    
+    # ── System and Intelligence Tools ────────────────────────────
+    "run_shell_command":         run_shell_command,
+    "get_system_info":           get_system_info,
+    "set_default_browser":       set_default_browser,
+    "set_preference":            set_preference,
+    "remove_preference":         remove_preference,
+    "set_humor_level":           set_humor_level,
+    "save_user_preference":      learning_save_preference,
+    # ── Plan-Mode Orchestrator ───────────────────────────────────
+    "architect_plan":            architect_plan,
+    
     "find_and_click":            find_and_click,
     "right_click_element":       right_click_element,
     "type_and_submit":           type_and_submit,
@@ -323,7 +355,14 @@ def _update_context(tool_name: str, args: dict, result: str, success: bool):
         if ACTIVE_CONTEXT["active_app"] == args.get("app_name"):
             ACTIVE_CONTEXT["active_app"] = None
     elif tool_name == "open_url" or tool_name == "open_url_and_wait":
-        ACTIVE_CONTEXT["active_app"] = "Safari"
+        browser_name = str(args.get("browser", "") or "").strip()
+        if not browser_name:
+            try:
+                prefs = get_all_preferences()
+                browser_name = str(prefs.get("default_browser", "") or "").strip()
+            except Exception:
+                browser_name = ""
+        ACTIVE_CONTEXT["active_app"] = browser_name or ACTIVE_CONTEXT.get("active_app") or "Browser"
         ACTIVE_CONTEXT["active_url"] = args.get("url", None)
 
     # ── Browser tool tracking ──
@@ -433,12 +472,53 @@ def _context_block() -> str:
         parts.append(f"- File choices: {', '.join(names)}")
     return "\n".join(parts)
 
+
+def _normalize_user_command(command: str) -> str:
+    """Lightweight autocorrection for noisy speech-to-text command text."""
+    text = str(command or "").strip()
+    if not text:
+        return text
+
+    original = text
+    low = text.lower()
+
+    # Common speech spelling forms for domains
+    low = re.sub(r"\bdouble\s+([a-z])\b", lambda m: m.group(1) * 2, low)
+    low = low.replace(" dot ", ".")
+    low = re.sub(r"\s*\.\s*", ".", low)
+    low = low.replace(" adu ", " edu ")
+
+    # Canonical LMS domain correction for common recognition variants
+    if "lms" in low and any(tok in low for tok in [
+        "bennit", "benit", "bennet", "benned", "bewewd", "penit", "paneth", "bennett"
+    ]):
+        low = re.sub(r"lms\.[a-z0-9.-]+", "lms.bennett.edu.in", low)
+
+    # Collapse immediate repeated phrase patterns from ASR
+    # e.g. "start my study routine start my study routine" -> "start my study routine"
+    low = re.sub(r"\b(.{5,80}?)\s+\1\b", r"\1", low)
+
+    # Fix common TLD truncations after speech recognition
+    low = re.sub(r"\.edu\.n\b", ".edu.in", low)
+    low = re.sub(r"\.edu\.i\b", ".edu.in", low)
+
+    # Study routine should map clearly to workflow behavior
+    if "study routine" in low and "workflow" not in low:
+        low = low + " workflow"
+
+    # Preserve capitalization only where useful; commands are generally case-insensitive.
+    fixed = low.strip()
+    if fixed != original:
+        print(f"[AUTOCORRECT] '{original}' -> '{fixed}'")
+    return fixed
+
 # ── Tool alias normalization — tolerate common LLM hallucinated names ──
 
 TOOL_ALIASES = {
     "click": "click_ui_element",
     "click_element": "click_ui_element",
     "click_ui": "click_ui_element",
+    "close_button": "click_ui_element",
     "type": "type_text",
     "type_text_in": "type_text_into_element",
     "find_element": "find_and_click",
@@ -519,6 +599,8 @@ def _normalize_tool_call(name: str, args: dict) -> tuple[str, dict]:
             normalized["element_name"] = normalized.pop("element")
         if "target" in normalized and "element_name" not in normalized:
             normalized["element_name"] = normalized.pop("target")
+        if "button" in normalized and "element_name" not in normalized:
+            normalized["element_name"] = normalized.pop("button")
 
     if canonical == "find_and_click":
         if "element_name" in normalized and "search_text" not in normalized:
@@ -542,11 +624,32 @@ def _normalize_tool_call(name: str, args: dict) -> tuple[str, dict]:
         if "message" in normalized and "text" not in normalized:
             normalized["text"] = normalized.pop("message")
 
-    if canonical == "open_url":
+    if canonical in {"open_url", "open_url_and_wait"}:
         if "website" in normalized and "url" not in normalized:
             normalized["url"] = normalized.pop("website")
         if "link" in normalized and "url" not in normalized:
             normalized["url"] = normalized.pop("link")
+        if "app_name" in normalized and "browser" not in normalized:
+            normalized["browser"] = normalized.pop("app_name")
+        if "app" in normalized and "browser" not in normalized:
+            normalized["browser"] = normalized.pop("app")
+
+    if canonical == "compose_email":
+        key_lookup = {k.lower(): k for k in list(normalized.keys())}
+
+        def _move_aliases(target_key: str, aliases: tuple[str, ...]) -> None:
+            if target_key in normalized:
+                return
+            for alias in aliases:
+                src_key = key_lookup.get(alias.lower())
+                if src_key and src_key in normalized:
+                    normalized[target_key] = normalized.pop(src_key)
+                    break
+
+        _move_aliases("recipient", ("to", "email", "to_address", "address", "toemail"))
+        _move_aliases("subject", ("title",))
+        _move_aliases("key_points", ("body", "message", "content", "text", "instructions"))
+        _move_aliases("tone", ("style",))
 
     # ── Browser tool argument normalization ──
     if canonical in ("browser_navigate", "browser_navigate_and_wait", "browser_new_tab"):
@@ -650,6 +753,18 @@ app = Flask(__name__)
 # ── MCP singleton — booted once at server start ─────────────────────
 
 _mcp: MCPManager | None = None
+
+
+def _server_host() -> str:
+    return os.getenv("DEMASCAS_HOST", "127.0.0.1")
+
+
+def _server_port() -> int:
+    return int(os.getenv("DEMASCAS_PORT", "5001"))
+
+
+def _should_boot_mcp() -> bool:
+    return os.getenv("DEMASCAS_SKIP_MCP_BOOT", "").strip().lower() not in {"1", "true", "yes", "on"}
 
 
 def _boot_mcp() -> MCPManager:
@@ -796,7 +911,7 @@ def get_filtered_tools():
     if not data or "query" not in data:
         return jsonify(_all_tool_schemas())  # fallback to all
 
-    query = data["query"]
+    query = _normalize_user_command(data["query"])
     max_tools = data.get("max_tools", 8)
     all_schemas = _all_tool_schemas()
     filtered = select_tools_for_query(
@@ -821,6 +936,17 @@ def health_check():
         "tools": len(TOOL_MAP) + mcp_count,
     })
 
+
+@app.route("/active_context", methods=["GET"])
+def get_context():
+    """Return only the active runtime context block."""
+    return jsonify({"context": _context_block()})
+
+@app.route("/preferences", methods=["GET"])
+def get_preferences():
+    """Return the formatted preferences block for LLM injection."""
+    from core.preferences import get_preferences_prompt
+    return jsonify({"preferences": get_preferences_prompt()})
 
 @app.route("/session", methods=["GET"])
 def get_session():
@@ -869,7 +995,7 @@ def deep_intent_endpoint():
     if not data or "command" not in data:
         return jsonify({"error": "Missing 'command'"}), 400
 
-    command = data["command"]
+    command = _normalize_user_command(data["command"])
     screen_ctx = data.get("screen_context", "")
     user_profile = data.get("user_profile", "")
 
@@ -928,6 +1054,145 @@ def deep_intent_endpoint():
         "user_profile": user_profile,
         "people_context": people_ctx,
     })
+
+
+# ── Structured Task Executor (STE) — plan, execute, verify ──────────
+
+@app.route("/plan_and_execute", methods=["POST"])
+def plan_and_execute_endpoint():
+    """
+    Structured Task Executor — plan, execute, verify, replan.
+
+    Body: {"command": "write an email to Aman"}
+    Returns: {
+        "status": "ok"|"partial"|"failed"|"clarifying",
+        "result": "Done.",
+        "steps_completed": 3,
+        "total_steps": 3,
+        "spoken_updates": ["Opening Gmail.", "Opening compose window.", "Done."],
+        "pending_file_choices": null
+    }
+    """
+    from core.task_executor import plan_task, execute_task
+    from core.learning import get_learned_context
+
+    data = request.get_json(silent=True)
+    if not data or "command" not in data:
+        return jsonify({"status": "failed", "result": "Missing 'command'",
+                        "steps_completed": 0, "total_steps": 0,
+                        "spoken_updates": [], "pending_file_choices": None}), 200
+
+    command = _normalize_user_command(data["command"])
+    print(f"\n[STE] ━━━ Structured Task: \"{command}\" ━━━")
+
+    # ── Gather context ───────────────────────────────────────
+    screen_ctx = ""
+    try:
+        screen_ctx = get_screen_context_block(force=True)
+    except Exception:
+        pass
+
+    learned_ctx = ""
+    try:
+        learned_ctx = get_learned_context(command)
+    except Exception:
+        pass
+
+    # ── Get filtered tools for this command ───────────────────
+    all_schemas = _all_tool_schemas()
+    filtered_schemas = select_tools_for_query(
+        command, all_schemas, max_tools=12,
+        active_app=ACTIVE_CONTEXT.get("active_app"),
+        active_url=ACTIVE_CONTEXT.get("active_url"),
+    )
+
+    # ── Plan ─────────────────────────────────────────────────
+    plan = plan_task(
+        command=command,
+        screen_context=screen_ctx or "No screen context available.",
+        tool_schemas=filtered_schemas if filtered_schemas else all_schemas,
+        learned_context=learned_ctx,
+    )
+
+    if plan is None or not plan.steps:
+        print("[STE] Planning failed — returning empty result.")
+        return jsonify({
+            "status": "failed",
+            "result": "I couldn't plan how to do that. Let me try a different approach.",
+            "steps_completed": 0, "total_steps": 0,
+            "spoken_updates": ["I couldn't plan the steps for that task."],
+            "pending_file_choices": None,
+        }), 200
+
+    # ── Execute ──────────────────────────────────────────────
+    def tool_dispatch(name: str, args: dict) -> str:
+        """Dispatch a tool call through the normal TOOL_MAP pipeline."""
+        import inspect
+        canon_name, canon_args = _normalize_tool_call(name, args)
+        func = TOOL_MAP.get(canon_name)
+        if func is None:
+            return f"[-] Unknown tool: {canon_name}"
+        try:
+            sig = inspect.signature(func)
+            cleaned = {}
+            for param_name, param in sig.parameters.items():
+                if param_name in canon_args:
+                    val = canon_args[param_name]
+                    if param.annotation is bool or (
+                        param.default is not inspect.Parameter.empty
+                        and isinstance(param.default, bool)):
+                        if isinstance(val, str):
+                            val = val.lower() in ("true", "1", "yes")
+                    cleaned[param_name] = val
+                elif param.default is not inspect.Parameter.empty:
+                    pass
+                else:
+                    cleaned[param_name] = canon_args.get(param_name)
+            result = str(func(**cleaned))
+            _update_context(canon_name, canon_args, result, success=True)
+            return result
+        except Exception as e:
+            _update_context(canon_name, canon_args, str(e), success=False)
+            return f"[-] Tool error ({canon_name}): {e}"
+
+    def screen_capture() -> str:
+        """Capture current screen state."""
+        try:
+            return get_active_window_tree() or ""
+        except Exception:
+            return ""
+
+    task_result = execute_task(
+        plan=plan,
+        tool_dispatch_fn=tool_dispatch,
+        screen_capture_fn=screen_capture,
+    )
+
+    print(f"[STE] ━━━ Result: {task_result.status} "
+          f"({task_result.steps_completed}/{task_result.total_steps} steps) ━━━\n")
+
+    # ── Log interaction for learning ─────────────────────────
+    try:
+        from core.learning import after_command
+        tools_used = [sr.tool for sr in task_result.step_results]
+        after_command(
+            command=command,
+            path_taken="structured_task",
+            tools_used=tools_used,
+            result=task_result.result,
+            success=(task_result.status == "ok"),
+        )
+    except Exception:
+        pass
+
+    return jsonify({
+        "status": task_result.status,
+        "result": task_result.result,
+        "steps_completed": task_result.steps_completed,
+        "total_steps": task_result.total_steps,
+        "spoken_updates": task_result.spoken_updates,
+        "pending_file_choices": task_result.pending_file_choices,
+    }), 200
 
 
 @app.route("/mcp/status", methods=["GET"])
@@ -1057,12 +1322,75 @@ def log_learning():
         return jsonify({"status": "error", "error": str(e)}), 200
 
 
+@app.route("/agent", methods=["POST"])
+def agent_endpoint():
+    """
+    Request:  {"command": "...", "context": {...}}   (context optional)
+    Response: {"success": bool, "summary": str, "steps_taken": int,
+               "tool_calls": [str], "error": str|null, "data": dict|null}
+    """
+    if not _AGENTS_AVAILABLE:
+        return jsonify({"error": "Agent system not loaded"}), 503
+
+    data = request.get_json(force=True) or {}
+    command = _normalize_user_command(str(data.get("command", "")).strip())
+    if not command:
+        return jsonify({"error": "Missing or empty 'command'"}), 400
+
+    context = data.get("context") or dict(ACTIVE_CONTEXT)
+
+    try:
+        result = run_agent(command, context)
+        return jsonify({
+            "success": result.success,
+            "summary": result.summary,
+            "steps_taken": result.steps_taken,
+            "tool_calls": result.tool_calls,
+            "error": result.error,
+            "data": result.data,
+        }), 200
+    except Exception as e:
+        logger.exception(f"[/agent] {e}")
+        return jsonify({
+            "success": False,
+            "summary": "Internal agent error.",
+            "steps_taken": 0,
+            "tool_calls": [],
+            "error": str(e),
+        }), 500
+
+
+@app.route("/agent/route", methods=["POST"])
+def agent_route_debug():
+    """
+    Request:  {"command": "..."}
+    Response: {"domain": str, "should_use_agent": bool, "scores": dict}
+    """
+    if not _AGENTS_AVAILABLE:
+        return jsonify({"error": "Agent system not loaded"}), 503
+
+    data = request.get_json(force=True) or {}
+    command = _normalize_user_command(str(data.get("command", "")).strip())
+    if not command:
+        return jsonify({"error": "Missing or empty 'command'"}), 400
+
+    dispatcher = get_dispatcher()
+    return jsonify({
+        "domain": route_command(command),
+        "should_use": should_use_agent(command),
+        "scores": dispatcher.scores(command),
+    }), 200
+
+
 # ── Entry point ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Boot MCP servers before Flask starts accepting requests
-    _boot_mcp()
-    atexit.register(_shutdown_mcp)
+    if _should_boot_mcp():
+        # Boot MCP servers before Flask starts accepting requests
+        _boot_mcp()
+        atexit.register(_shutdown_mcp)
+    else:
+        print("[*] MCP boot disabled via DEMASCAS_SKIP_MCP_BOOT=1; native tools only.")
 
     mcp_count = len(_mcp.get_mcp_tool_names()) if _mcp else 0
     total = len(TOOL_MAP) + mcp_count
@@ -1070,16 +1398,17 @@ if __name__ == "__main__":
     print(f"[*] DEMASCAS Tool Server starting ({total} tools: "
           f"{len(TOOL_MAP)} native + {mcp_count} MCP)...")
     print(f"[*] Endpoints:")
-    print(f"      POST http://127.0.0.1:5001/tool")
-    print(f"      GET  http://127.0.0.1:5001/tools")
-    print(f"      POST http://127.0.0.1:5001/tools_for_query")
-    print(f"      GET  http://127.0.0.1:5001/health")
-    print(f"      GET  http://127.0.0.1:5001/session")
-    print(f"      GET  http://127.0.0.1:5001/screen_context")
-    print(f"      POST http://127.0.0.1:5001/deep_intent")
-    print(f"      GET  http://127.0.0.1:5001/mcp/status")
-    print(f"      GET  http://127.0.0.1:5001/context?query=...")
-    print(f"      POST http://127.0.0.1:5001/learn")
+    print(f"      POST http://{_server_host()}:{_server_port()}/tool")
+    print(f"      GET  http://{_server_host()}:{_server_port()}/tools")
+    print(f"      POST http://{_server_host()}:{_server_port()}/tools_for_query")
+    print(f"      GET  http://{_server_host()}:{_server_port()}/health")
+    print(f"      GET  http://{_server_host()}:{_server_port()}/session")
+    print(f"      GET  http://{_server_host()}:{_server_port()}/screen_context")
+    print(f"      POST http://{_server_host()}:{_server_port()}/deep_intent")
+    print(f"      POST http://{_server_host()}:{_server_port()}/plan_and_execute")
+    print(f"      GET  http://{_server_host()}:{_server_port()}/mcp/status")
+    print(f"      GET  http://{_server_host()}:{_server_port()}/context?query=...")
+    print(f"      POST http://{_server_host()}:{_server_port()}/learn")
     print()
 
     # Disable Flask's default banner and request logging for clean output
@@ -1087,4 +1416,4 @@ if __name__ == "__main__":
     log = logging.getLogger("werkzeug")
     log.setLevel(logging.WARNING)
 
-    app.run(host="127.0.0.1", port=5001, debug=False, use_reloader=False)
+    app.run(host=_server_host(), port=_server_port(), debug=False, use_reloader=False)

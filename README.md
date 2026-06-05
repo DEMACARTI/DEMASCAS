@@ -159,7 +159,7 @@ Fourth state in the state machine: `SLEEPING → LISTENING → PROCESSING → CO
 ## Features
 
 - 🎤 **Full-duplex voice** — Barge-in interruption, streaming TTS, energy-based VAD
-- 🧠 **Native Apple Silicon LLM** — MLX `Qwen2.5-3B-Instruct-4bit` (~1.8 GB) on port 8081
+- 🧠 **Native Apple Silicon LLM** — MLX `Phi-4-mini-instruct-4bit` (~1.8 GB) on port 8081
 - 👁️ **Vision-language model** — MLX `Qwen2.5-VL-3B-Instruct-4bit` (~1.6 GB) on port 8082; screenshot-based screen understanding
 - 🗣️ **Neural TTS** — Kokoro 82M via sherpa-onnx (native arm64); sentence-queued streaming to PortAudio
 - 🖥️ **Screen awareness** — Dual mode: macOS accessibility trees + VLM screenshot analysis
@@ -258,6 +258,32 @@ Binary:  daemon/build/demascas_daemon
 
 ---
 
+## Docker
+
+Docker is supported for the Python tool server only. The macOS-specific UI automation layer and the C++ voice daemon still need to run on the host because they depend on AppleScript, accessibility APIs, microphone access, and Metal/MLX.
+
+### Run the tool server in Docker
+
+```bash
+docker compose up --build tool-server
+```
+
+This publishes the tool server on `http://127.0.0.1:5001` and stores persistent DEMASCAS data in a Docker volume at `/home/demascas/.demascas`.
+
+### How to use it with the host daemon
+
+Keep the C++ daemon running on macOS as usual. It can keep talking to the containerized tool server on `127.0.0.1:5001` because the container port is published back to the host.
+
+If you want to run the Python server outside Docker again, use:
+
+```bash
+python main.py
+```
+
+The server host and port can also be overridden with `DEMASCAS_HOST` and `DEMASCAS_PORT`.
+
+---
+
 ## Running DEMASCAS
 
 DEMASCAS runs as **four processes** — an MLX text server, an MLX vision server, a Python tool server, and a C++ daemon.
@@ -273,7 +299,7 @@ source ../venv/bin/activate
 ```
 
 The run script starts:
-1. **MLX text server** on `localhost:8081` — Qwen2.5-3B-Instruct-4bit
+1. **MLX text server** on `localhost:8081` — Phi-4-mini-instruct-4bit
 2. **MLX vision server** on `localhost:8082` — Qwen2.5-VL-3B-Instruct-4bit (optional, waits up to 8s, then continues)
 3. **Python tool server** on `localhost:5001` — 88 tools + MCP + learning
 4. **C++ daemon** in foreground — audio → whisper.cpp → MLX → Kokoro TTS
@@ -308,7 +334,7 @@ If you prefer to run the processes separately (useful for debugging):
 
 ```bash
 source ../venv/bin/activate
-python -m mlx_lm.server --model mlx-community/Qwen2.5-3B-Instruct-4bit --port 8081
+python -m mlx_lm.server --model mlx-community/Phi-4-mini-instruct-4bit --port 8081
 ```
 
 **Terminal 2 — MLX vision server (optional):**
@@ -422,7 +448,7 @@ DEMASCAS runs all LLM inference natively on Apple Silicon via **MLX** — no Oll
 
 | Server | Model | RAM | Port | Role |
 |--------|-------|-----|------|------|
-| **MLX Text** | `Qwen2.5-3B-Instruct-4bit` | ~1.8 GB | 8081 | All interactions: OS tools, shortcuts, Q&A, planning |
+| **MLX Text** | `Phi-4-mini-instruct-4bit` | ~1.8 GB | 8081 | All interactions: OS tools, shortcuts, Q&A, planning |
 | **MLX Vision** | `Qwen2.5-VL-3B-Instruct-4bit` | ~1.6 GB | 8082 | Screenshot-based screen understanding (optional) |
 
 Both servers expose OpenAI-compatible `/v1/chat/completions` endpoints. The C++ daemon communicates via streaming HTTP (libcurl NDJSON).
@@ -462,7 +488,7 @@ User speaks → PortAudio → whisper.cpp (Metal GPU)
 │                MLX SERVERS (native Apple Silicon)               │
 │                                                                │
 │  mlx_lm.server (port 8081)      mlx_vlm.server (port 8082)   │
-│  Qwen2.5-3B-Instruct-4bit      Qwen2.5-VL-3B-Instruct-4bit  │
+│  Phi-4-mini-instruct-4bit      Qwen2.5-VL-3B-Instruct-4bit  │
 │  ~1.8 GB (text)                 ~1.6 GB (vision, optional)    │
 │  OpenAI-compatible /v1/chat/completions                       │
 └───────────────────────────┬────────────────────────────────────┘
@@ -872,7 +898,7 @@ All 37 tuning knobs live in a single header: `daemon/src/config.hpp`
 |------|---------|-------------|
 | `MLX_TEXT_URL` | `"http://127.0.0.1:8081/v1/chat/completions"` | MLX text model endpoint |
 | `MLX_VL_URL` | `"http://127.0.0.1:8082/v1/chat/completions"` | MLX vision model endpoint |
-| `MLX_TEXT_MODEL` | `"mlx-community/Qwen2.5-3B-Instruct-4bit"` | Text LLM model |
+| `MLX_TEXT_MODEL` | `"mlx-community/Phi-4-mini-instruct-4bit"` | Text LLM model |
 | `MLX_VL_MODEL` | `"mlx-community/Qwen2.5-VL-3B-Instruct-4bit"` | Vision LLM model |
 | `TOOL_CTX` | `2048` | Context window for tool-calling path |
 | `TOOL_PREDICT` | `200` | Max tokens for tool-calling responses |
@@ -938,7 +964,7 @@ After changing config, rebuild with `./scripts/build.sh`.
 
 | Component | RAM |
 |---|---|
-| Qwen 2.5 3B (MLX text server) | ~1.8 GB |
+| Phi-4 mini (MLX text server) | ~1.8 GB |
 | Qwen 2.5 VL 3B (MLX vision server) | ~1.6 GB |
 | whisper.cpp tiny + base | ~222 MB |
 | Kokoro TTS model | ~335 MB |
@@ -1015,7 +1041,7 @@ After changing config, rebuild with `./scripts/build.sh`.
 
 | Component | Technology |
 |-----------|-----------|
-| LLM (text) | MLX + `Qwen2.5-3B-Instruct-4bit` (native Apple Silicon) |
+| LLM (text) | MLX + `Phi-4-mini-instruct-4bit` (native Apple Silicon) |
 | LLM (vision) | MLX + `Qwen2.5-VL-3B-Instruct-4bit` (optional, port 8082, auto-discovered endpoint) |
 | STT | whisper.cpp (tiny + base, Metal GPU) |
 | TTS | Kokoro-82M via sherpa-onnx (native arm64 neural) + macOS `say` fallback |

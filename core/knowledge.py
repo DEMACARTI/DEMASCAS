@@ -190,7 +190,7 @@ def get_relevant_procedures(query: str, top_k: int = 3) -> list[dict]:
 # 2. FACTS — atomic knowledge items
 # ═══════════════════════════════════════════════════════════════════════
 
-def save_fact(fact: str, category: str = "general") -> dict:
+def save_fact(fact: str, category: str = "general", source: str = "agent") -> dict:
     """
     Save an atomic fact.
 
@@ -202,6 +202,11 @@ def save_fact(fact: str, category: str = "general") -> dict:
         {"success": True/False, "message": "..."}
     """
     try:
+        if "{" in fact and "}" in fact:
+            return {"success": False, "message": "[-] Rejected: fact contains unresolved template placeholders"}
+        if len(fact.strip()) < 10:
+            return {"success": False, "message": "[-] Rejected: fact too short"}
+
         coll = _get_facts()
         doc_id = "fact_" + hashlib.md5(fact.lower().strip().encode()).hexdigest()[:12]
 
@@ -210,6 +215,7 @@ def save_fact(fact: str, category: str = "general") -> dict:
             documents=[fact],
             metadatas=[{
                 "category": category,
+                "source": source,
                 "created": datetime.now(_IST).isoformat(),
                 "type": "fact",
             }],

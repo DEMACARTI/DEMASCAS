@@ -1,0 +1,17 @@
+services:
+  tool-server:
+    build:
+      context: .
+    image: demascas-tool-server:latest
+    ports:
+      - "5001:5001"
+    environment:
+      DEMASCAS_HOST: 0.0.0.0
+      DEMASCAS_PORT: 5001
+      DEMASCAS_SKIP_MCP_BOOT: "1"
+    volumes:
+      - demascas-home:/home/demascas/.demascas
+    restart: unless-stopped
+
+volumes:
+  demascas-home:

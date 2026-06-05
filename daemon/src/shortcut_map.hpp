@@ -42,6 +42,11 @@ public:
         s_["new window"]         = "command+n";
         s_["new tab"]            = "command+t";
         s_["close all windows"]  = "command+option+w";
+        s_["close powerpoint"]   = "command+q";
+        s_["close powerpoint app"] = "command+q";
+        s_["close power point app"] = "command+q";
+        s_["close powerpoint presentation"] = "command+q";
+        s_["close the powerpoint presentation"] = "command+q";
         s_["full screen"]        = "command+control+f";
         s_["toggle full screen"] = "command+control+f";
         s_["switch app"]         = "command+tab";
@@ -273,309 +278,10 @@ public:
         return best;
     }
 
-    // ── URL detection (deterministic fast-path for opening websites) ──
-
-    struct UrlMatch {
-        std::string url;       // e.g. "https://instagram.com"
-        std::string browser;   // e.g. "Safari", or "" for system default
-    };
-
-    /**
-     * Detect a URL/domain in the user's speech and extract it.
-     * Only triggers when the intent is clearly to OPEN/VISIT a site
-     * (not "type", "search for", etc.).
-     *
-     * Returns the full URL + optional browser, or std::nullopt.
-     */
-    std::optional<UrlMatch> extract_url(const std::string& text) const {
-        std::string t = lower(trim(text));
-
-        // ── Must have an "open" intent — skip if user wants to TYPE ─
-        static const std::vector<std::string> open_intents = {
-            "open", "go to", "goto", "visit", "navigate",
-            "browse", "load", "take me to", "show me",
-            "pull up", "launch", "can you open",
-        };
-        bool has_open = false;
-        for (const auto& intent : open_intents)
-            if (t.find(intent) != std::string::npos) { has_open = true; break; }
-        if (!has_open) return std::nullopt;
-
-        // ── Normalise whisper "dot com" → ".com" transcriptions ──
-        static const std::vector<std::pair<std::string, std::string>> dot_fixes = {
-            {" dot com",  ".com"},  {" dot org",  ".org"},
-            {" dot net",  ".net"},  {" dot io",   ".io"},
-            {" dot edu",  ".edu"},  {" dot gov",  ".gov"},
-            {" dot co ",  ".co "},  {" dot dev",  ".dev"},
-            {" dot app",  ".app"},  {" dot in",   ".in"},
-            {" dot me",   ".me"},
-        };
-        for (const auto& [from, to] : dot_fixes) {
-            auto pos = t.find(from);
-            if (pos != std::string::npos)
-                t.replace(pos, from.size(), to);
-        }
-
-        // ── Resolve bare site names (e.g. "google" → "google.com") ──
-        // Whisper often transcribes just the site name without the TLD.
-        static const std::unordered_map<std::string, std::string> SITE_NAMES = {
-            {"google",     "google.com"},
-            {"youtube",    "youtube.com"},
-            {"gmail",      "mail.google.com"},
-            {"github",     "github.com"},
-            {"reddit",     "reddit.com"},
-            {"twitter",    "twitter.com"},
-            {"facebook",   "facebook.com"},
-            {"instagram",  "instagram.com"},
-            {"linkedin",   "linkedin.com"},
-            {"wikipedia",  "wikipedia.org"},
-            {"amazon",     "amazon.com"},
-            {"netflix",    "netflix.com"},
-            {"spotify",    "open.spotify.com"},
-            {"whatsapp",   "web.whatsapp.com"},
-            {"stackoverflow", "stackoverflow.com"},
-            {"stack overflow", "stackoverflow.com"},
-            {"chatgpt",    "chat.openai.com"},
-            {"chat gpt",   "chat.openai.com"},
-        };
-        for (const auto& [name, domain] : SITE_NAMES) {
-            if (t.find(name) != std::string::npos) {
-                std::string url = "https://" + domain;
-                // Detect browser name
-                std::string browser;
-                static const std::vector<std::pair<std::string, std::string>> br = {
-                    {"safari",  "Safari"},
-                    {"chrome",  "Google Chrome"},
-                    {"firefox", "Firefox"},
-                    {"brave",   "Brave Browser"},
-                    {"edge",    "Microsoft Edge"},
-                    {"arc",     "Arc"},
-                };
-                for (const auto& [kw, bname] : br) {
-                    if (t.find(kw) != std::string::npos) {
-                        browser = bname;
-                        break;
-                    }
-                }
-                return UrlMatch{url, browser};
-            }
-        }
-
-        // ── Extract domain (e.g. "instagram.com", "en.wikipedia.org") ─
-        static const std::regex domain_re(
-            R"(([a-z0-9][-a-z0-9]*(?:\.[a-z0-9][-a-z0-9]*)*\.(?:com|org|net|io|edu|gov|co|dev|app|me|tv|info|xyz|in))\b)");
-        std::smatch m;
-        if (!std::regex_search(t, m, domain_re)) return std::nullopt;
-
-        std::string domain = m[1].str();
-        std::string url = "https://" + domain;
-
-        // ── Detect browser name ─────────────────────────────────
-        std::string browser;
-        static const std::vector<std::pair<std::string, std::string>> browsers = {
-            {"safari",  "Safari"},
-            {"chrome",  "Google Chrome"},
-            {"firefox", "Firefox"},
-            {"brave",   "Brave Browser"},
-            {"edge",    "Microsoft Edge"},
-            {"arc",     "Arc"},
-        };
-        for (const auto& [kw, name] : browsers) {
-            if (t.find(kw) != std::string::npos) {
-                browser = name;
-                break;
-            }
-        }
-
-        return UrlMatch{url, browser};
-    }
-
-    // ── App open detection (deterministic fast-path) ───────────
-
-    struct AppMatch {
-        std::string app_name;   // resolved + title-cased
-    };
-
-    /**
-     * Detect "open [app]" / "launch [app]" commands and extract the app
-     * name deterministically.  Runs AFTER extract_url() so domains are
-     * already handled.  Returns std::nullopt for complex commands that
-     * need LLM reasoning.
-     */
-    std::optional<AppMatch> extract_app_open(const std::string& text) const {
-        std::string t = lower(trim(text));
-
-        // Must start with an "open" intent
-        static const std::vector<std::string> open_prefixes = {
-            "can you open ", "could you open ", "please open ",
-            "open up ", "fire up ", "launch ", "open ", "start ",
-        };
-        std::string after;
-        bool found = false;
-        for (const auto& p : open_prefixes) {
-            if (starts_with(t, p)) {
-                after = t.substr(p.size());
-                found = true;
-                break;
-            }
-        }
-        if (!found) return std::nullopt;
-
-        // Strip articles and filler words
-        static const std::vector<std::string> filler = {
-            "the ", "a ", "an ", "my ", "up ",
-        };
-        for (const auto& f : filler) {
-            if (starts_with(after, f))
-                after = after.substr(f.size());
-        }
-
-        // Trim trailing whitespace / punctuation
-        while (!after.empty() &&
-               (after.back() == ' ' || after.back() == '.' || after.back() == '!'))
-            after.pop_back();
-        if (after.empty()) return std::nullopt;
-
-        // Skip if it contains a period → probably a domain (URL path)
-        if (after.find('.') != std::string::npos) return std::nullopt;
-
-        // Skip if too many words (complex command → LLM)
-        int wc = 1;
-        for (char c : after) if (c == ' ') ++wc;
-        if (wc > 3) return std::nullopt;
-
-        // Skip phrases that indicate non-app-open intent
-        static const std::vector<std::string> skip = {
-            "file", "folder", "directory", "document", "window",
-            "tab", "page", "link", "pdf", "image", "photo",
-        };
-        for (const auto& s : skip)
-            if (after.find(s) != std::string::npos) return std::nullopt;
-
-        // ── Alias resolution (common names → macOS .app names) ──
-        static const std::unordered_map<std::string, std::string> aliases = {
-            {"safari", "Safari"}, {"chrome", "Google Chrome"},
-            {"google chrome", "Google Chrome"}, {"firefox", "Firefox"},
-            {"brave", "Brave Browser"}, {"brave browser", "Brave Browser"},
-            {"arc", "Arc"}, {"edge", "Microsoft Edge"},
-            {"terminal", "Terminal"}, {"iterm", "iTerm"},
-            {"iterm2", "iTerm"}, {"finder", "Finder"},
-            {"notes", "Notes"}, {"messages", "Messages"},
-            {"facetime", "FaceTime"}, {"mail", "Mail"},
-            {"maps", "Maps"}, {"music", "Music"},
-            {"photos", "Photos"}, {"calendar", "Calendar"},
-            {"reminders", "Reminders"}, {"calculator", "Calculator"},
-            {"preview", "Preview"}, {"textedit", "TextEdit"},
-            {"text edit", "TextEdit"}, {"books", "Books"},
-            {"news", "News"}, {"stocks", "Stocks"},
-            {"weather", "Weather"}, {"clock", "Clock"},
-            {"activity monitor", "Activity Monitor"},
-            {"disk utility", "Disk Utility"},
-            {"system settings", "System Settings"},
-            {"system preferences", "System Preferences"},
-            {"vscode", "Visual Studio Code"},
-            {"vs code", "Visual Studio Code"},
-            {"visual studio code", "Visual Studio Code"},
-            {"xcode", "Xcode"}, {"slack", "Slack"},
-            {"discord", "Discord"}, {"spotify", "Spotify"},
-            {"telegram", "Telegram"}, {"whatsapp", "WhatsApp"},
-            {"zoom", "zoom.us"}, {"teams", "Microsoft Teams"},
-            {"microsoft teams", "Microsoft Teams"},
-            {"word", "Microsoft Word"}, {"excel", "Microsoft Excel"},
-            {"powerpoint", "Microsoft PowerPoint"},
-            {"notion", "Notion"}, {"obsidian", "Obsidian"},
-            {"figma", "Figma"}, {"keynote", "Keynote"},
-            {"pages", "Pages"}, {"numbers", "Numbers"},
-            {"garageband", "GarageBand"}, {"imovie", "iMovie"},
-        };
-
-        auto it = aliases.find(after);
-        if (it != aliases.end()) return AppMatch{it->second};
-
-        // Title-case unknown app names
-        std::string titled;
-        bool cap_next = true;
-        for (char c : after) {
-            if (c == ' ') { titled += ' '; cap_next = true; }
-            else { titled += cap_next ? static_cast<char>(toupper(c)) : c; cap_next = false; }
-        }
-        return AppMatch{titled};
-    }
-
-    // ── App close detection (deterministic fast-path) ───────────
-
-    /**
-     * Detect "close [app]" / "quit [app]" and extract the app name.
-     * Returns std::nullopt for "close window", "close tab", "close this"
-     * (those are handled by the shortcut map).
-     */
-    std::optional<AppMatch> extract_app_close(const std::string& text) const {
-        std::string t = lower(trim(text));
-
-        static const std::vector<std::string> close_prefixes = {
-            "can you close ", "please close ", "could you close ",
-            "can you quit ", "please quit ",
-            "close ", "quit ", "exit ",
-        };
-        std::string after;
-        bool found = false;
-        for (const auto& p : close_prefixes) {
-            if (starts_with(t, p)) {
-                after = t.substr(p.size());
-                found = true;
-                break;
-            }
-        }
-        if (!found) return std::nullopt;
-
-        // Strip articles
-        if (starts_with(after, "the ")) after = after.substr(4);
-        if (starts_with(after, "a "))   after = after.substr(2);
-
-        while (!after.empty() && after.back() == ' ') after.pop_back();
-        if (after.empty()) return std::nullopt;
-
-        // These go to the shortcut map, not here
-        static const std::vector<std::string> not_app = {
-            "window", "tab", "this", "it", "that", "all",
-            "everything", "app", "application",
-        };
-        for (const auto& na : not_app)
-            if (after == na || starts_with(after, na + " ")) return std::nullopt;
-
-        // Too many words → complex command → LLM
-        int wc = 1;
-        for (char c : after) if (c == ' ') ++wc;
-        if (wc > 3) return std::nullopt;
-
-        // Alias resolution
-        static const std::unordered_map<std::string, std::string> close_aliases = {
-            {"safari", "Safari"}, {"chrome", "Google Chrome"},
-            {"google chrome", "Google Chrome"}, {"firefox", "Firefox"},
-            {"brave", "Brave Browser"}, {"terminal", "Terminal"},
-            {"finder", "Finder"}, {"notes", "Notes"},
-            {"messages", "Messages"}, {"mail", "Mail"},
-            {"music", "Music"}, {"photos", "Photos"},
-            {"calendar", "Calendar"}, {"vscode", "Visual Studio Code"},
-            {"vs code", "Visual Studio Code"},
-            {"slack", "Slack"}, {"discord", "Discord"},
-            {"spotify", "Spotify"}, {"xcode", "Xcode"},
-            {"activity monitor", "Activity Monitor"},
-            {"system settings", "System Settings"},
-        };
-
-        auto it = close_aliases.find(after);
-        if (it != close_aliases.end()) return AppMatch{it->second};
-
-        // Title-case
-        std::string titled;
-        bool cap_next = true;
-        for (char c : after) {
-            if (c == ' ') { titled += ' '; cap_next = true; }
-            else { titled += cap_next ? static_cast<char>(toupper(c)) : c; cap_next = false; }
-        }
-        return AppMatch{titled};
-    }
+    // ── [LOBOTOMY] extract_url, extract_app_open, extract_app_close,
+    //    extract_type_text REMOVED — all intent routing now handled
+    //    by the LLM semantic path (PATH 3).  Only pure keyboard
+    //    shortcuts (PATH 1) and simple Q&A (PATH 2) remain in C++.
 
     // ── Realtime query detection ────────────────────────────────
 
@@ -614,18 +320,31 @@ public:
         // ── FORCE_TOOL_KEYWORDS: commands that MUST reach PATH 3/4 ──
         // These are action/compose commands the fast path cannot handle.
         static const std::vector<std::string> force_tool = {
+            "create ", "make ",
+            "composing", "composition",
             "compose", "draft an email", "draft a mail", "draft email",
             "write an email", "write a mail", "write email",
             "send an email", "send a mail", "send email",
             "reply to", "respond to",
+            "read email", "check inbox", "first 10 emails",
             "click the", "click on", "tap the", "tap on",
             "fill in", "fill out", "fill the",
             "type into", "type in the",
             "navigate to", "go to ",
             "search for", "search on",
-            "play on youtube", "play video",
             "add to cart", "buy ",
             "open gmail", "open youtube", "open amazon",
+            "open my study routine", "study routine",
+            "summarize selected pdf", "summarize selected file", "highlighted file",
+            "play lofi", "lofi", "low fi", "low five",
+            "process", "processes", "running on my", "system info",
+            "battery", "disk space", "memory usage", "cpu", 
+            "storage", "uptime", "wifi", "network", "ip address",
+            "what apps", "which apps", "check my", "show me my",
+            "list my", "tell me the current", "currently running",
+            "check your", "logs", "error", "delegate", "iot",
+            "remember that", "always use",
+            "do it", "set it", "change it", "go ahead", "execute", "remember", "save",
         };
         for (const auto& kw : force_tool)
             if (t.find(kw) != std::string::npos) return false;
@@ -633,6 +352,8 @@ public:
         // Explicit tool triggers → NOT simple
         static const std::vector<std::string> triggers = {
             "open ", "launch ", "start ", "close ", "quit ", "exit",
+            "compose", "composing", "draft", "send mail", "send email",
+            "create ", "make ",
             "minimize", "maximize", "click ", "type ", "press ",
             "search for", "go to", "switch to", "screenshot", "save",
             "copy", "paste", "undo", "redo", "find ", "select all",
@@ -644,16 +365,34 @@ public:
             "list files", "what files", "files in", "show files",
             "which app", "what app", "running app", "what is open",
             "what's open", "whats open",
-            "search the web", "search online", "look up", "google ",
-            "browse ", "read webpage", "read website", "fetch ",
-            "remember ", "save memory", "recall ", "do you remember",
-            "what did i tell", "what did i say",
+            "browser", "read webpage", "read website", "fetch ",
+            "remember", "save memory", "recall", "do you remember",
+            "what did i tell", "what did i say", "rule", "preference",
             "scroll ", "drag ",
             "list windows", "what windows", "show windows", "all windows",
+            "study routine", "summarize selected", "selected pdf", "highlighted file",
+            "youtube", "play music", "lofi", "low fi", "low five",
             "[file]",  // transcription normalizer tags file-related queries
         };
         for (const auto& tr : triggers)
             if (t.find(tr) != std::string::npos) return false;
+
+        // Action phrasing can still be prefixed with conversational lead-ins
+        // like "so" or "alright". Do not fast-path those.
+        static const std::vector<std::string> action_verbs = {
+            "open", "close", "click", "type", "press", "scroll",
+            "search", "download", "upload", "save", "delete",
+            "create", "make", "move", "copy", "paste", "drag",
+            "launch", "quit", "minimize", "maximize", "switch",
+            "screenshot", "activate", "navigate", "browse", "use",
+        };
+        bool has_action = false;
+        for (const auto& v : action_verbs) {
+            if (t.find(v) != std::string::npos) {
+                has_action = true;
+                break;
+            }
+        }
 
         // Matches a question/conversational prefix
         static const std::vector<std::string> prefixes = {
@@ -673,7 +412,7 @@ public:
             "you know", "actually", "well ",
         };
         for (const auto& p : prefixes)
-            if (starts_with(t, p)) return true;
+            if (starts_with(t, p)) return !has_action;
 
         // Ends with a question mark
         if (!t.empty() && t.back() == '?') return true;
@@ -682,23 +421,7 @@ public:
         // a conversational-length sentence, treat it as simple Q&A.
         // This catches things like "greet my friend", "tell him hi",
         // "my friend says hello" without hard-coding each phrase.
-        {
-            static const std::vector<std::string> action_verbs = {
-                "open", "close", "click", "type", "press", "scroll",
-                "search", "download", "upload", "save", "delete",
-                "create", "move", "copy", "paste", "drag",
-                "launch", "quit", "minimize", "maximize", "switch",
-                "screenshot", "activate", "navigate", "browse",
-            };
-            bool has_action = false;
-            for (const auto& v : action_verbs) {
-                if (t.find(v) != std::string::npos) {
-                    has_action = true;
-                    break;
-                }
-            }
-            if (!has_action) return true;
-        }
+        if (!has_action) return true;
 
         return false;
     }
@@ -742,225 +465,86 @@ private:
     }
 };
 
-// ── Macro system (PATH 1.8) — pre-built multi-step sequences ───────
-//    These bypass the LLM entirely for common multi-step flows.
-//    Each macro is a sequence of tool calls executed deterministically.
-
-struct MacroStep {
-    std::string tool;       // tool name
-    std::string args_json;  // JSON args as string (will be parsed at runtime)
-    int delay_ms;           // milliseconds to wait after this step
-};
-
-struct Macro {
-    std::string description;        // spoken confirmation
-    std::vector<MacroStep> steps;
-};
-
-/// Try to match a user command to a pre-built macro.
-/// Returns the Macro if found, or std::nullopt.
-inline std::optional<Macro> try_macro(const std::string& text) {
-    std::string t = text;
-    std::transform(t.begin(), t.end(), t.begin(), ::tolower);
-
-    // ── Planning language guard ─────────────────────────────────
-    // If the user is giving a multi-step instruction (e.g. "first open
-    // downloads, then find the file named SIH"), suppress macro firing
-    // and let the full input fall through to the Planner (PATH 2.5).
-    {
-        static const char* PLANNING_PHRASES[] = {
-            "first ", "then ", " then ", "after that", " next ",
-            "finally ", "and then", "followed by", "step ",
-            "steps", "afterwards", "once you", "when you",
-            "before ", " before ",
-        };
-        for (auto& p : PLANNING_PHRASES) {
-            if (t.find(p) != std::string::npos)
-                return std::nullopt;
-        }
-    }
-
-    // ── File intent guard ───────────────────────────────────────
-    // If the user mentions a folder AND a file action/type, they want
-    // to do something with a file IN that folder → send to planner,
-    // not macro.  "in the downloads folder, open the PDF named SIH"
-    {
-        static const char* FOLDER_REFS[] = {
-            "downloads", "documents", "desktop", "folder",
-        };
-        static const char* FILE_ACTIONS[] = {
-            "open", "find", "search", "look for", "show", "read", "locate",
-        };
-        static const char* FILE_TYPES[] = {
-            "pdf", "ppt", "pptx", "doc", "docx", "xls", "xlsx",
-            "file", "certificate", "txt", "zip", "mp4", "mp3",
-            "named", "called",
-        };
-
-        bool has_folder = false;
-        for (auto& fr : FOLDER_REFS) {
-            if (t.find(fr) != std::string::npos) { has_folder = true; break; }
-        }
-        if (has_folder) {
-            bool has_file_signal = false;
-            for (auto& fa : FILE_ACTIONS) {
-                if (t.find(fa) != std::string::npos) { has_file_signal = true; break; }
-            }
-            if (!has_file_signal) {
-                for (auto& ft : FILE_TYPES) {
-                    if (t.find(ft) != std::string::npos) { has_file_signal = true; break; }
-                }
-            }
-            if (has_file_signal) {
-                // Exception: simple "open downloads folder" / "open the downloads" should still macro
-                // Only suppress if there's ALSO a file type or "named"/"called"
-                bool has_file_type_or_name = false;
-                static const char* SPECIFIC_FILE_SIGNALS[] = {
-                    "pdf", "ppt", "pptx", "doc", "docx", "xls", "xlsx",
-                    "file", "certificate", "txt", "zip", "named", "called",
-                    "mp4", "mp3",
-                };
-                for (auto& s : SPECIFIC_FILE_SIGNALS) {
-                    if (t.find(s) != std::string::npos) { has_file_type_or_name = true; break; }
-                }
-                if (has_file_type_or_name) {
-                    return std::nullopt;  // suppress macro → goes to planner
-                }
-            }
-        }
-    }
-
-    // Strip common prefixes
-    static const char* prefixes[] = {
-        "can you ", "could you ", "please ", "hey ", "demascas ",
+inline bool is_agent_command(const std::string& cmd) {
+    static const std::vector<std::string> AGENT_TRIGGERS = {
+        "compose email", "compose mail", "composing email", "composing mail",
+        "write email", "write mail", "draft email", "draft mail",
+        "new email", "new mail", "email to", "mail to",
+        "reply to", "smart reply", "respond to that",
+        "open gmail", "check email", "read email",
+        "powerpoint", "power point", "blank presentation", "new presentation",
+        "open downloads folder", "open download folder",
+        "open documents folder", "open desktop folder",
+        "browse to", "navigate to", "go to website",
+        "open youtube", "youtube in brave", "open in brave",
+        "open the", "open a", "website", "webpage", "web page",
+        "wikipedia", "google", "reddit", "github", "youtube",
+        "youtube", "watch video", "play video",
+        "search the web", "look up online",
+        "summarize the pdf", "read the pdf",
+        "find all", "list all files",
+        "student productivity pack", "student workflow pack", "install student pack",
+        "start class notes", "start notes session", "lecture notes",
+        "start revision timer", "study timer", "focus timer", "pomodoro",
+        "assignment planner", "plan my assignments", "homework planner",
+        "capture citation", "research citation", "save source link",
+        "daily student startup", "start my study day", "student startup",
+        "list student workflows", "show student workflows", "show built in workflows",
+        "open my study routine", "start study routine", "study routine",
+        "research", "look up", "tell me about",
+        "weather in", "news about", "latest on",
+        "find information", "find out",
+        "extract contact", "who emailed",
+        "summarize selected pdf", "summarize selected file", "highlighted file",
+        "play lofi", "lofi", "low fi", "low five",
+        "open my", "find my", "find the",
     };
-    for (auto& p : prefixes) {
-        std::string ps(p);
-        if (t.size() >= ps.size() && t.compare(0, ps.size(), ps) == 0)
-            t = t.substr(ps.size());
+
+    std::string lower = cmd;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    static const std::regex web_open_1(
+        R"(\bopen\b.{0,40}\b(page|website|site|url|link)\b)",
+        std::regex::icase
+    );
+    static const std::regex web_open_2(
+        R"(\bopen\b.{0,40}(wikipedia|google|reddit|github|twitter|youtube|instagram|amazon))",
+        std::regex::icase
+    );
+    static const std::regex web_open_3(
+        R"(\bopen\b.{0,40}(\.com|\.org|\.io|\.net|\.edu))",
+        std::regex::icase
+    );
+
+    if (std::regex_search(lower, web_open_1) ||
+        std::regex_search(lower, web_open_2) ||
+        std::regex_search(lower, web_open_3)) {
+        return true;
     }
 
-    // Trim whitespace
-    while (!t.empty() && t.front() == ' ') t.erase(t.begin());
-    while (!t.empty() && t.back() == ' ')  t.pop_back();
-
-    // ── Gmail macro ─────────────────────────────────────────────
-    if (t == "open gmail" || t == "check my email" || t == "check email"
-        || t == "open my email" || t == "check my gmail") {
-        return Macro{
-            "Opening Gmail.",
-            {
-                {"open_url", R"({"url":"https://mail.google.com"})", 0},
-            }
-        };
+    // Robust speech/noise handling for communication/workflow intents.
+    static const std::regex compose_mail_re(
+        R"(\b(compose|draft|write|create|new)\b.{0,40}\b(mail|email)\b)",
+        std::regex::icase
+    );
+    static const std::regex mail_to_re(
+        R"(\b(mail|email)\b.{0,25}\bto\b)",
+        std::regex::icase
+    );
+    static const std::regex study_routine_re(
+        R"(\b(start|open|run)\b.{0,35}\b(study routine|student startup|daily student startup)\b)",
+        std::regex::icase
+    );
+    if (std::regex_search(lower, compose_mail_re) ||
+        std::regex_search(lower, mail_to_re) ||
+        std::regex_search(lower, study_routine_re)) {
+        return true;
     }
 
-    // ── YouTube macro ───────────────────────────────────────────
-    if (t == "open youtube" || t == "go to youtube") {
-        return Macro{
-            "Opening YouTube.",
-            {
-                {"open_url", R"({"url":"https://www.youtube.com"})", 0},
-            }
-        };
+    for (const auto& trigger : AGENT_TRIGGERS) {
+        if (lower.find(trigger) != std::string::npos) return true;
     }
-
-    // ── New tab macro ───────────────────────────────────────────
-    if (t == "new tab" || t == "open a new tab" || t == "open new tab") {
-        return Macro{
-            "New tab.",
-            {
-                {"press_keyboard_shortcut", R"({"keys":"command+t"})", 0},
-            }
-        };
-    }
-
-    // ── Close tab macro ─────────────────────────────────────────
-    if (t == "close tab" || t == "close this tab" || t == "close the tab") {
-        return Macro{
-            "Tab closed.",
-            {
-                {"press_keyboard_shortcut", R"({"keys":"command+w"})", 0},
-            }
-        };
-    }
-
-    // ── Go back macro ───────────────────────────────────────────
-    if (t == "go back" || t == "back" || t == "go back a page"
-        || t == "previous page") {
-        return Macro{
-            "Going back.",
-            {
-                {"press_keyboard_shortcut", R"({"keys":"command+["})", 0},
-            }
-        };
-    }
-
-    // ── Open Downloads folder in Finder ─────────────────────────
-    if (t.find("downloads") != std::string::npos &&
-        (t.find("folder") != std::string::npos || t.find("open") != std::string::npos
-         || t.find("finder") != std::string::npos || t == "downloads")) {
-        return Macro{
-            "Opening Downloads folder.",
-            {
-                {"open_application", R"({"app_name":"Finder"})", 500},
-                {"press_keyboard_shortcut", R"({"keys":"command+option+l"})", 0},
-            }
-        };
-    }
-
-    // ── Open Documents folder in Finder ─────────────────────────
-    if (t.find("documents") != std::string::npos &&
-        (t.find("folder") != std::string::npos || t.find("open") != std::string::npos
-         || t.find("finder") != std::string::npos)) {
-        return Macro{
-            "Opening Documents folder.",
-            {
-                {"open_application", R"({"app_name":"Finder"})", 500},
-                {"press_keyboard_shortcut", R"({"keys":"command+shift+o"})", 0},
-            }
-        };
-    }
-
-    // ── Open Desktop folder in Finder ───────────────────────────
-    if (t.find("desktop") != std::string::npos &&
-        (t.find("folder") != std::string::npos || t.find("open") != std::string::npos
-         || t.find("finder") != std::string::npos)) {
-        return Macro{
-            "Opening Desktop folder.",
-            {
-                {"open_application", R"({"app_name":"Finder"})", 500},
-                {"press_keyboard_shortcut", R"({"keys":"command+shift+d"})", 0},
-            }
-        };
-    }
-
-    // ── Google search macro ─────────────────────────────────────
-    // "google X", "search google for X", "search for X on google"
-    {
-        std::string query;
-        if (t.rfind("google ", 0) == 0) {
-            query = t.substr(7);
-        } else if (t.find("search google for ") == 0) {
-            query = t.substr(18);
-        }
-        if (!query.empty()) {
-            // URL-encode spaces
-            std::string encoded;
-            for (char c : query) {
-                if (c == ' ') encoded += '+';
-                else encoded += c;
-            }
-            return Macro{
-                "Searching Google for " + query + ".",
-                {
-                    {"open_url", R"({"url":"https://www.google.com/search?q=)" + encoded + R"("})", 0},
-                }
-            };
-        }
-    }
-
-    return std::nullopt;
+    return false;
 }
 
 }  // namespace demascas

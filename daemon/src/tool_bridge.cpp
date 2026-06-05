@@ -203,6 +203,116 @@ std::string ToolBridge::fetch_learned_context(const std::string& query) {
     }
 }
 
+ToolBridge::AgentResult ToolBridge::execute_agent(
+    const std::string& command, const std::string& context_json) {
+
+    AgentResult out;
+    out.success = false;
+    out.summary = "";
+    out.steps_taken = 0;
+    out.error = "";
+    out.raw_json = "";
+
+    json context = json::object();
+    try {
+        auto parsed = json::parse(context_json.empty() ? "{}" : context_json);
+        if (parsed.is_object()) context = parsed;
+    } catch (...) {}
+
+    json payload = {
+        {"command", command},
+        {"context", context},
+    };
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        out.error = "HTTP client init failed.";
+        return out;
+    }
+
+    std::string url = cfg::TOOL_SERVER_BASE + "/agent";
+    std::string body = payload.dump();
+    std::string response;
+
+    struct curl_slist* hdrs = nullptr;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    hdrs);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,       90L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        out.error = std::string("HTTP error: ") + curl_easy_strerror(res);
+        return out;
+    }
+
+    if (response.empty()) {
+        out.error = "Empty response from /agent endpoint.";
+        return out;
+    }
+
+    out.raw_json = response;
+    try {
+        auto j = json::parse(response);
+        out.success = j.value("success", false);
+        out.summary = j.value("summary", "");
+        out.steps_taken = j.value("steps_taken", 0);
+        out.error = j.value("error", "");
+    } catch (const std::exception& e) {
+        out.error = std::string("JSON parse error: ") + e.what();
+    }
+
+    return out;
+}
+
+std::string ToolBridge::fetch_active_context() {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "{}";
+
+    std::string response;
+    std::string url = cfg::TOOL_SERVER_BASE + "/session";
+    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,       5L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || response.empty()) return "{}";
+    return response;
+}
+
+std::string ToolBridge::fetch_preferences() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_prefs_fetch_).count();
+    
+    // Cache preferences for 60 seconds to avoid per-turn HTTP overhead
+    if (!last_preferences_.empty() && elapsed < 60) {
+        return last_preferences_;
+    }
+    
+    try {
+        std::string reply = http_get(cfg::TOOL_SERVER_BASE + "/preferences");
+        if (reply.empty()) return last_preferences_;
+        auto j = nlohmann::json::parse(reply);
+        last_preferences_ = j.value("preferences", "");
+        last_prefs_fetch_ = now;
+        return last_preferences_;
+    } catch (...) {
+        return last_preferences_;
+    }
+}
+
 // ── Learning: log interaction ───────────────────────────────────────
 
 void ToolBridge::log_interaction(const std::string& command,
@@ -263,6 +373,84 @@ ToolBridge::DeepIntentResult ToolBridge::fetch_deep_intent(
         result.user_profile       = j.value("user_profile", "");
         result.people_context     = j.value("people_context", "");
     } catch (...) {}
+
+    return result;
+}
+
+// ── Structured Task Executor (STE) ──────────────────────────────────
+
+ToolBridge::TaskExecResult ToolBridge::execute_task(
+    const std::string& command) {
+
+    TaskExecResult result;
+    json payload = {{"command", command}};
+
+    // Use a longer timeout — tasks can take 30-60s with waits
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        result.status = "failed";
+        result.result = "[-] HTTP client init failed.";
+        return result;
+    }
+
+    std::string url = cfg::TOOL_SERVER_BASE + "/plan_and_execute";
+    std::string body = payload.dump();
+    std::string response;
+
+    struct curl_slist* hdrs = nullptr;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     hdrs);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        cfg::TASK_EXEC_TIMEOUT_SEC);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        result.status = "failed";
+        result.result = std::string("[-] HTTP error: ") + curl_easy_strerror(res);
+        return result;
+    }
+
+    if (response.empty()) {
+        result.status = "failed";
+        result.result = "[-] Empty response from task executor.";
+        return result;
+    }
+
+    try {
+        auto j = json::parse(response);
+        result.status          = j.value("status", "failed");
+        result.result          = j.value("result", "");
+        result.steps_completed = j.value("steps_completed", 0);
+        result.total_steps     = j.value("total_steps", 0);
+
+        // Parse spoken updates
+        if (j.contains("spoken_updates") && j["spoken_updates"].is_array()) {
+            for (auto& s : j["spoken_updates"])
+                result.spoken.push_back(s.get<std::string>());
+        }
+
+        // Parse file choices for CLARIFYING state
+        if (j.contains("pending_file_choices") &&
+            j["pending_file_choices"].is_array()) {
+            for (auto& fc : j["pending_file_choices"]) {
+                result.file_choices.push_back({
+                    fc.value("name", "?"),
+                    fc.value("path", "?"),
+                });
+            }
+        }
+    } catch (const std::exception& e) {
+        result.status = "failed";
+        result.result = "[-] JSON parse error: " + std::string(e.what());
+    }
 
     return result;
 }

@@ -25,6 +25,65 @@ OLLAMA_MODEL = "qwen2.5:3b"
 # PDF summarization
 # ---------------------------------------------------------------------------
 
+
+def _extract_pdf_text(pdf_path: str, max_pages: int = 3, max_chars: int = 4000) -> str:
+    """Read up to max_pages from a PDF and return extracted text."""
+    pages: list[str] = []
+    with open(pdf_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        for i in range(min(max_pages, len(reader.pages))):
+            page_text = reader.pages[i].extract_text()
+            if page_text:
+                pages.append(page_text)
+                if sum(len(p) for p in pages) >= max_chars:
+                    break
+
+    text_content = "\n".join(pages)
+    return text_content[:max_chars]
+
+
+def _summarize_pdf_text(file_name: str, text_content: str) -> str:
+    """Summarize already extracted PDF text through local Ollama."""
+    if not text_content.strip():
+        return f"Failed: '{file_name}' appears to be empty or contains only images."
+
+    print("[*] Text extracted. Routing to LLM for summarization...")
+    summary_prompt = (
+        "Summarize the following document in 3 concise bullet points:\n\n"
+        f"{text_content}"
+    )
+
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[{'role': 'user', 'content': summary_prompt}],
+        options={"num_ctx": 4096, "num_predict": 300, "temperature": 0},
+    )
+    return f"Summary of {file_name}:\n" + response['message']['content']
+
+
+def _get_selected_finder_file() -> str:
+    """Return POSIX path of the first selected Finder item, or empty string."""
+    script = (
+        'tell application "Finder"\n'
+        '  if not (exists Finder window 1) then return ""\n'
+        '  set sel to selection\n'
+        '  if (count sel) is 0 then return ""\n'
+        '  return POSIX path of (item 1 of sel as alias)\n'
+        'end tell'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return ""
+        return (result.stdout or "").strip()
+    except Exception:
+        return ""
+
 def summarize_latest_pdf() -> str:
     """
     Finds the newest PDF in ~/Downloads, reads the first 3 pages,
@@ -45,38 +104,45 @@ def summarize_latest_pdf() -> str:
     file_name = os.path.basename(latest_pdf)
     print(f"[*] Found target: '{file_name}'. Extracting text...")
 
-    pages: list[str] = []
     try:
-        with open(latest_pdf, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            for i in range(min(3, len(reader.pages))):
-                page_text = reader.pages[i].extract_text()
-                if page_text:
-                    pages.append(page_text)
-                    # Stop early if we already have enough text for the LLM
-                    if sum(len(p) for p in pages) >= 4000:
-                        break
+        text_content = _extract_pdf_text(latest_pdf, max_pages=3, max_chars=4000)
     except Exception as e:
         return f"Failed to read PDF: {e}"
 
-    text_content = "\n".join(pages)
-    if not text_content.strip():
-        return f"Failed: '{file_name}' appears to be empty or contains only images."
+    return _summarize_pdf_text(file_name, text_content)
 
-    print("[*] Text extracted. Routing to LLM for summarization...")
 
-    summary_prompt = (
-        f"Summarize the following document in 3 concise bullet points:\n\n"
-        f"{text_content[:4000]}"
-    )
+def summarize_selected_pdf(file_path: str = "") -> str:
+    """
+    Summarize the selected PDF in Finder, or a provided PDF file path.
 
-    response = ollama.chat(
-        model=OLLAMA_MODEL,
-        messages=[{'role': 'user', 'content': summary_prompt}],
-        options={"num_ctx": 4096, "num_predict": 300, "temperature": 0},
-    )
+    Args:
+        file_path: Optional explicit path. If omitted, reads Finder selection.
 
-    return f"Summary of {file_name}:\n" + response['message']['content']
+    Returns:
+        A bullet-point summary string, or a clear failure message.
+    """
+    target = (file_path or "").strip()
+    if target:
+        target = str(resolve_safe_path(target))
+    else:
+        target = _get_selected_finder_file()
+
+    if not target:
+        return "Failed: No file is selected in Finder. Please select a PDF and try again."
+    if not os.path.exists(target):
+        return f"Failed: Selected file not found: {target}"
+    if not target.lower().endswith(".pdf"):
+        return "Failed: The selected file is not a PDF. Please select a .pdf file."
+
+    file_name = os.path.basename(target)
+    print(f"[*] Summarizing selected PDF: '{file_name}'")
+    try:
+        text_content = _extract_pdf_text(target, max_pages=3, max_chars=4000)
+    except Exception as e:
+        return f"Failed to read selected PDF: {e}"
+
+    return _summarize_pdf_text(file_name, text_content)
 
 
 def list_files_in_folder(folder_path: str = "~/Downloads") -> str:

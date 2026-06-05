@@ -43,26 +43,32 @@ TOOL_CATEGORIES = {
         "click_ui_element", "type_text", "type_text_into_element",
         "scroll_direction", "drag_element", "find_and_click",
         "right_click_element", "scroll_to_element",
+        "architect_plan",
     ],
     "app_management": [
         "open_application", "quit_application", "activate_application",
-        "list_running_applications", "wait_for_app_ready",
+        "list_running_applications", "wait_for_app_ready", "set_default_browser",
+        "architect_plan",
     ],
     "web_browsing": [
         "open_url", "search_web", "read_webpage", "switch_tab",
     ],
     "browser": [
+        "open_url", "open_url_and_wait",
         "browser_navigate", "browser_navigate_and_wait",
+        "browser_get_url", "browser_get_title", "browser_get_dom_summary", "browser_get_page_text",
+        "browser_click", "browser_click_text", "browser_type", "browser_type_by_label",
+        "browser_scroll", "browser_fill_form", "browser_submit_form",
         "browser_new_tab", "browser_close_tab",
         "browser_list_tabs", "browser_switch_to_tab",
-        "browser_back", "browser_forward", "browser_reload",
-        "browser_get_page_text", "browser_get_links", "browser_get_inputs",
-        "browser_click", "browser_click_text",
-        "browser_type", "browser_type_by_label", "browser_press_key",
-        "browser_scroll", "browser_scroll_to_element",
-        "browser_fill_form", "browser_select_option",
-        "browser_wait_for_element", "browser_wait_for_page_load",
-        "browser_get_dom_summary", "browser_get_url",
+        "browser_back", "browser_forward", "browser_reload", "browser_press_key",
+        "browser_get_links", "browser_get_inputs", "browser_scroll_to_element",
+        "browser_select_option", "browser_wait_for_element", "browser_wait_for_page_load",
+        "gmail_compose_draft", "gmail_read_email",
+        "web_analyze_page", "web_smart_click", "web_scan_for_obstacles", "web_handle_obstacle",
+        "web_search", "web_read_article",
+        "web_youtube_search", "web_youtube_play_first", "web_ecommerce_search",
+        "get_clipboard", "set_clipboard", "press_keyboard_shortcut",
     ],
     "web_agent": [
         "web_analyze_page", "web_scan_for_obstacles", "web_handle_obstacle",
@@ -83,7 +89,7 @@ TOOL_CATEGORIES = {
     ],
     "file_management": [
         "list_files_in_folder", "create_file", "delete_file",
-        "summarize_latest_pdf", "find_file", "open_file",
+        "summarize_latest_pdf", "summarize_selected_pdf", "find_file", "open_file",
     ],
     "screen_reading": [
         "get_active_window_tree", "list_open_windows",
@@ -108,6 +114,12 @@ TOOL_CATEGORIES = {
     ],
     "realtime": [
         "smart_search", "search_web",
+    ],
+    "system": [
+        "run_shell_command", "get_system_info",
+    ],
+    "preferences": [
+        "set_preference", "remove_preference", "set_humor_level",
     ],
 }
 
@@ -153,6 +165,9 @@ INTENT_KEYWORDS = {
 
     # Web
     "website":     ["web_browsing", "browser"],
+    "wikipedia":   ["browser", "web_agent"],
+    "open the":    ["browser", "web_browsing"],
+    "open a":      ["browser", "web_browsing"],
     "webpage":     ["web_browsing", "browser"],
     "url":         ["web_browsing", "browser"],
     "browse":      ["web_browsing", "browser"],
@@ -185,6 +200,9 @@ INTENT_KEYWORDS = {
     "gmail":       ["gmail_browser", "browser"],
     "email":       ["gmail_browser"],
     "compose":     ["gmail_browser"],
+    "draft email": ["gmail_browser", "browser"],
+    "read email":  ["gmail_browser", "browser"],
+    "check email": ["gmail_browser", "browser"],
     "draft":       ["gmail_browser"],
     "inbox":       ["gmail_browser", "browser"],
     "mail":        ["gmail_browser"],
@@ -218,6 +236,10 @@ INTENT_KEYWORDS = {
     "locate":      ["file_management"],
     "open file":   ["file_management"],
     "open pdf":    ["file_management"],
+    "selected pdf": ["file_management"],
+    "selected file": ["file_management"],
+    "highlighted file": ["file_management"],
+    "summarize selected": ["file_management"],
     "open ppt":    ["file_management"],
     "open doc":    ["file_management"],
     "ppt":         ["file_management"],
@@ -282,6 +304,31 @@ INTENT_KEYWORDS = {
     "find out about": ["realtime"],
     "look up":     ["realtime", "web_browsing"],
     "search for":  ["realtime", "typing", "web_browsing"],
+
+    # System state
+    "system":      ["system"],
+    "process":     ["system", "app_management"],
+    "processes":   ["system", "app_management"],
+    "cpu":         ["system"],
+    "memory usage":["system"],
+    "disk":        ["system"],
+    "battery":     ["system"],
+    "ip address":  ["system"],
+    "network":     ["system"],
+    "uptime":      ["system"],
+    "terminal":    ["system"],
+    "shell":       ["system"],
+
+    # Preferences & Rules
+    "remember":    ["preferences", "memory"],
+    "always":      ["preferences"],
+    "never":       ["preferences"],
+    "preference":  ["preferences"],
+    "rule":        ["preferences"],
+    "humor":       ["preferences"],
+    "personality": ["preferences"],
+    "my favorite": ["preferences", "memory"],
+    "i like":      ["preferences", "memory"],
 }
 
 
@@ -312,7 +359,7 @@ def select_tools_for_query(query: str, all_schemas: list[dict],
     """
     query_lower = query.lower()
     is_brave_active = (active_app or "").lower() in ("brave browser", "brave")
-    is_gmail_url = active_url and "mail.google.com" in (active_url or "")
+    is_gmail_url = "mail.google.com" in (active_url or "").lower()
 
     # ── Detect file-search intent ────────────────────────────────
     has_file_intent = any(kw in query_lower for kw in FILE_SEARCH_KEYWORDS)
@@ -386,16 +433,84 @@ def select_tools_for_query(query: str, all_schemas: list[dict],
 
     # Filter to only tools that exist in our schema list
     # Prioritize gmail tools when on Gmail
+    # Prioritize learning/memory tools when doing preferences
+    is_learning_query = "preferences" in matched_categories or "memory" in matched_categories
     priority_tools = []
     regular_tools = []
+    
     for name in matched_tools:
         if name in schema_map:
             if is_gmail_url and name.startswith("gmail_"):
+                priority_tools.append(schema_map[name])
+            elif is_learning_query and name in ["set_preference", "save_memory", "retrieve_memories", "remove_preference", "set_humor_level"]:
                 priority_tools.append(schema_map[name])
             else:
                 regular_tools.append(schema_map[name])
 
     result = priority_tools + regular_tools
+
+    # ── Force architect_plan for complex / multi-step commands ───
+    complex_triggers = [" and ", " then ", "create", "make", "after",
+                        "compose", "draft", "research", "send",
+                        "first ", "step", "followed by"]
+    if any(trigger in query_lower for trigger in complex_triggers):
+        if "architect_plan" in schema_map:
+            # Ensure architect_plan is present and at the top
+            result = [s for s in result
+                      if s.get("function", {}).get("name") != "architect_plan"]
+            result.insert(0, schema_map["architect_plan"])
+
+    # ── YouTube enforcement ────────────────────────────────────────
+    if any(kw in query_lower for kw in ["youtube", "watch video", "play video", "watch"]):
+        must_include = ["web_youtube_search", "web_youtube_play_first", "open_url"]
+        ordered = []
+        seen = set()
+
+        for name in must_include:
+            if name in schema_map and name not in seen:
+                ordered.append(schema_map[name])
+                seen.add(name)
+
+        for schema in result:
+            name = schema.get("function", {}).get("name", "")
+            if name and name not in seen:
+                ordered.append(schema)
+                seen.add(name)
+
+        result = ordered
+
+    # ── Browser query ordering ────────────────────────────────────
+    # Keep critical browser tools at the top so they survive max_tools caps.
+    if "browser" in matched_categories or query_lower.strip() == "browser":
+        browser_priority = [
+            "open_url", "open_url_and_wait",
+            "browser_navigate", "browser_navigate_and_wait",
+            "browser_get_url", "browser_get_title", "browser_get_dom_summary", "browser_get_page_text",
+            "browser_click", "browser_click_text", "browser_type",
+            "browser_scroll", "browser_fill_form", "browser_submit_form",
+            "gmail_compose_draft", "gmail_read_email",
+            "web_youtube_search", "web_youtube_play_first",
+        ]
+        result_names = {
+            s.get("function", {}).get("name", "")
+            for s in result
+            if isinstance(s, dict)
+        }
+
+        ordered = []
+        seen = set()
+        for name in browser_priority:
+            if name in schema_map and name in result_names and name not in seen:
+                ordered.append(schema_map[name])
+                seen.add(name)
+
+        for schema in result:
+            name = schema.get("function", {}).get("name", "")
+            if name and name not in seen:
+                ordered.append(schema)
+                seen.add(name)
+
+        result = ordered
 
     # Cap at max_tools — prioritize by keeping the order from matched_tools
     if len(result) > max_tools:
