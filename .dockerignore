@@ -11,9 +11,16 @@ __pycache__/
 venv/
 env/
 node_modules/
-daemon/build/
-daemon/models/
+# C++ voice daemon — runs on the macOS host, never in the container
+daemon/
 docs/
-memory/
 *.log
 .DS_Store
+# Local secrets / personal config must never be baked into an image
+.env
+.env.*
+.zshrc
+# Archived copies of old code
+files.zip
+# NOTE: do NOT ignore memory/ — it is the Python package that holds
+# memory/web_memory.py (ignoring it crashed the container on startup).

@@ -2,6 +2,7 @@
 comms_agent.py - Email, smart reply, contact extraction.
 """
 
+import json
 import re
 from .base_agent import AgentBase, AgentResult, StepRecord
 
@@ -34,7 +35,7 @@ class CommsAgent(AgentBase):
 
     def run(self, goal, context):
         g = (goal or "").lower()
-        if re.search(r"\b(compose|draft|write|new|create)\b", g) and re.search(r"\b(email|mail)\b", g):
+        if re.search(r"\b(compose|draft|write|new|create|send)\b", g) and re.search(r"\b(e?mails?|gmail)\b", g):
             return self._compose_email_flow(goal, context)
         if re.search(r"\b(reply|respond)\b", g) and re.search(r"\b(email|message|that|it)\b", g):
             return self._smart_reply_flow(goal, context)
@@ -44,15 +45,88 @@ class CommsAgent(AgentBase):
             return self._extract_contact_flow(goal, context)
         return self._execute(goal, context)
 
+    _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    _NOT_NAMES = {
+        "the", "my", "a", "an", "him", "her", "them", "me", "us", "it", "gmail",
+        "mail", "email", "everyone", "all", "about", "regarding", "say", "tell",
+    }
+
+    def _resolve_recipient(self, goal: str) -> tuple[str, str]:
+        """Return (email_address, spoken_name).  Uses an explicit address if
+        present, otherwise looks the spoken name up in the people graph."""
+        m = self._EMAIL_RE.search(goal)
+        if m:
+            return m.group(0), ""
+        nm = re.search(
+            r"\bto\s+([A-Za-z][\w'-]*(?:\s+[A-Z][\w'-]*)?)", goal
+        )
+        name = ""
+        if nm:
+            words = [w for w in nm.group(1).split() if w.lower() not in self._NOT_NAMES]
+            # stop at the topic ("to Aman about …")
+            name = " ".join(words[:2]).strip()
+            if name.lower() in self._NOT_NAMES:
+                name = ""
+        if not name:
+            return "", ""
+        try:
+            from core.learning import get_person
+            person = get_person(name) or {}
+            if person.get("email"):
+                return str(person["email"]), name
+        except Exception:
+            pass
+        return "", name
+
+    @staticmethod
+    def _extract_topic(goal: str) -> tuple[str, str]:
+        """Return (subject, key_points) spoken in the command."""
+        subject = ""
+        sm = re.search(r"\bsubject(?:\s+line)?\s*(?:is|:|as|saying)?\s+(.+?)(?:\s+(?:and|saying|that says)\b|$)",
+                       goal, re.IGNORECASE)
+        if sm:
+            subject = sm.group(1).strip(" .\"'")
+        km = re.search(r"\b(?:about|regarding|saying|that says|to say|telling (?:him|her|them))\b\s+(.+)$",
+                       goal, re.IGNORECASE)
+        key_points = km.group(1).strip(" .") if km else ""
+        return subject, key_points
+
     def _compose_email_flow(self, goal, context):
         tools: list[str] = []
+        recipient, spoken_name = self._resolve_recipient(goal)
+        subject, key_points = self._extract_topic(goal)
 
-        recipient = ""
-        email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", goal)
-        if email_match:
-            recipient = email_match.group(0)
+        # A named recipient we can't resolve → ask instead of guessing.
+        if spoken_name and not recipient:
+            return AgentResult(
+                True, f"What's {spoken_name}'s email address?", 0, [],
+                data={"needs": "recipient_email", "name": spoken_name},
+            )
 
-        # Honor user preference for Gmail compose in Brave first.
+        body = ""
+        if key_points or subject:
+            draft_json = self._call_tool("compose_email", {
+                "recipient": recipient or spoken_name,
+                "subject": subject,
+                "key_points": key_points or subject,
+                # The spoken request has the content — skip the ~1-2 s
+                # screen digest.
+                "use_screen": False,
+            })
+            tools.append("compose_email")
+            if not self._is_tool_error(draft_json):
+                try:
+                    draft = json.loads(draft_json)
+                    subject = str(draft.get("subject") or subject)
+                    body = str(draft.get("body") or "")
+                except Exception:
+                    body = ""
+            if not body:
+                # LLM drafting failed — still put the user's words in the draft.
+                body = key_points
+            if not subject and key_points:
+                subject = key_points[:60]
+
         nav_res = self._call_tool(
             "open_url_and_wait",
             {"url": "https://mail.google.com/", "browser": "Brave Browser", "wait_seconds": 4.0},
@@ -61,19 +135,18 @@ class CommsAgent(AgentBase):
         if self._is_tool_error(nav_res):
             return AgentResult(False, "I couldn't open Gmail in Brave.", len(tools), tools, error=nav_res)
 
-        draft_args = {}
-        if recipient:
-            draft_args["to"] = recipient
-
+        draft_args = {k: v for k, v in (("to", recipient), ("subject", subject), ("body", body)) if v}
         draft_res = self._call_tool("gmail_compose_draft", draft_args)
         tools.append("gmail_compose_draft")
         if self._is_tool_error(draft_res):
             return AgentResult(False, "Gmail opened, but I couldn't start the draft.", len(tools), tools, error=draft_res)
 
-        if recipient:
-            summary = f"I've opened Gmail in Brave and started a draft to {recipient}."
+        who = f" to {recipient}" if recipient else ""
+        about = f" about {subject}" if subject else ""
+        if body:
+            summary = f"I've drafted an email{who}{about}. It's ready for you to review; I haven't sent it."
         else:
-            summary = "I've opened Gmail in Brave and started a blank draft."
+            summary = f"I've opened a new Gmail draft{who}."
         return AgentResult(True, summary, len(tools), tools)
 
     def _smart_reply_flow(self, goal, context):
@@ -84,7 +157,7 @@ class CommsAgent(AgentBase):
             return AgentResult(False, "Couldn't read email. Please open one first.", 1, [read_tool], error=read_res)
 
         self._active_context["email_content"] = read_res[:600]
-        draft_res = self._call_tool("smart_reply", {"context": read_res})
+        draft_res = self._call_tool("smart_reply", {"instructions": goal})
         if self._is_tool_error(draft_res):
             return AgentResult(False, "I read the email but couldn't draft a reply.", 2, [read_tool, "smart_reply"], error=draft_res)
 
@@ -114,7 +187,7 @@ class CommsAgent(AgentBase):
         if not name:
             return AgentResult(False, "Couldn't identify the contact name.", 0, [], error="missing_name")
 
-        result = self._call_tool("extract_contact", {"name": name})
+        result = self._call_tool("extract_contact", {})
         if self._is_tool_error(result):
             return AgentResult(False, "Couldn't find contact info.", 1, ["extract_contact"], error=result)
 

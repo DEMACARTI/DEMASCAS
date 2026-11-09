@@ -81,7 +81,7 @@ MAX_TASK_STEPS = 10
 MAX_RETRIES_PER_STEP = 2
 PLANNER_MAX_TOKENS = 500
 LLM_TEMPERATURE = 0.1
-MLX_TEXT_MODEL = os.getenv("DEMASCAS_MLX_TEXT_MODEL", "mlx-community/Phi-4-mini-instruct-4bit")
+from core.config import LLM_CONFIGURED, LLM_MODEL, LLM_CHAT_URL
 
 # Tools that change UI state and should trigger screen capture + wait
 _UI_MUTATING = frozenset({
@@ -563,7 +563,8 @@ def _handle_find_file_result(
     except (json.JSONDecodeError, TypeError):
         # Try Python dict-style
         try:
-            parsed = eval(result)  # noqa: S307
+            import ast
+            parsed = ast.literal_eval(result)  # literals only — never eval()
         except Exception:
             return "ok"  # can't parse, pass through
 
@@ -603,17 +604,20 @@ def _is_tool_error(result: str) -> bool:
     return False
 
 
-# ── Default LLM call (MLX HTTP) ─────────────────────────────────────
+# ── Default LLM call (OpenAI-compatible HTTP) ─────────────────────────────────────
 
 def _default_llm_call(messages: list[dict], max_tokens: int) -> str:
-    """Call the local MLX LLM server."""
+    """Call the user's plugged-in local LLM (OpenAI-compatible)."""
     import requests
+
+    if not LLM_CONFIGURED:
+        return ""
 
     try:
         resp = requests.post(
-            "http://127.0.0.1:8081/v1/chat/completions",
+            LLM_CHAT_URL,
             json={
-                "model": MLX_TEXT_MODEL,
+                "model": LLM_MODEL,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": LLM_TEMPERATURE,

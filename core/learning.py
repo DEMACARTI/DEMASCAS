@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -343,21 +344,25 @@ def _extract_facts(cmd_lower: str, cmd_original: str, profile: dict) -> None:
     """Extract personal facts from the command text."""
     facts = profile.get("facts", [])
 
-    # Name detection
-    name_patterns = [
-        "my name is ", "i am ", "i'm ", "call me ", "they call me ",
-    ]
+    # Name detection — only explicit introductions.  "I'm late" / "I am
+    # looking for my file" are NOT names, so "i am"/"i'm" are not used.
+    name_patterns = ["my name is ", "they call me ", "call me "]
     for pat in name_patterns:
-        if pat in cmd_lower:
-            after = cmd_original[cmd_lower.index(pat) + len(pat):].strip()
-            name = after.split(".")[0].split(",")[0].split("!")[0].strip()
-            if name and len(name) < 40:
-                # Only extract name from "my name is" and "call me"
-                if pat in ("my name is ", "call me ", "they call me "):
-                    profile["name"] = name
-                fact = f"User's name: {name}"
-                if fact not in facts:
-                    facts.append(fact)
+        m = re.search(r"(?:^|\b)" + re.escape(pat), cmd_lower)
+        if not m:
+            continue
+        after = cmd_original[m.end():].strip()
+        name = re.split(r"[.,!?;]| and | but ", after)[0].strip()
+        words = name.split()
+        # A name is 1-3 words and contains no obvious command verbs.
+        if 0 < len(words) <= 3 and len(name) < 40 and not re.search(
+            r"\b(open|close|search|find|play|when|if|later|back|now)\b", name, re.I
+        ):
+            profile["name"] = name
+            fact = f"User's name: {name}"
+            if fact not in facts:
+                facts.append(fact)
+        break
 
     # Preference detection
     pref_patterns = [
@@ -397,8 +402,9 @@ def _extract_facts(cmd_lower: str, cmd_original: str, profile: dict) -> None:
                 if fact not in facts:
                     facts.append(fact)
 
-    # Cap facts at 30 to bound profile size
-    profile["facts"] = facts[:30]
+    # Cap facts at 30 to bound profile size — keep the NEWEST facts so new
+    # information isn't silently dropped once the list is full.
+    profile["facts"] = facts[-30:]
 
 
 def _track_app_usage(tools_used: list[str], profile: dict) -> None:
@@ -601,8 +607,10 @@ def after_command(
 
 
 def flush() -> None:
-    """Force-flush any pending profile writes.  Call at shutdown."""
+    """Force-flush any pending profile and people-graph writes.
+    Registered as an atexit hook by the tool server."""
     _flush_profile_now()
+    _flush_people_now()
 
 
 def before_command(query: str) -> str:

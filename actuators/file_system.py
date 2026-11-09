@@ -9,16 +9,55 @@ import os
 import subprocess
 import time
 
-import ollama
 import PyPDF2
+import requests
 
+from core.config import LLM_CONFIGURED, LLM_MODEL, LLM_CHAT_URL
 from core.utils import resolve_safe_path
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 WATCH_DIRECTORY = os.path.expanduser("~/Desktop/DEMASCAS_Inbox")
-OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_MODEL = "qwen2.5:3b"   # only used if the MLX server is unreachable
+
+
+def _llm_complete(prompt: str, max_tokens: int = 300) -> str:
+    """Run a one-shot completion on the user's plugged-in local LLM (the same
+    model the daemon uses).  Falls back to Ollama only if it is installed
+    and MLX is unreachable.  Raises RuntimeError if neither works."""
+    if not LLM_CONFIGURED:
+        raise RuntimeError("no language model is set up yet (run: python main.py setup)")
+    try:
+        resp = requests.post(
+            LLM_CHAT_URL,
+            json={
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "stream": False,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as mlx_err:
+        try:
+            import ollama  # optional legacy backend
+        except ImportError:
+            raise RuntimeError(f"MLX text server unavailable ({mlx_err})") from mlx_err
+        try:
+            response = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                options={"num_ctx": 4096, "num_predict": max_tokens, "temperature": 0},
+            )
+            return response["message"]["content"].strip()
+        except Exception as ollama_err:
+            raise RuntimeError(
+                f"No LLM available (MLX: {mlx_err}; Ollama: {ollama_err})"
+            ) from ollama_err
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +82,7 @@ def _extract_pdf_text(pdf_path: str, max_pages: int = 3, max_chars: int = 4000) 
 
 
 def _summarize_pdf_text(file_name: str, text_content: str) -> str:
-    """Summarize already extracted PDF text through local Ollama."""
+    """Summarize already extracted PDF text with the local LLM."""
     if not text_content.strip():
         return f"Failed: '{file_name}' appears to be empty or contains only images."
 
@@ -53,12 +92,11 @@ def _summarize_pdf_text(file_name: str, text_content: str) -> str:
         f"{text_content}"
     )
 
-    response = ollama.chat(
-        model=OLLAMA_MODEL,
-        messages=[{'role': 'user', 'content': summary_prompt}],
-        options={"num_ctx": 4096, "num_predict": 300, "temperature": 0},
-    )
-    return f"Summary of {file_name}:\n" + response['message']['content']
+    try:
+        summary = _llm_complete(summary_prompt, max_tokens=300)
+    except RuntimeError as e:
+        return f"Failed to summarize '{file_name}': {e}"
+    return f"Summary of {file_name}:\n" + summary
 
 
 def _get_selected_finder_file() -> str:
@@ -189,16 +227,14 @@ def list_files_in_folder(folder_path: str = "~/Downloads") -> str:
     except Exception as e:
         return f"Failed to list files: {e}"
 # ---------------------------------------------------------------------------
-# File creation & deletion (with confirmation enforced by the LLM prompt)
+# File creation & deletion (deletion requires voice confirmation, enforced server-side)
 # ---------------------------------------------------------------------------
 
 def create_file(file_path: str, content: str = "") -> str:
     """
     Creates a new file at the given path with optional content.
     Parent directories are created automatically if they don't exist.
-
-    SAFETY: The system prompt instructs the LLM to always ask the user
-    for verbal confirmation before calling this tool.
+    Never overwrites an existing file.
 
     Args:
         file_path: Absolute or ~-relative path (e.g. '~/Desktop/notes.txt').
@@ -207,7 +243,7 @@ def create_file(file_path: str, content: str = "") -> str:
     Returns:
         A success/failure message string.
     """
-    expanded = os.path.expanduser(file_path)
+    expanded = str(resolve_safe_path(file_path))
     print(f"[*] DEMASCAS is creating file: {expanded}")
 
     try:
@@ -232,12 +268,12 @@ def create_file(file_path: str, content: str = "") -> str:
 
 def delete_file(file_path: str) -> str:
     """
-    Deletes a file (or empty directory) at the given path.
-    Moves to macOS Trash via Finder AppleScript when possible so the
-    user can recover it.  Falls back to os.remove for non-Finder paths.
+    Moves a file (or empty directory) at the given path to the macOS Trash
+    so the user can recover it.  Never deletes permanently.
 
-    SAFETY: The system prompt instructs the LLM to always ask the user
-    for verbal confirmation before calling this tool.
+    SAFETY: The tool server never runs this directly from an LLM or agent
+    call — it creates a pending confirmation that the user must approve
+    by voice (see CONFIRM_REQUIRED_TOOLS in server/tool_server.py).
 
     Args:
         file_path: Absolute or ~-relative path (e.g. '~/Desktop/notes.txt').
@@ -245,37 +281,44 @@ def delete_file(file_path: str) -> str:
     Returns:
         A success/failure message string.
     """
-    expanded = os.path.expanduser(file_path)
+    expanded = str(resolve_safe_path(file_path))
     print(f"[*] DEMASCAS is deleting: {expanded}")
 
-    if not os.path.exists(expanded):
+    if not os.path.lexists(expanded):
         return f"Failed: '{file_path}' does not exist."
 
+    if os.path.isdir(expanded) and not os.path.islink(expanded) and os.listdir(expanded):
+        return (f"Refused: '{file_path}' is a non-empty directory. "
+                "DEMASCAS won't delete directories with contents.")
+
+    # Always move to the Trash (recoverable).  The path is passed as an
+    # argv item, never spliced into the script, so quotes in file names
+    # cannot inject AppleScript.  There is deliberately NO permanent-delete
+    # fallback: if Finder refuses (e.g. missing Automation permission), we
+    # report the failure instead of destroying data.
+    script = (
+        'on run argv\n'
+        '  tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)\n'
+        'end run'
+    )
     try:
-        # Prefer Trash via Finder (recoverable) over hard delete
         result = subprocess.run(
-            ['osascript', '-e',
-             f'tell application "Finder" to delete '
-             f'(POSIX file "{expanded}" as alias)'],
+            ["osascript", "-e", script, expanded],
             capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0:
-            return f"Success: Moved '{file_path}' to Trash."
-
-        # Fallback: hard delete
-        if os.path.isfile(expanded):
-            os.remove(expanded)
-        elif os.path.isdir(expanded) and not os.listdir(expanded):
-            os.rmdir(expanded)
-        else:
-            return (f"Refused: '{file_path}' is a non-empty directory. "
-                    "DEMASCAS won't delete directories with contents.")
-
-        return f"Success: Deleted '{file_path}'."
-    except PermissionError:
-        return f"Failed: Permission denied for '{file_path}'."
+    except subprocess.TimeoutExpired:
+        return f"Failed: Timed out moving '{file_path}' to the Trash."
     except Exception as e:
         return f"Failed to delete: {e}"
+
+    if result.returncode == 0:
+        return f"Success: Moved '{file_path}' to Trash."
+    err = (result.stderr or "").strip()
+    hint = ""
+    if "-1743" in err or "not allowed" in err.lower():
+        hint = (" Grant Automation permission for Finder in System Settings → "
+                "Privacy & Security → Automation.")
+    return f"Failed: Could not move '{file_path}' to the Trash: {err}{hint}"
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +484,14 @@ def open_file(file_path: str) -> dict:
 
 def send_mac_notification(title: str, text: str) -> None:
     """Triggers a native macOS notification with a sound."""
-    script = f'display notification "{text}" with title "{title}" sound name "Glass"'
-    subprocess.run(["osascript", "-e", script])
+    # Text is passed via argv so quotes/backslashes can't break the script.
+    script = (
+        'on run argv\n'
+        '  display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass"\n'
+        'end run'
+    )
+    subprocess.run(["osascript", "-e", script, str(title), str(text)],
+                   capture_output=True, timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +499,8 @@ def send_mac_notification(title: str, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 def summarize_with_ollama(file_path: str, content: str) -> None:
-    """Sends file content to the local Ollama LLM and shows a notification."""
+    """Sends file content to the local LLM and shows a notification.
+    (Name kept for backward compatibility; uses MLX first, Ollama as fallback.)"""
     print(f"[*] DEMASCAS is reading: {file_path}...")
 
     prompt = (
@@ -460,11 +510,7 @@ def summarize_with_ollama(file_path: str, content: str) -> None:
     )
 
     try:
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[{'role': 'user', 'content': prompt}],
-        )
-        summary = response['message']['content'].strip()
+        summary = _llm_complete(prompt, max_tokens=200)
 
         print("\n[+] Summary Generated:\n" + summary + "\n")
 
@@ -472,7 +518,7 @@ def summarize_with_ollama(file_path: str, content: str) -> None:
         send_mac_notification("DEMASCAS: File Summarized", short_summary)
 
     except Exception as e:
-        print(f"[-] Error connecting to DEMASCAS Engine (Ollama): {e}")
+        print(f"[-] Error connecting to the local LLM: {e}")
 
 
 def start_file_observer() -> None:

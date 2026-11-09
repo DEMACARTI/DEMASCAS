@@ -145,7 +145,6 @@ INTENT_KEYWORDS = {
     "enter":       ["typing", "keyboard"],
     "input":       ["typing", "ui_interaction"],
     "fill":        ["typing", "ui_interaction"],
-    "search for":  ["typing", "web_browsing"],
 
     # Scrolling
     "scroll":      ["ui_interaction", "screen_reading"],
@@ -273,7 +272,6 @@ INTENT_KEYWORDS = {
     "new window":  ["keyboard"],
 
     # Memory
-    "remember":    ["memory"],
     "recall":      ["memory"],
     "memory":      ["memory"],
     "forget":      ["memory"],

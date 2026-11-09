@@ -10,6 +10,7 @@ OPTIMIZATIONS:
   - Input sanitization strips quotes/backslashes to prevent AppleScript injection.
 """
 
+import re
 import subprocess
 import time
 from core.preferences import get_all_preferences
@@ -110,8 +111,14 @@ def normalize_element_name(name: str) -> list[str]:
 
 
 def _sanitize_for_applescript(text: str) -> str:
-    """Strip characters that could break or inject into AppleScript strings."""
-    return text.replace('\\', '').replace('"', '').replace('\n', ' ').strip()
+    """Escape text for use INSIDE an AppleScript double-quoted string literal.
+
+    Backslashes and quotes are escaped (not stripped) so the exact text is
+    preserved and cannot break out of the literal.  Newlines become spaces;
+    callers that need real line breaks (type_text) split on lines first."""
+    text = "" if text is None else str(text)
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return text.replace("\\", "\\\\").replace('"', '\\"').strip()
 
 
 def _build_key_command(keys: str) -> str:
@@ -145,7 +152,14 @@ def _build_key_command(keys: str) -> str:
         'power': 127, 'volumeup': 72, 'volumedown': 73, 'mute': 74,
     }
 
-    as_modifiers = ', '.join(modifier_map[m] for m in modifiers if m in modifier_map)
+    unknown = [m for m in modifiers if m not in modifier_map]
+    if unknown:
+        # Previously unknown parts were silently dropped, so
+        # "command+shift+4+space" became ⌘⇧Space.  Use a sequence instead:
+        # "command+shift+4, space".
+        raise ValueError(f"Unknown modifier(s) {unknown} in '{keys}'")
+
+    as_modifiers = ', '.join(dict.fromkeys(modifier_map[m] for m in modifiers))
 
     if key_char in special_keys:
         code = special_keys[key_char]
@@ -153,9 +167,18 @@ def _build_key_command(keys: str) -> str:
             return f'key code {code} using {{{as_modifiers}}}'
         return f'key code {code}'
 
+    if len(key_char) != 1:
+        raise ValueError(f"Unknown key '{key_char}' in '{keys}'")
+    safe_char = _sanitize_for_applescript(key_char) if key_char.strip() else key_char
     if as_modifiers:
-        return f'keystroke "{key_char}" using {{{as_modifiers}}}'
-    return f'keystroke "{key_char}"'
+        return f'keystroke "{safe_char}" using {{{as_modifiers}}}'
+    return f'keystroke "{safe_char}"'
+
+
+def _split_key_sequence(keys: str) -> list[str]:
+    """'command+shift+4, space' → ['command+shift+4', 'space']."""
+    parts = re.split(r"\s*(?:,|\bthen\b)\s*", keys or "")
+    return [p for p in (x.strip() for x in parts) if p]
 
 
 def click_ui_element(element_name: str) -> str:
@@ -166,9 +189,11 @@ def click_ui_element(element_name: str) -> str:
     Includes fast-path overrides for Apple's protected window controls
     (close, minimize, zoom).
 
-    Now supports element name normalization: tries the exact name first,
-    then alias expansions (compose_button → "Compose", "Compose email", etc.),
-    then auto-generated title-case variants.
+    Element name normalization (exact → aliases like compose_button →
+    "Compose"/"New message" → title-case variants) is resolved in ONE
+    traversal of the accessibility tree: the exact name wins immediately,
+    otherwise the highest-priority alias that exists is clicked.  (Each
+    traversal costs ~1-2 s, so trying candidates one by one was slow.)
 
     Args:
         element_name: The name of the UI element (exact or snake_case alias).
@@ -177,70 +202,103 @@ def click_ui_element(element_name: str) -> str:
         A success/failure message string.
     """
     candidates = normalize_element_name(element_name)
-
-    for candidate in candidates:
-        result = _click_ui_element_single(candidate)
-        if result.startswith("Success"):
-            return result
-
-    # All candidates failed
+    result = _find_ui_element(candidates, do_click=True)
+    if result.startswith("Success"):
+        return result
+    if result.startswith("[-]"):
+        return result
     tried = ", ".join(f"'{c}'" for c in candidates[:5])
     return f"Failed: Could not locate element. Tried: {tried}"
 
 
 def _click_ui_element_single(element_name: str) -> str:
-    """Click a single exact element name via AppleScript recursive search."""
-    safe_name = _sanitize_for_applescript(element_name)
-    print(f"[*] DEMASCAS is attempting to click: '{safe_name}'...")
+    """Click a single exact element name (kept for backward compatibility)."""
+    return _find_ui_element([element_name], do_click=True)
 
+
+def _find_ui_element(candidates: list[str], do_click: bool = True) -> str:
+    """One recursive accessibility-tree pass over the frontmost window.
+
+    Returns "Success: Clicked '<name>'" (or "Success: Found '<name>'" when
+    do_click is False), "Failed: ..." when nothing matched, or "[-] ...".
+    Candidate order is priority order; candidate 1 short-circuits."""
+    names = [_sanitize_for_applescript(c) for c in candidates if c and str(c).strip()]
+    names = list(dict.fromkeys(names))[:8]
+    if not names:
+        return "[-] No element name given."
+    print(f"[*] DEMASCAS is looking for: {names}...")
+
+    as_list = "{" + ", ".join(f'"{n}"' for n in names) + "}"
+    action = "click" if do_click else "found"
     applescript_code = f"""
     tell application "System Events"
         set frontApp to first application process whose frontmost is true
-        set targetName to "{safe_name}"
+        set targetNames to {as_list}
+        set firstName to item 1 of targetNames
 
         -- FAST-PATH OVERRIDE: Apple's protected window controls
-        try
-            if targetName is "close button" then
-                click button 1 of window 1 of frontApp
-                return "Success: Clicked standard OS close button"
-            else if targetName is "minimize button" then
-                click button 2 of window 1 of frontApp
-                return "Success: Clicked standard OS minimize button"
-            else if targetName is "zoom button" then
-                click button 3 of window 1 of frontApp
-                return "Success: Clicked standard OS zoom button"
-            end if
-        end try
+        if "{action}" is "click" then
+            try
+                if firstName is "close button" then
+                    click button 1 of window 1 of frontApp
+                    return "Success: Clicked standard OS close button"
+                else if firstName is "minimize button" then
+                    click button 2 of window 1 of frontApp
+                    return "Success: Clicked standard OS minimize button"
+                else if firstName is "zoom button" then
+                    click button 3 of window 1 of frontApp
+                    return "Success: Clicked standard OS zoom button"
+                end if
+            end try
+        end if
 
         tell window 1 of frontApp
-            -- RECURSIVE HUNTER: Infinitely deep search without crashing the OS
-            script Finder
-                on searchAndClick(parentElement)
+            script Hunter
+                property wanted : {{}}
+                property found : {{}}
+                on search(parentElement)
                     try
                         set theElements to UI elements of parentElement
                         repeat with elem in theElements
                             try
-                                if name of elem is targetName then
-                                    click elem
-                                    return true
+                                set n to name of elem
+                                if n is not missing value then
+                                    repeat with i from 1 to count of wanted
+                                        if (item i of found) is missing value then
+                                            if n is (item i of wanted) then
+                                                set item i of found to contents of elem
+                                                if i is 1 then return true
+                                            end if
+                                        end if
+                                    end repeat
                                 end if
                             end try
-
-                            -- Dig deeper into nested groups
-                            if my searchAndClick(elem) is true then
-                                return true
-                            end if
+                            if my search(elem) is true then return true
                         end repeat
                     end try
                     return false
-                end searchAndClick
+                end search
             end script
 
-            if Finder's searchAndClick(it) is true then
-                return "Success: Clicked '" & targetName & "'"
-            else
-                return "Failed: Could not locate '" & targetName & "' in the UI tree."
-            end if
+            set wanted of Hunter to targetNames
+            set found of Hunter to {{}}
+            repeat (count of targetNames) times
+                set end of found of Hunter to missing value
+            end repeat
+            Hunter's search(it)
+
+            repeat with i from 1 to count of targetNames
+                set e to item i of found of Hunter
+                if e is not missing value then
+                    if "{action}" is "click" then
+                        click e
+                        return "Success: Clicked '" & (item i of targetNames) & "'"
+                    else
+                        return "Success: Found '" & (item i of targetNames) & "'"
+                    end if
+                end if
+            end repeat
+            return "Failed: Could not locate '" & firstName & "' in the UI tree."
         end tell
     end tell
     """
@@ -252,7 +310,7 @@ def _click_ui_element_single(element_name: str) -> str:
         )
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
-        return f"[-] Timeout: Click on '{safe_name}' took too long (app may be unresponsive)."
+        return f"[-] Timeout: Search for '{names[0]}' took too long (app may be unresponsive)."
     except subprocess.CalledProcessError as e:
         return f"[-] Execution Error: {e.stderr}"
 
@@ -289,6 +347,12 @@ def type_text(text: str, app_name: str = "", press_enter: bool = False,
     """
     if text is None:
         text = ""
+    text = str(text)
+    # Keep the text exactly as given: quotes/backslashes are escaped, and
+    # line breaks are typed as Shift+Return (a newline in editors and chat
+    # apps that doesn't submit the form/message).
+    lines_to_type = [_sanitize_for_applescript(ln) if ln.strip() else ln.replace("\t", "\\t")
+                     for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
     safe_text = _sanitize_for_applescript(text)
     print(f"[*] DEMASCAS is typing: '{safe_text}'" +
           (f" in {app_name}" if app_name else "") +
@@ -314,8 +378,12 @@ def type_text(text: str, app_name: str = "", press_enter: bool = False,
             pass
         lines.append('  delay 0.2')
 
-    # Type the text
-    lines.append(f'  keystroke "{safe_text}"')
+    # Type the text (line by line; Shift+Return between lines)
+    for i, ln in enumerate(lines_to_type):
+        if i > 0:
+            lines.append('  key code 36 using {shift down}')
+        if ln:
+            lines.append(f'  keystroke "{ln}"')
 
     # Optionally press Enter
     if press_enter:
@@ -554,19 +622,24 @@ def press_keyboard_shortcut(keys: str) -> str:
 
     Args:
         keys: A human-readable key combo like 'command+n', 'command+shift+t',
-              'return', 'escape', 'tab'.
+              'return', 'escape', 'tab'.  Several combos can be pressed in
+              order by separating them with commas: 'command+shift+4, space'.
 
     Returns:
         A success/failure message string.
     """
     print(f"[*] DEMASCAS is pressing keyboard shortcut: '{keys}'...")
 
+    # A sequence like "command+shift+4, space" presses each combo in turn.
     try:
-        key_cmd = _build_key_command(keys)
-    except ValueError:
-        return "[-] Invalid keyboard shortcut."
+        key_cmds = [_build_key_command(k) for k in _split_key_sequence(keys)]
+    except ValueError as e:
+        return f"[-] Invalid keyboard shortcut: {e}"
+    if not key_cmds:
+        return "[-] Invalid keyboard shortcut: empty."
 
-    script = f'tell application "System Events" to {key_cmd}'
+    body = "\n  delay 0.3\n  ".join(key_cmds)
+    script = f'tell application "System Events"\n  {body}\nend tell'
 
     try:
         subprocess.run(

@@ -27,8 +27,10 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include <curl/curl.h>
+#include <sys/stat.h>
 
 namespace demascas {
 
@@ -82,13 +84,28 @@ std::string LLMClient::format_tools_as_text(const json& schemas) const {
             }
         }
 
+        // The tool list changes per command, so it is NOT reused from the
+        // runtime's prompt cache — every character here is prefill time on
+        // every command.  Keep just the first sentence of each description
+        // (the full text was ~2.6k chars / ~750 tokens for 8 tools).
+        constexpr size_t MAX_DESC = 160;
+        std::string short_desc = desc;
+        for (size_t k = 0; k + 1 < short_desc.size(); ++k) {
+            if ((short_desc[k] == '.' || short_desc[k] == '!' || short_desc[k] == '?') &&
+                short_desc[k + 1] == ' ' && k >= 20) {
+                short_desc = short_desc.substr(0, k + 1);
+                break;
+            }
+        }
+        if (short_desc.size() > MAX_DESC) short_desc = short_desc.substr(0, MAX_DESC - 1) + "…";
+
         out += "- " + name + "(";
         for (size_t i = 0; i < params.size(); ++i) {
             if (i > 0) out += ", ";
             out += params[i];
         }
         out += ")";
-        if (!desc.empty()) out += " — " + desc;
+        if (!short_desc.empty()) out += " — " + short_desc;
         out += "\n";
     }
     return out;
@@ -314,7 +331,7 @@ static size_t sse_write_cb(void* ptr, size_t size, size_t nmemb,
 
 // ── MLX HTTP calls ──────────────────────────────────────────────────
 
-std::string LLMClient::call_mlx_streaming(const json& messages,
+std::string LLMClient::call_llm_streaming(const json& messages,
                                            SentenceCallback on_sentence,
                                            std::atomic<bool>& cancel,
                                            int max_tokens,
@@ -322,7 +339,7 @@ std::string LLMClient::call_mlx_streaming(const json& messages,
     auto t0 = std::chrono::steady_clock::now();
 
     json body = {
-        {"model",       cfg::MLX_TEXT_MODEL},
+        {"model",       model_},
         {"messages",    messages},
         {"stream",      true},
         {"max_tokens",  max_tokens},
@@ -341,7 +358,7 @@ std::string LLMClient::call_mlx_streaming(const json& messages,
         hdrs = curl_slist_append(hdrs, "Accept: text/event-stream");
         std::string body_str = body.dump();
 
-        curl_easy_setopt(curl, CURLOPT_URL,           cfg::MLX_TEXT_URL.c_str());
+        curl_easy_setopt(curl, CURLOPT_URL,           chat_url_.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     hdrs);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body_str.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  sse_write_cb);
@@ -385,12 +402,12 @@ std::string LLMClient::call_mlx_streaming(const json& messages,
     return sctx.full_text;
 }
 
-std::string LLMClient::call_mlx_blocking(const json& messages,
+std::string LLMClient::call_llm_blocking(const json& messages,
                                           int max_tokens) {
     auto t0 = std::chrono::steady_clock::now();
 
     json body = {
-        {"model",       cfg::MLX_TEXT_MODEL},
+        {"model",       model_},
         {"messages",    messages},
         {"stream",      false},
         {"max_tokens",  max_tokens},
@@ -398,7 +415,7 @@ std::string LLMClient::call_mlx_blocking(const json& messages,
         {"stop",        json::array({"<|endoftext|>", "<|im_end|>"})}
     };
 
-    std::string resp = ToolBridge::http_post(cfg::MLX_TEXT_URL, body.dump());
+    std::string resp = ToolBridge::http_post(chat_url_, body.dump());
 
     float elapsed = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - t0).count();
@@ -420,13 +437,30 @@ std::string LLMClient::call_mlx_blocking(const json& messages,
 /// Detect tool error prefixes in a tool result string.
 /// Used by the ReAct loop to inject recovery guidance.
 static bool is_tool_error(const std::string& result) {
+    // Only look at how the result STARTS — content-bearing results (web
+    // pages, file listings, search hits) often contain words like
+    // "not found" or "Could not" without being failures.
+    auto p = result.find_first_not_of(" \t\r\n");
+    if (p == std::string::npos) return true;
+    std::string head = result.substr(p, 24);
+    std::transform(head.begin(), head.end(), head.begin(), ::tolower);
     static const char* ERROR_PREFIXES[] = {
-        "[-]", "Failed:", "Error:", "Timeout:",
-        "Could not", "not found", "not responding",
+        "[-]", "failed", "error", "timeout", "could not", "refused",
     };
-    for (auto& prefix : ERROR_PREFIXES) {
-        if (result.find(prefix) != std::string::npos)
-            return true;
+    for (auto& prefix : ERROR_PREFIXES)
+        if (head.rfind(prefix, 0) == 0) return true;
+
+    // JSON results: {"success": false, ...}
+    if (result[p] == '{') {
+        try {
+            auto j = json::parse(result);
+            if (j.is_object()) {
+                if (j.contains("success") && j["success"].is_boolean() && !j["success"].get<bool>())
+                    return true;
+                std::string msg = ToolBridge::json_str(j, "message");
+                if (msg.rfind("[-]", 0) == 0) return true;
+            }
+        } catch (...) {}
     }
     return false;
 }
@@ -526,7 +560,72 @@ void LLMClient::trim_history() {
 
 void LLMClient::reset() { history_.clear(); }
 
+void LLMClient::fit_history_to_context(const json& sys) {
+    // ~3 characters per token is conservative for English + JSON, so the
+    // estimate errs on the side of trimming rather than overflowing.
+    const long reserve_tokens = cfg::TOOL_PREDICT + 96;
+    const size_t budget_chars = static_cast<size_t>(
+        std::max<long>(512, ctx_tokens_ - reserve_tokens) * 3);
+    auto content = [](const json& m) -> std::string {
+        return (m.contains("content") && m["content"].is_string())
+                   ? m["content"].get<std::string>() : std::string();
+    };
+    auto total = [&]() {
+        size_t n = content(sys).size();
+        for (auto& m : history_) n += content(m).size();
+        return n;
+    };
+    if (total() <= budget_chars) return;
+
+    // 1) Drop screen-state dumps from all but the newest tool result.
+    static const std::string SCREEN_TAG = "\n\n[SCREEN STATE AFTER ACTION]";
+    for (size_t i = 0; i + 1 < history_.size() && total() > budget_chars; ++i) {
+        std::string c = content(history_[i]);
+        auto pos = c.find(SCREEN_TAG);
+        if (pos != std::string::npos) history_[i]["content"] = c.substr(0, pos);
+    }
+
+    // 2) Drop the oldest assistant/tool-result pairs, but keep a one-line
+    //    record of each inside the FIRST user message, so the model still
+    //    knows what it already did (otherwise it repeats steps).  Merged into
+    //    that message — not a new one — because some chat templates reject
+    //    two consecutive user messages.
+    static const std::string EARLIER = "\n\n[EARLIER STEPS — details trimmed to fit context]";
+    while (total() > budget_chars && history_.size() > 3) {
+        std::string call = content(history_[1]);
+        std::string res = content(history_[2]);
+        auto nl = res.find('\n');
+        std::string body = nl == std::string::npos ? res : res.substr(nl + 1);
+        bool failed = is_tool_error(body);
+        std::string line = "\n- " + call.substr(0, 200) + " → " +
+                           (failed ? "FAILED: " : "ok: ") +
+                           body.substr(0, 80);
+        std::replace(line.begin() + 1, line.end(), '\n', ' ');
+        std::string first = content(history_[0]);
+        if (first.find(EARLIER) == std::string::npos) first += EARLIER;
+        history_[0]["content"] = first + line;
+        history_.erase(history_.begin() + 1, history_.begin() + 3);
+    }
+
+    // 3) Still too big: shorten the newest tool result, then the first
+    //    user message's injected context (never below the request itself).
+    for (size_t idx : {history_.size() - 1, size_t{0}}) {
+        if (total() <= budget_chars || idx >= history_.size()) continue;
+        std::string c = content(history_[idx]);
+        size_t over = total() - budget_chars;
+        if (c.size() > over + 200)
+            history_[idx]["content"] = c.substr(0, c.size() - over) + "\n…[trimmed to fit context]";
+    }
+}
+
 // ── Session persistence ─────────────────────────────────────────
+
+static std::string session_path(bool create_dir) {
+    const char* home = std::getenv("HOME");
+    std::string dir = std::string(home && *home ? home : "/tmp") + "/.demascas";
+    if (create_dir) ::mkdir(dir.c_str(), 0700);
+    return dir + "/" + cfg::SESSION_FILE_NAME;
+}
 
 void LLMClient::save_session() const {
     try {
@@ -536,10 +635,12 @@ void LLMClient::save_session() const {
         for (int i = start; i < static_cast<int>(history_.size()); ++i)
             arr.push_back(history_[i]);
 
-        std::ofstream f(cfg::SESSION_FILE);
+        const std::string path = session_path(/*create_dir=*/true);
+        std::ofstream f(path, std::ios::trunc);
         if (f.is_open()) {
             f << arr.dump(2);
             f.close();
+            ::chmod(path.c_str(), 0600);  // conversation text is private
         }
     } catch (const std::exception& e) {
         std::cerr << "[!] Session save failed: " << e.what() << "\n";
@@ -548,7 +649,7 @@ void LLMClient::save_session() const {
 
 void LLMClient::load_session() {
     try {
-        std::ifstream f(cfg::SESSION_FILE);
+        std::ifstream f(session_path(/*create_dir=*/false));
         if (!f.is_open()) return;
 
         std::string content((std::istreambuf_iterator<char>(f)),
@@ -579,27 +680,63 @@ void LLMClient::load_session() {
 
 // ── Prewarm ─────────────────────────────────────────────────────────
 
-void LLMClient::prewarm() {
-    std::cout << "[*] Checking MLX text server at " << cfg::MLX_TEXT_URL << "...\n";
+void LLMClient::configure(const std::string& chat_url, const std::string& model,
+                          int context_tokens) {
+    chat_url_ = chat_url;
+    model_ = model;
+    ctx_tokens_ = std::max(1024, context_tokens);
+}
+
+void LLMClient::prewarm(ToolBridge& bridge) {
+    if (!configured()) {
+        std::cerr << "[!] No language model is set up yet. Plug one in with:\n"
+                  << "    python main.py setup\n";
+        return;
+    }
+    std::cout << "[*] Checking LLM (" << model_ << ") at " << chat_url_ << "...\n";
     auto t0 = std::chrono::steady_clock::now();
 
     // Extract base URL for health check (strip /v1/chat/completions)
-    std::string base = cfg::MLX_TEXT_URL;
+    std::string base = chat_url_;
     auto v1pos = base.find("/v1/");
     if (v1pos != std::string::npos) base = base.substr(0, v1pos);
 
-    // Try a health endpoint first
     std::string health = ToolBridge::http_get(base + "/v1/models");
     if (health.empty()) {
-        std::cerr << "[!] MLX text server not responding. Start it with:\n"
-                  << "    mlx_lm.server --model " << cfg::MLX_TEXT_MODEL
-                  << " --port 8081\n";
+        std::cerr << "[!] LLM runtime not responding at " << base
+                  << " — start it (see: python main.py doctor).\n";
         return;
     }
 
     float s = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - t0).count();
-    std::cout << "[OK] MLX text server ready (" << s << " s).\n";
+    std::cout << "[OK] LLM runtime ready (" << s << " s).\n";
+
+    // Build the warm-up prompts here (uses the bridge), then send them from
+    // a background thread so startup isn't blocked.  The tool prompt's
+    // static rules are identical for every command, so once they're in the
+    // server's prompt cache only the per-command tail is processed.
+    json tool_msgs = json::array({
+        build_tool_prompt(json::array(), bridge, ""),
+        {{"role", "user"}, {"content", "warm up"}},
+    });
+    json fast_msgs = json::array({
+        build_simple_prompt(bridge),
+        {{"role", "user"}, {"content", "hello"}},
+    });
+    std::string url = chat_url_, model = model_;
+    std::thread([tool_msgs, fast_msgs, url, model]() {
+        auto t1 = std::chrono::steady_clock::now();
+        for (const auto& msgs : {tool_msgs, fast_msgs}) {
+            json body = {
+                {"model", model}, {"messages", msgs},
+                {"stream", false}, {"max_tokens", 1}, {"temperature", 0.0},
+            };
+            ToolBridge::http_post(url, body.dump());
+        }
+        float w = std::chrono::duration<float>(std::chrono::steady_clock::now() - t1).count();
+        std::cout << "[✓] LLM warm-up done (" << w << " s) — prompt cache primed.\n";
+    }).detach();
 }
 
 // ── Streaming fast chat (no tools) ──────────────────────────────────
@@ -609,6 +746,16 @@ std::string LLMClient::fast_chat_streaming(const std::string& user_msg,
                                             SentenceCallback on_sentence,
                                             std::atomic<bool>& cancel) {
     trim_history();
+    last_tools_.clear();
+    last_path_ = "fast";
+    last_success_ = true;
+    if (!configured()) {
+        last_success_ = false;
+        std::string msg = "I don't have a language model set up yet. "
+                          "Run python main.py setup to plug one in.";
+        on_sentence(msg);
+        return msg;
+    }
     history_.push_back({{"role", "user"}, {"content", user_msg}});
 
     json messages;
@@ -618,9 +765,21 @@ std::string LLMClient::fast_chat_streaming(const std::string& user_msg,
     for (int i = start; i < static_cast<int>(history_.size()); ++i)
         messages.push_back(history_[i]);
 
-    auto text = call_mlx_streaming(
+    auto text = call_llm_streaming(
         messages, on_sentence, cancel,
         cfg::FAST_PREDICT, cfg::LLM_TEMPERATURE);
+
+    if (text.empty()) {
+        // Don't leave the user in silence, and don't store an empty turn.
+        history_.pop_back();
+        last_success_ = false;
+        if (!cancel.load()) {
+            text = "Sorry, I couldn't reach my language model. "
+                   "Please check that the MLX server is running.";
+            on_sentence(text);
+        }
+        return text;
+    }
 
     history_.push_back({{"role", "assistant"}, {"content", text}});
     return text;
@@ -642,40 +801,49 @@ std::string LLMClient::chat_with_tools_streaming(
     history_.clear();
     last_tools_.clear();
     last_path_ = "tool";
+    last_success_ = true;
+    pending_confirmation_ = {};
+    file_choices_.clear();
+    if (!configured()) {
+        last_success_ = false;
+        std::string msg = "I don't have a language model set up yet. "
+                          "Run python main.py setup to plug one in.";
+        on_sentence(msg);
+        return msg;
+    }
 
     // ── Tool filtering: fetch only relevant tools for this query ─
     json filtered_schemas = bridge.fetch_filtered_tools(user_msg, 8);
-    json all_schemas = bridge.fetch_tool_schemas();
 
     if (filtered_schemas.empty() || !filtered_schemas.is_array()
         || filtered_schemas.size() == 0) {
-        filtered_schemas = all_schemas;
+        // Only fetch the full 43 KB schema list when filtering failed.
+        filtered_schemas = bridge.fetch_tool_schemas();
         std::cout << "[ROUTER] Filtering failed — using all "
-                  << all_schemas.size() << " tools.\n";
+                  << filtered_schemas.size() << " tools.\n";
     } else {
         std::cout << "[ROUTER] Using " << filtered_schemas.size()
-                  << " filtered tools (from " << all_schemas.size()
-                  << " total).\n";
+                  << " filtered tools.\n";
     }
 
     // Memory auto-retrieval
     std::string enriched = user_msg;
     try {
+        // Strict threshold: only clearly related memories are injected.
         auto mem = bridge.execute("retrieve_memories",
-                                   {{"query", user_msg}, {"top_k", 3}});
-        if (!mem.empty() &&
-            mem.find("No ") == std::string::npos &&
-            mem.find("[-]") == std::string::npos) {
+                                   {{"query", user_msg}, {"top_k", 3}, {"max_distance", 0.55}});
+        // retrieve_memories only returns "Relevant memories ..." when
+        // something actually matches the query (distance threshold).
+        if (mem.rfind("Relevant memories", 0) == 0) {
             enriched += "\n\n[MEMORY CONTEXT]\n" + mem;
             std::cout << "[MEMORY] Injected context.\n";
         }
     } catch (...) {}
 
-    // Learned context
-    if (!learned_context.empty()) {
-        enriched += "\n\n[LEARNED CONTEXT]\n" + learned_context;
-        std::cout << "[LEARN] Injected learned context.\n";
-    }
+    // Learned context goes into the system prompt only (build_tool_prompt);
+    // it used to be injected twice, wasting the small model's context.
+    if (!learned_context.empty())
+        std::cout << "[LEARN] Learned context added to system prompt.\n";
 
     history_.push_back({{"role", "user"}, {"content", enriched}});
 
@@ -708,26 +876,10 @@ std::string LLMClient::chat_with_tools_streaming(
             }
         }
 
-        bool compose_req =
-            ((lower_msg.find("compose") != std::string::npos ||
-              lower_msg.find("draft") != std::string::npos ||
-              lower_msg.find("write") != std::string::npos ||
-              lower_msg.find("new") != std::string::npos) &&
-             (lower_msg.find("email") != std::string::npos ||
-              lower_msg.find("mail") != std::string::npos));
-        if (compose_req) {
-            auto open_res = bridge.execute("open_url_and_wait", {
-                {"url", "https://mail.google.com"},
-                {"browser", "Brave Browser"},
-                {"wait_seconds", 4}
-            });
-            auto draft_res = bridge.execute("gmail_compose_draft", json::object());
-            if (!is_tool_error(open_res) && !is_tool_error(draft_res)) {
-                std::string say = "Opened Gmail and started a new draft.";
-                on_sentence(say);
-                return say;
-            }
-        }
+        // (A substring-based "compose email" short-circuit used to live here.
+        //  It fired on phrases like "any news from my gmail" and opened an
+        //  EMPTY draft, discarding recipient/subject/body.  Email composing
+        //  is handled by the comms agent / gmail_compose_draft instead.)
 
         bool selected_pdf_req =
             (lower_msg.find("summarize") != std::string::npos || lower_msg.find("summarise") != std::string::npos) &&
@@ -746,11 +898,13 @@ std::string LLMClient::chat_with_tools_streaming(
     }
     std::string prev_tool;   // for dedup detection
     json        prev_args;   // for dedup detection
+    bool        prev_failed = false;  // did the most recent tool call fail?
 
     while (depth < cfg::MAX_TOOL_DEPTH && !cancel.load()) {
         ++depth;
 
-        // Build full message list
+        // Build full message list (trimmed to the runtime's context window)
+        fit_history_to_context(sys);
         json messages;
         messages.push_back(sys);
         for (auto& m : history_) messages.push_back(m);
@@ -760,11 +914,18 @@ std::string LLMClient::chat_with_tools_streaming(
         std::string raw_output;
         auto silent_cb = [](const std::string&) {};
 
-        raw_output = call_mlx_streaming(
+        raw_output = call_llm_streaming(
             messages, silent_cb, cancel,
             cfg::TOOL_PREDICT, cfg::LLM_TEMPERATURE);
 
-        if (raw_output.empty() || cancel.load()) break;
+        if (cancel.load()) break;
+        if (raw_output.empty()) {
+            final_text = "Sorry, I couldn't reach my language model. "
+                         "Please check that the MLX server is running.";
+            last_success_ = false;
+            on_sentence(final_text);
+            break;
+        }
 
         // Parse the LLM's output
         auto action = parse_llm_action(raw_output);
@@ -789,7 +950,12 @@ std::string LLMClient::chat_with_tools_streaming(
         if (fn == prev_tool && args == prev_args) {
             std::cout << "[!] Duplicate tool call detected (" << fn
                       << ") — breaking ReAct loop.\n";
-            final_text = "Done.";
+            if (prev_failed) {
+                final_text = "I couldn't get that to work.";
+                last_success_ = false;
+            } else {
+                final_text = "Done.";
+            }
             on_sentence(final_text);
             break;
         }
@@ -803,12 +969,65 @@ std::string LLMClient::chat_with_tools_streaming(
         // Record the assistant's tool-call output in history
         history_.push_back({{"role", "assistant"}, {"content", raw_output}});
 
-        // Execute the tool
-        auto tr = bridge.execute_with_screen(fn, args);
+        // Execute the tool.  A screen read costs ~1-2 s, so only ask for it
+        // after actions whose next step needs on-screen element names.
+        // (Browser tools: the tree can't see page content anyway — rule 10.)
+        static const std::set<std::string> NEEDS_SCREEN = {
+            "click_ui_element", "find_and_click", "right_click_element",
+            "open_application", "activate_application", "type_text_into_element",
+            "drag_element", "scroll_to_element",
+        };
+        auto tr = bridge.execute_with_screen(fn, args, NEEDS_SCREEN.count(fn) > 0);
         std::cout << "[TOOL RESULT] " << tr.result << "\n";
 
         // ── Error detection & recovery guidance ─────────────────
-        bool tool_failed = is_tool_error(tr.result);
+        // Prefer the server's explicit success flag; fall back to parsing.
+        bool tool_failed = tr.has_success ? !tr.success : is_tool_error(tr.result);
+        prev_failed = tool_failed;
+
+        // ── Destructive action needs a spoken yes/no ────────────
+        if (!tool_failed && tr.result.find("pending_confirmation") != std::string::npos) {
+            try {
+                auto pj = json::parse(tr.result);
+                if (ToolBridge::json_str(pj, "status") == "pending_confirmation") {
+                    pending_confirmation_.token  = ToolBridge::json_str(pj, "confirm_token");
+                    pending_confirmation_.speech = ToolBridge::json_str(pj, "confirm_speech", "Should I go ahead?");
+                    pending_confirmation_.tool   = ToolBridge::json_str(pj, "pending_tool");
+                    if (!pending_confirmation_.token.empty()) {
+                        final_text = pending_confirmation_.speech;
+                        history_.push_back({{"role", "assistant"}, {"content", final_text}});
+                        break;  // the daemon asks and handles yes/no
+                    }
+                }
+            } catch (...) {}
+        }
+
+        // ── find_file with several matches → ask which one ──────
+        if (!tool_failed && fn == "find_file") {
+            try {
+                auto fj = json::parse(tr.result);
+                if (fj.contains("matches") && fj["matches"].is_array() && fj["matches"].size() > 1) {
+                    std::string names;
+                    for (auto& m : fj["matches"]) {
+                        std::string path = ToolBridge::json_str(m, "path");
+                        if (path.empty()) continue;
+                        std::string name = ToolBridge::json_str(m, "name", path);
+                        file_choices_.push_back({name, path});
+                        if (!names.empty()) names += ", ";
+                        names += name;
+                        if (file_choices_.size() >= 5) break;
+                    }
+                    if (file_choices_.size() > 1) {
+                        final_text = "I found " + std::to_string(fj["matches"].size()) +
+                                     " files: " + names + ". Which one should I open?";
+                        on_sentence(final_text);
+                        history_.push_back({{"role", "assistant"}, {"content", final_text}});
+                        break;
+                    }
+                    file_choices_.clear();
+                }
+            } catch (...) {}
+        }
         if (tool_failed) {
             ++error_count_;
             std::cout << "[!] Tool error #" << error_count_
@@ -818,6 +1037,7 @@ std::string LLMClient::chat_with_tools_streaming(
             if (error_count_ >= cfg::REACT_MAX_ERRORS) {
                 std::cout << "[!] " << cfg::REACT_MAX_ERRORS
                           << " consecutive tool errors — aborting ReAct loop.\n";
+                last_success_ = false;
                 final_text = "I tried several approaches but couldn't complete that action. "
                              "You might need to do it manually.";
                 on_sentence(final_text);
@@ -830,7 +1050,14 @@ std::string LLMClient::chat_with_tools_streaming(
 
         // Build tool result feedback — inject screen state if available.
         // MLX has no "tool" role, so we feed results back as "user" messages.
-        std::string feedback = "[TOOL RESULT: " + fn + "]\n" + tr.result;
+        // Cap large tool results (file lists, page text): every extra token
+        // is prefill time on the next step and eats the context window.
+        constexpr size_t MAX_RESULT_CHARS = 2000;
+        std::string result_text = tr.result;
+        if (result_text.size() > MAX_RESULT_CHARS)
+            result_text = result_text.substr(0, MAX_RESULT_CHARS) + "\n…[" +
+                          std::to_string(tr.result.size() - MAX_RESULT_CHARS) + " more chars]";
+        std::string feedback = "[TOOL RESULT: " + fn + "]\n" + result_text;
 
         // Inject recovery guidance on error so the LLM tries a different approach
         if (tool_failed) {
@@ -865,8 +1092,9 @@ std::string LLMClient::chat_with_tools_streaming(
 
         if (!tr.screen_state.empty()) {
             std::string screen = tr.screen_state;
-            if (screen.size() > 3000)
-                screen = screen.substr(0, 3000) + "... (truncated)";
+            // Every extra prompt token costs prefill time on the next step.
+            if (screen.size() > 1500)
+                screen = screen.substr(0, 1500) + "... (truncated)";
             feedback += "\n\n[SCREEN STATE AFTER ACTION]\n" + screen;
             std::cout << "[SCREEN] Injected " << screen.size()
                       << " chars of screen state.\n";
@@ -878,9 +1106,14 @@ std::string LLMClient::chat_with_tools_streaming(
     if (depth >= cfg::MAX_TOOL_DEPTH)
         std::cout << "[!] Hit max tool depth (" << cfg::MAX_TOOL_DEPTH << ").\n";
 
-    // If the loop ended without a final answer
-    if (final_text.empty()) {
-        final_text = "Done.";
+    // If the loop ended without a final answer, report honestly.
+    if (final_text.empty() && !cancel.load()) {
+        if (prev_failed || last_tools_.empty()) {
+            final_text = "I wasn't able to finish that.";
+            last_success_ = false;
+        } else {
+            final_text = "Done.";
+        }
         on_sentence(final_text);
     }
 
@@ -997,7 +1230,7 @@ std::vector<std::string> LLMClient::plan_steps(
         {"content", command}
     });
 
-    auto plan_text = call_mlx_blocking(plan_messages, cfg::TOOL_PREDICT + 100);
+    auto plan_text = call_llm_blocking(plan_messages, cfg::TOOL_PREDICT + 100);
 
     std::cout << "[PLANNER] Raw output: " << plan_text << "\n";
 
@@ -1168,7 +1401,7 @@ std::vector<json> LLMClient::plan_steps_structured(
         {"content", command}
     });
 
-    auto plan_text = call_mlx_blocking(plan_messages, cfg::TOOL_PREDICT + 100);
+    auto plan_text = call_llm_blocking(plan_messages, cfg::TOOL_PREDICT + 100);
     std::cout << "[PLANNER-S] Raw output: " << plan_text << "\n";
 
     std::vector<json> structured_steps;
@@ -1388,7 +1621,7 @@ std::string LLMClient::deep_intent_streaming(
     phase1_messages.push_back({{"role", "user"}, {"content", user_msg}});
 
     auto silent_cb = [](const std::string&) {};
-    auto phase1_raw = call_mlx_streaming(
+    auto phase1_raw = call_llm_streaming(
         phase1_messages, silent_cb, cancel,
         cfg::TOOL_PREDICT + 100, cfg::LLM_TEMPERATURE);
 

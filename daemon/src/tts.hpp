@@ -17,6 +17,10 @@
 
 #pragma once
 #include <atomic>
+#include <cstdint>
+#include <deque>
+#include <unordered_map>
+#include <vector>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -32,7 +36,8 @@ public:
     /// Which synthesis engine is active.
     enum class Backend { SAY, KOKORO };
 
-    TTS();
+    /// threads: Kokoro synthesis threads (from GET /llm; 0 = config default).
+    explicit TTS(int threads = 0);
     ~TTS();
 
     TTS(const TTS&)            = delete;
@@ -50,6 +55,14 @@ public:
     /// Kill current speech and discard all pending sentences.
     /// Target latency: < 5 ms.
     void interrupt();
+
+    /// Close the output stream and drop TTS's PortAudio reference so a full
+    /// PortAudio re-initialisation (after macOS sleep / device change) can
+    /// actually happen.  Call only while nothing is playing.
+    void release_audio();
+
+    /// Re-open the output stream after release_audio().
+    void reacquire_audio();
 
     /// True if audio is currently being spoken or queued.
     bool is_playing() const;
@@ -83,11 +96,19 @@ private:
     void speak_one(const std::string& text);
     void speak_one_kokoro(const std::string& text);
     void speak_one_say(const std::string& text);
-    void play_pcm(const void* audio_ptr);
+    void play_pcm(const void* audio_ptr, uint64_t gen);
+    void play_samples(const float* samples, int32_t n, uint64_t gen);
+
+    /// Split text into sentences so long answers start playing after the
+    /// first sentence is synthesized instead of after the whole answer.
+    static std::vector<std::string> split_sentences(const std::string& text);
+
+    /// Worker-thread only: synthesize one queued fixed phrase into the cache.
+    void warm_one_cached_phrase();
 
     // ── Kokoro initialisation ──────────────────────────────────
     bool init_kokoro();
-    bool open_output_stream(int sample_rate);
+    bool open_output_stream(int sample_rate, bool test_tone = true);
 
     // ── State ──────────────────────────────────────────────────
     Backend                     backend_     = Backend::SAY;
@@ -105,6 +126,14 @@ private:
 
     // Process tracking (for macOS `say` fallback only)
     std::atomic<pid_t>          current_pid_{0};
+    std::atomic<uint64_t>       gen_{0};        // bumped by interrupt(); stale audio is dropped
+    std::mutex                  pa_mu_;         // guards out_stream_ open/close vs. writes
+    int                         sample_rate_ = 0;
+    int                         threads_     = 4;
+    // Pre-synthesized PCM for fixed phrases (worker thread only).
+    std::unordered_map<std::string, std::vector<float>> phrase_pcm_;
+    std::deque<std::string>     warm_queue_;
+    bool                        pa_held_     = false;  // TTS holds a Pa_Initialize reference
     std::atomic<bool>           playing_{false};
     std::atomic<bool>           stop_{false};
     std::thread                 worker_;

@@ -61,16 +61,40 @@ public:
     std::string fetch_screen_context(bool force = false);
 
     struct AgentResult {
-        bool        success;
+        bool        success = false;
+        bool        unavailable = false;   // agent system not loaded / unreachable
         std::string summary;
-        int         steps_taken;
+        int         steps_taken = 0;
         std::string error;
         std::string raw_json;
+        std::vector<std::string> tool_calls;
+        // Multi-match file search → CLARIFYING state
+        std::vector<std::pair<std::string, std::string>> file_choices;  // {name, path}
+        // Destructive action waiting for a spoken yes/no → CONFIRMING state
+        std::string confirm_token;
+        std::string confirm_speech;
+        std::string pending_tool;
     };
 
     AgentResult execute_agent(const std::string& command,
                               const std::string& context_json = "{}");
     std::string fetch_active_context();
+
+    /// GET /llm — the user's plugged-in LLM + hardware-aware thread counts.
+    struct LLMRuntimeConfig {
+        bool        configured = false;
+        std::string runtime;
+        std::string chat_url;
+        std::string model;
+        int         context_tokens  = 4096;
+        int         whisper_threads = 4;
+        int         tts_threads     = 4;
+    };
+    LLMRuntimeConfig fetch_llm_config();
+
+    /// POST /confirm — approve or reject a pending destructive action.
+    /// Returns the tool result (or "Cancelled.").
+    std::string confirm(const std::string& token, bool approve);
 
     /// Fetch user preferences and rules from the Python server
     std::string fetch_preferences();
@@ -94,9 +118,13 @@ public:
     struct ToolResult {
         std::string result;
         std::string screen_state;  // empty if not a UI-mutating tool
+        bool        has_success = false;  // server reported an explicit success flag
+        bool        success     = true;
     };
+    /// include_screen=false skips the server's ~1-2 s accessibility-tree read.
     ToolResult execute_with_screen(const std::string& name,
-                                    const nlohmann::json& args);
+                                    const nlohmann::json& args,
+                                    bool include_screen = true);
 
     // ── Structured Task Executor (STE) ──────────────────────────
 
@@ -112,6 +140,13 @@ public:
         std::vector<std::pair<std::string, std::string>> file_choices; // {name, path}
     };
     TaskExecResult execute_task(const std::string& command);
+
+    /// Read a string field, tolerating missing / null / non-string values.
+    static std::string json_str(const nlohmann::json& j, const char* key,
+                                const std::string& def = "");
+
+    /// Percent-encode a string for use in a URL query component.
+    static std::string url_encode(const std::string& s);
 
     // ── Static HTTP helpers (used by LLMClient too) ──────────
     static std::string http_post(const std::string& url,

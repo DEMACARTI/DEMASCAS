@@ -2,11 +2,11 @@
 # ═══════════════════════════════════════════════════════════════════
 # DEMASCAS — Run Script
 #
-# Starts the full polyglot stack (4 processes):
-#   1. MLX text server        (localhost:8081)  — Phi-4-mini-instruct-4bit
-#   2. MLX vision server      (localhost:8082)  — Qwen2.5-VL-3B (optional)
+# Starts the DEMASCAS stack:
+#   1. Your plugged-in local LLM (checked; MLX is started if configured to)
+#   2. MLX vision server      (localhost:8082)  — optional, manual
 #   3. Python tool micro-service  (localhost:5001)
-#   4. C++ bare-metal daemon      (audio → whisper.cpp → MLX → TTS)
+#   4. C++ bare-metal daemon      (audio → whisper.cpp → LLM → TTS)
 #
 # The C++ daemon runs in the foreground; Ctrl-C stops all processes.
 #
@@ -25,13 +25,8 @@ TOOL_SERVER="server/tool_server.py"
 VLM_SERVER="scripts/start_vlm_server.py"
 VENV_DIR="$(cd "$PROJECT_ROOT/.." && pwd)/venv"
 
-# MLX model names (must match config.hpp)
-MLX_TEXT_MODEL="mlx-community/Phi-4-mini-instruct-4bit"
-MLX_TEXT_PORT=8081
-MLX_VL_PORT=8082
-
-# Keep every Python caller aligned with the text server model.
-export DEMASCAS_MLX_TEXT_MODEL="$MLX_TEXT_MODEL"
+# DEMASCAS ships without an LLM — the user's plugged-in model is read from
+# ~/.demascas/config.json (set it up with: python main.py setup).
 
 # ── Track PIDs for cleanup ──────────────────────────────────────────
 
@@ -77,58 +72,80 @@ fi
 CONFIG_FILE="$HOME/.demascas/config.json"
 if [ -f "$CONFIG_FILE" ]; then
     echo "[*] Loading config from $CONFIG_FILE"
-    # Extract and export API keys using python (reliable JSON parsing)
-    eval "$(python3 -c "
-import json, os
+    # Read each key separately (no eval — values are never executed as shell).
+    _cfg_get() {
+        python3 - "$CONFIG_FILE" "$1" <<'PY'
+import json, sys
 try:
-    cfg = json.load(open(os.path.expanduser('~/.demascas/config.json')))
-    for k in ('google_api_key', 'google_cse_id'):
-        v = cfg.get(k, '')
-        if v:
-            print(f'export {k.upper()}=\"{v}\"')
+    v = json.load(open(sys.argv[1])).get(sys.argv[2], "")
+    sys.stdout.write(v if isinstance(v, str) else "")
 except Exception:
     pass
-")"
+PY
+    }
+    _gkey="$(_cfg_get google_api_key)"
+    _gcse="$(_cfg_get google_cse_id)"
+    [ -n "$_gkey" ] && export GOOGLE_API_KEY="$_gkey"
+    [ -n "$_gcse" ] && export GOOGLE_CSE_ID="$_gcse"
+    unset _gkey _gcse
 else
     echo "[*] No config at $CONFIG_FILE — smart_search will use DuckDuckGo"
 fi
 
-# ── 1. Start MLX text server ────────────────────────────────────────
+# ── 1. Check the plugged-in LLM ─────────────────────────────────────
+# llm-check exit codes: 0 reachable · 1 not reachable · 2 not configured ·
+# 3 MLX with autostart (prints "<model>\n<port>" — MLX has no background
+#   service, so DEMASCAS starts it).
 
-echo "[*] Starting MLX text server (localhost:${MLX_TEXT_PORT})..."
+echo "[*] Checking your local LLM..."
+set +e
+LLM_CHECK_OUT="$(python main.py llm-check)"
+LLM_STATUS=$?
+set -e
 
-if curl -s "http://127.0.0.1:${MLX_TEXT_PORT}/v1/models" > /dev/null 2>&1; then
-    echo "[✓] Reusing existing MLX text server on port ${MLX_TEXT_PORT}."
-else
-    # If the port is occupied but /v1/models is not healthy, stop early with clear guidance.
-    if lsof -nP -iTCP:"${MLX_TEXT_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "❌  Port ${MLX_TEXT_PORT} is already in use by a non-MLX process."
-        echo "    Free the port or stop that process, then run ./scripts/run.sh again."
-        exit 1
-    fi
-
-    # New CLI form (avoids deprecation warning): python -m mlx_lm server ...
-    python -m mlx_lm server \
-        --model "$MLX_TEXT_MODEL" \
-        --port "$MLX_TEXT_PORT" &
-    TEXT_PID=$!
-    PIDS+=($TEXT_PID)
-    echo "    PID: $TEXT_PID"
-fi
-
-# Wait for MLX text server to be ready
-echo "[*] Waiting for MLX text server..."
-for i in $(seq 1 30); do
-    if curl -s "http://127.0.0.1:${MLX_TEXT_PORT}/v1/models" > /dev/null 2>&1; then
-        echo "[✓] MLX text server ready."
-        break
-    fi
-    if [ "$i" -eq 30 ]; then
-        echo "❌  MLX text server failed to start."
-        exit 1
-    fi
-    sleep 1
-done
+case "$LLM_STATUS" in
+    0)
+        echo "[✓] LLM runtime reachable."
+        ;;
+    2)
+        echo "[!] No language model is set up yet. DEMASCAS will run shortcuts and"
+        echo "    non-LLM actions only. Plug one in with:  python main.py setup"
+        ;;
+    3)
+        MLX_MODEL="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 1p)"
+        MLX_PORT="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 2p)"
+        if lsof -nP -iTCP:"${MLX_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "❌  Port ${MLX_PORT} is in use by something that isn't answering as an LLM."
+            exit 1
+        fi
+        echo "[*] Starting MLX server: ${MLX_MODEL} on port ${MLX_PORT}..."
+        python -m mlx_lm server --model "$MLX_MODEL" --port "$MLX_PORT" &
+        TEXT_PID=$!
+        PIDS+=($TEXT_PID)
+        # First run downloads the model — wait up to MLX_STARTUP_TIMEOUT s.
+        MLX_STARTUP_TIMEOUT="${MLX_STARTUP_TIMEOUT:-300}"
+        for i in $(seq 1 "$MLX_STARTUP_TIMEOUT"); do
+            if curl -s "http://127.0.0.1:${MLX_PORT}/v1/models" > /dev/null 2>&1; then
+                echo "[✓] MLX server ready."
+                break
+            fi
+            if ! kill -0 "$TEXT_PID" 2>/dev/null; then
+                echo "❌  MLX server exited during startup (see output above)."
+                exit 1
+            fi
+            if [ "$i" -eq "$MLX_STARTUP_TIMEOUT" ]; then
+                echo "❌  MLX server not ready after ${MLX_STARTUP_TIMEOUT}s."
+                exit 1
+            fi
+            if [ $((i % 15)) -eq 0 ]; then echo "    ...still loading (${i}s)"; fi
+            sleep 1
+        done
+        ;;
+    *)
+        echo "[!] Your configured LLM runtime isn't reachable. Start it (Ollama app,"
+        echo "    LM Studio server, llama-server, ...) — details: python main.py doctor"
+        ;;
+esac
 
 # ── 2. MLX vision server — LAZY LOAD (disabled by default) ──────────
 # The VLM uses ~1.7GB RAM.  On 8GB M1, running it alongside the text
@@ -158,34 +175,44 @@ done
 
 echo "[*] VLM server disabled (lazy-load mode for 8GB RAM). Start manually if needed."
 
-# Export discovered VLM endpoint (written by start_vlm_server.py probe thread)
-VLM_ENDPOINT_FILE="$HOME/.demascas/vlm_endpoint.txt"
-if [ -f "$VLM_ENDPOINT_FILE" ]; then
-    export DEMASCAS_VLM_ENDPOINT=$(cat "$VLM_ENDPOINT_FILE")
-    echo "[✓] VLM endpoint: $DEMASCAS_VLM_ENDPOINT"
-fi
+# (Vision tools read ~/.demascas/vlm_endpoint.txt directly when the VLM
+#  server is running; nothing needs to be exported here.)
 
 # ── 3. Start Python tool server ─────────────────────────────────────
 
 echo "[*] Starting Python tool server (localhost:5001)..."
-python "$TOOL_SERVER" &
-TOOL_PID=$!
-PIDS+=($TOOL_PID)
-echo "    PID: $TOOL_PID"
+TOOL_PID=""
+if curl -s "http://127.0.0.1:5001/health" | grep -q '"status"' 2>/dev/null; then
+    # e.g. the Docker container or a manual `python main.py` — reuse it
+    # instead of launching a second copy that would fail to bind :5001.
+    echo "[✓] Reusing the tool server already running on port 5001."
+elif lsof -nP -iTCP:5001 -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "❌  Port 5001 is in use by another program. Free it and retry."
+    exit 1
+else
+    python "$TOOL_SERVER" &
+    TOOL_PID=$!
+    PIDS+=($TOOL_PID)
+    echo "    PID: $TOOL_PID"
 
-# Wait for tool server /health endpoint
-echo "[*] Waiting for tool server..."
-for i in $(seq 1 15); do
-    if curl -s "http://127.0.0.1:5001/health" | grep -q '"status"' 2>/dev/null; then
-        echo "[✓] Tool server ready."
-        break
-    fi
-    if [ "$i" -eq 15 ]; then
-        echo "❌  Tool server failed to start."
-        exit 1
-    fi
-    sleep 1
-done
+    # Wait for tool server /health endpoint (first start imports ChromaDB)
+    echo "[*] Waiting for tool server..."
+    for i in $(seq 1 60); do
+        if curl -s "http://127.0.0.1:5001/health" | grep -q '"status"' 2>/dev/null; then
+            echo "[✓] Tool server ready."
+            break
+        fi
+        if ! kill -0 "$TOOL_PID" 2>/dev/null; then
+            echo "❌  Tool server exited during startup (see output above)."
+            exit 1
+        fi
+        if [ "$i" -eq 60 ]; then
+            echo "❌  Tool server failed to start."
+            exit 1
+        fi
+        sleep 1
+    done
+fi
 
 # ── 4. Start C++ daemon in foreground ───────────────────────────────
 

@@ -104,7 +104,8 @@ def get_screen_digest(force: bool = False) -> dict:
 
     # ── Step 2: VLM scene understanding (slower, ~1-2s) ──────────
     try:
-        screenshot = take_screenshot_base64()
+        from sensors.vision import vlm_available
+        screenshot = take_screenshot_base64() if vlm_available() else "[-] VLM off"
         if not screenshot.startswith("[-]"):
             vlm_prompt = (
                 "Describe this screen in ONE JSON object. Be precise and brief:\n"

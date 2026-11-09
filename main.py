@@ -6,7 +6,7 @@ C++ daemon connects to over HTTP.
 Architecture (polyglot):
   C++ daemon (daemon/build/demascas_daemon)
     → PortAudio mic capture + whisper.cpp STT
-    → Streaming Ollama (libcurl NDJSON)
+    → Streaming MLX LLM (libcurl SSE, OpenAI-compatible)
     → Streaming TTS with barge-in interrupt
     → Calls this tool server for OS actions, MCP, memory, learning
 
@@ -16,9 +16,12 @@ Architecture (polyglot):
     → /tools  — list all available tool schemas
     → /health — liveness check
     → /context, /learn — learning endpoints
+    → /agent, /confirm — domain agents + human confirmation
 
 Usage:
     python main.py              # start tool server (port 5001)
+    python main.py setup        # plug in a local LLM sized to this laptop
+    python main.py doctor       # hardware / model / runtime status (--bench for speed)
     ./daemon/build/demascas_daemon  # start voice engine (separate terminal)
 """
 
@@ -30,9 +33,14 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+LLM_COMMANDS = {"setup", "doctor", "detect", "llm-check"}
+
+
 def main() -> None:
-    host = os.getenv("DEMASCAS_HOST", "127.0.0.1")
-    port = int(os.getenv("DEMASCAS_PORT", "5001"))
+    # `python main.py setup|doctor|detect|llm-check` → LLM plug-in CLI
+    if len(sys.argv) > 1 and sys.argv[1] in LLM_COMMANDS:
+        from core.llm.cli import main as llm_cli
+        sys.exit(llm_cli(sys.argv[1:]))
 
     print("========================================")
     print("   DEMASCAS SYSTEM CORE INITIALIZED     ")
@@ -42,11 +50,12 @@ def main() -> None:
     print("[*] Launch the daemon separately:")
     print("      ./daemon/build/demascas_daemon\n")
 
-    from server.tool_server import app  # noqa: E402
+    from server.tool_server import run_server  # noqa: E402
 
-    # Run the Flask tool server — the C++ daemon talks to this.
-    # threaded=True so the daemon can make concurrent tool calls.
-    app.run(host=host, port=port, threaded=True)
+    # Same startup path as `python server/tool_server.py` (MCP boot,
+    # shutdown hooks, threaded Flask) — host/port come from
+    # DEMASCAS_HOST / DEMASCAS_PORT.
+    run_server()
 
 
 if __name__ == "__main__":

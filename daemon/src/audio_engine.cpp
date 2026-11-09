@@ -202,6 +202,20 @@ std::vector<float> AudioEngine::capture_chunk(float seconds) {
     return drain();
 }
 
+std::vector<float> AudioEngine::collect(float seconds) {
+    const size_t need = static_cast<size_t>(seconds * cfg::SAMPLE_RATE);
+    auto deadline = clk::now() + std::chrono::milliseconds(
+        static_cast<int>(seconds * 2000) + 500);   // safety if the stream stalls
+    while (clk::now() < deadline) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (ring_.size() >= need) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return drain();
+}
+
 std::vector<float> AudioEngine::capture_utterance(float timeout_sec,
                                                     float silence_sec) {
     drain();  // start clean
@@ -210,11 +224,12 @@ std::vector<float> AudioEngine::capture_utterance(float timeout_sec,
         + std::chrono::milliseconds(static_cast<int>(timeout_sec * 1000));
 
     std::vector<float> recording;
+    std::vector<float> preroll;   // last quiet buffer — keeps soft word onsets
     bool speech_started = false;
     auto last_speech     = clk::now();
 
     while (clk::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(cfg::CAPTURE_POLL_MS));
 
         auto buf = drain();
         if (buf.empty()) continue;
@@ -222,6 +237,12 @@ std::vector<float> AudioEngine::capture_utterance(float timeout_sec,
         float energy = rms(buf.data(), buf.size());
 
         if (energy >= cfg::VAD_ENERGY_THRESHOLD) {
+            if (!speech_started) {
+                recording.insert(recording.end(), preroll.begin(), preroll.end());
+                // Speech may continue past the original deadline — give the
+                // user up to 15 s of talking time from when they START.
+                deadline = std::max(deadline, clk::now() + std::chrono::seconds(15));
+            }
             speech_started = true;
             last_speech    = clk::now();
         }
@@ -233,6 +254,8 @@ std::vector<float> AudioEngine::capture_utterance(float timeout_sec,
                 clk::now() - last_speech).count();
             if (silence_elapsed >= silence_sec)
                 break;  // silence detected — utterance complete
+        } else {
+            preroll.swap(buf);
         }
     }
 

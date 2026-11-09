@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Iterator, Any
 import requests
+from core.config import LLM_CHAT_URL, TOOL_SERVER_URL
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ class ToolRouterV2:
         ],
     }
 
-    def __init__(self, tool_server: str = "http://127.0.0.1:5001"):
+    def __init__(self, tool_server: str = TOOL_SERVER_URL):
         self.tool_server = tool_server
         self._tool_schemas = None
         self._tool_cache_time = 0
@@ -203,8 +204,8 @@ class SmartAgentV2(ABC):
         self.router = tool_router
         self.state = AgentState.IDLE
         self.steps: list[AgentStep] = []
-        self._llm_url = "http://127.0.0.1:8081/v1/chat/completions"
-        self._tool_url = "http://127.0.0.1:5001/tool"
+        self._llm_url = LLM_CHAT_URL
+        self._tool_url = f"{TOOL_SERVER_URL}/tool"
 
     @abstractmethod
     def plan(self, goal: str) -> list[str]:

@@ -329,13 +329,42 @@ def take_screenshot_base64() -> str:
 # ---------------------------------------------------------------------------
 
 _VLM_ENDPOINT_FILE = os.path.join(str(pathlib.Path.home()), ".demascas", "vlm_endpoint.txt")
-_VLM_BASE = "http://127.0.0.1:8082"
-_VLM_MODEL = "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
+from core.config import MLX_VL_BASE as _VLM_BASE, MLX_VL_MODEL as _VLM_MODEL, VL_CHAT_URL as _VL_CHAT_URL
+
+
+_vlm_state = {"ok": None, "checked": 0.0}
+
+
+def vlm_available(ttl_up: float = 60.0, ttl_down: float = 10.0) -> bool:
+    """Cheap, cached check that the VLM server is listening.
+
+    The VLM is OFF by default (8 GB RAM budget), so callers use this to skip
+    taking a ~0.3-0.5 s screenshot that could never be analysed."""
+    import socket
+    import time as _t
+    from urllib.parse import urlparse
+
+    now = _t.time()
+    ttl = ttl_up if _vlm_state["ok"] else ttl_down
+    if _vlm_state["ok"] is not None and now - _vlm_state["checked"] < ttl:
+        return bool(_vlm_state["ok"])
+    u = urlparse(_VLM_BASE)
+    ok = False
+    try:
+        with socket.create_connection((u.hostname or "127.0.0.1", u.port or 80), timeout=0.25):
+            ok = True
+    except OSError:
+        ok = False
+    _vlm_state.update(ok=ok, checked=now)
+    return ok
 
 
 def _get_vlm_url() -> str:
-    """Read the VLM endpoint from the discovery file, with fallback probing.
-    Priority: 1) cached file  2) probe common paths  3) hardcoded default."""
+    """VLM chat endpoint.
+    Priority: 0) vision model configured via `python main.py setup`
+              1) cached discovery file  2) probe common paths  3) default."""
+    if _VL_CHAT_URL:
+        return _VL_CHAT_URL
     # 1) Try the file written by start_vlm_server.py
     try:
         if os.path.exists(_VLM_ENDPOINT_FILE):
@@ -385,6 +414,9 @@ def vision_query(prompt: str, screenshot_b64: str | None = None) -> str:
         VLM response text, or error message.
     """
     import requests
+
+    if not vlm_available():
+        return "[-] VLM server not running on port 8082."
 
     if screenshot_b64 is None:
         screenshot_b64 = take_screenshot_base64()
@@ -446,6 +478,10 @@ def vision_execute(action: str) -> str:
     """
     import json as json_mod
 
+    # Don't spend time on a screenshot if no VLM can read it.
+    if not vlm_available():
+        return "[-] VLM server not running on port 8082 (vision is off)."
+
     # Capture screenshot
     screenshot_b64 = take_screenshot_base64()
     if screenshot_b64.startswith("[-]"):
@@ -504,13 +540,17 @@ def vision_execute(action: str) -> str:
                 pyautogui.click(x, y)
                 return f"Clicked at ({x}, {y})."
             except ImportError:
-                # Fallback to AppleScript
-                subprocess.run(
+                # Fallback to AppleScript — only report success if it worked.
+                r = subprocess.run(
                     ['osascript', '-e',
-                     f'tell application "System Events" to click at {{{x}, {y}}}'],
-                    capture_output=True, timeout=5,
+                     f'tell application "System Events" to click at {{{int(x)}, {int(y)}}}'],
+                    capture_output=True, text=True, timeout=5,
                 )
-                return f"Clicked at ({x}, {y})."
+                if r.returncode == 0:
+                    return f"Clicked at ({x}, {y})."
+                return ("[-] Could not click by coordinates: pyautogui is not installed "
+                        "and the AppleScript fallback failed "
+                        f"({(r.stderr or '').strip()[:120]}). Run: pip install pyautogui")
 
         if act == "type":
             raw_x, raw_y = result.get("x", 0), result.get("y", 0)
@@ -523,7 +563,7 @@ def vision_execute(action: str) -> str:
                 pyautogui.typewrite(text, interval=0.02)
                 return f"Typed '{text}' at ({x}, {y})."
             except ImportError:
-                return "[-] pyautogui not installed for type action."
+                return "[-] pyautogui not installed for type action. Run: pip install pyautogui"
 
         if act == "scroll":
             direction = result.get("direction", "down")
@@ -534,7 +574,7 @@ def vision_execute(action: str) -> str:
                 pyautogui.scroll(scroll_val)
                 return f"Scrolled {direction} by {amount}."
             except ImportError:
-                return "[-] pyautogui not installed for scroll action."
+                return "[-] pyautogui not installed for scroll action. Run: pip install pyautogui"
 
         return f"[-] Unknown VLM action: {act}"
 

@@ -17,10 +17,16 @@ Start:
 """
 
 import atexit
+import inspect
+import json
 import sys
 import os
 import logging
 import re
+import secrets
+import signal
+import threading
+import time
 
 # Ensure the DEMASCAS package root is on the path so we can import
 # actuators/, sensors/, core/, and mcp/ directly.
@@ -124,45 +130,44 @@ except ImportError as e:
 
 def click_ui_element_safe(element_name: str) -> str:
     """
-    Safe wrapper around click_ui_element with 3-tier fallback:
-      1. wait_for_element → click_ui_element  (accessibility tree)
-      2. If click fails → vision_execute      (VLM screenshot-based click)
-      3. If VLM fails → structured error message
+    Safe wrapper around click_ui_element with a fast-first fallback chain:
+      1. click_ui_element directly (one accessibility-tree pass for the name
+         and all its aliases) — the common case costs a single traversal.
+      2. If not found: the element may still be appearing → wait up to 2 s,
+         then click once more.
+      3. If still not found and the VLM server is running → vision click.
+      4. Otherwise a structured error the LLM can act on.
 
-    This prevents the LLM from getting stuck in retry loops when an
-    element isn't immediately available.
+    (Previously step 2's wait ran BEFORE every click, adding a full
+    1-2 s tree traversal even when the element was already on screen.)
     """
-    import time
-
-    # Tier 1: Wait for element to appear, then click via accessibility tree
     try:
-        wait_result = wait_for_element(element_name, timeout=3)
-        if "Success" in wait_result:
-            click_result = click_ui_element(element_name)
-            if "Success" in click_result:
-                return click_result
-            # Click found element but failed — fall through to vision
-            print(f"[SAFE-CLICK] Accessibility click failed: {click_result}")
-        else:
-            print(f"[SAFE-CLICK] Element not in tree: {wait_result}")
+        click_result = click_ui_element(element_name)
+        if click_result.startswith("Success"):
+            return click_result
+        print(f"[SAFE-CLICK] First attempt failed: {click_result}")
+        if "Timeout" not in click_result:
+            wait_result = wait_for_element(element_name, timeout=2)
+            if "Success" in wait_result:
+                click_result = click_ui_element(element_name)
+                if click_result.startswith("Success"):
+                    return click_result
     except Exception as e:
-        print(f"[SAFE-CLICK] Tier 1 error: {e}")
+        print(f"[SAFE-CLICK] Accessibility click error: {e}")
 
-    # Tier 2: Vision-based click via VLM
+    # Vision-based click via VLM (skipped instantly when the VLM is off)
     try:
-        print(f"[SAFE-CLICK] Falling back to VLM vision for '{element_name}'...")
-        time.sleep(0.3)  # let UI settle
         vision_result = vision_execute(f"Click the element labeled '{element_name}'")
         if not vision_result.startswith("[-]"):
             return vision_result
-        print(f"[SAFE-CLICK] VLM vision failed: {vision_result}")
+        print(f"[SAFE-CLICK] VLM vision unavailable/failed: {vision_result}")
     except Exception as e:
-        print(f"[SAFE-CLICK] Tier 2 error: {e}")
+        print(f"[SAFE-CLICK] Vision error: {e}")
 
-    # Tier 3: Structured error — helps LLM choose an alternative
     return (
         f"[-] Could not click '{element_name}'. "
-        "The element was not found in the accessibility tree or via screen vision. "
+        "The element was not found in the accessibility tree"
+        " (and screen vision is unavailable or could not find it). "
         "Try: (1) read the screen with get_active_window_tree to find the exact element name, "
         "or (2) use press_keyboard_shortcut for the equivalent action."
     )
@@ -283,7 +288,183 @@ TOOL_MAP = {
     "web_ecommerce_search":      web_ecommerce_search,
 }
 
+# ── Result helpers ───────────────────────────────────────────────────
+# Tools return either plain strings or dicts like {"success": bool, ...}.
+# Results are serialised as JSON (never Python repr) so every consumer —
+# the C++ daemon, agents, the learning engine — can parse them reliably.
+
+_ERROR_PREFIXES = ("[-]", "failed", "error", "timeout", "could not", "refused")
+
+
+def _serialize_result(obj) -> str:
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (dict, list)):
+        try:
+            return json.dumps(obj, ensure_ascii=False, default=str)
+        except Exception:
+            pass
+    return str(obj)
+
+
+def _result_failed(obj) -> bool:
+    """True if a raw tool return value represents a failure."""
+    if obj is None:
+        return True
+    if isinstance(obj, dict):
+        if obj.get("success") is False:
+            return True
+        if obj.get("error"):
+            return True
+        msg = obj.get("message")
+        return isinstance(msg, str) and msg.lstrip().lower().startswith(_ERROR_PREFIXES)
+    if isinstance(obj, str):
+        return obj.lstrip().lower().startswith(_ERROR_PREFIXES)
+    return False
+
+
+def _parse_result(obj):
+    """Return a dict/list for a raw result or a JSON string, else None."""
+    if isinstance(obj, (dict, list)):
+        return obj
+    if isinstance(obj, str) and obj[:1] in ("{", "["):
+        try:
+            return json.loads(obj)
+        except Exception:
+            return None
+    return None
+
+
+# ── Human confirmation for destructive actions ───────────────────────
+# Destructive tools never run straight from an LLM/agent call.  Instead a
+# pending action is stored server-side under a one-time token and the
+# daemon asks the user.  Only POST /confirm with that token executes it,
+# so a model can't "confirm" on its own by passing extra arguments.
+
+CONFIRM_REQUIRED_TOOLS = frozenset({"delete_file"})
+_CONFIRM_TTL_SEC = 120
+_PENDING: dict[str, dict] = {}
+_PENDING_LOCK = threading.Lock()
+
+
+def _create_pending(tool: str, args: dict, speech: str) -> dict:
+    token = secrets.token_urlsafe(16)
+    now = time.time()
+    with _PENDING_LOCK:
+        for t in [t for t, p in _PENDING.items() if now - p["created"] > _CONFIRM_TTL_SEC]:
+            _PENDING.pop(t, None)
+        _PENDING[token] = {"tool": tool, "args": dict(args or {}), "created": now}
+    return {
+        "status": "pending_confirmation",
+        "confirm_speech": speech,
+        "pending_tool": tool,
+        "pending_args": dict(args or {}),
+        "confirm_token": token,
+        "message": "Waiting for the user to confirm. Do not call this tool again.",
+    }
+
+
+def _describe_action(tool: str, args: dict) -> str:
+    if tool == "delete_file":
+        path = str(args.get("file_path", "that file"))
+        return f"Move {os.path.basename(path.rstrip('/')) or path} to the Trash?"
+    return f"Run {tool.replace('_', ' ')}?"
+
+
+def _confirm_and_execute_tool(action_description: str, tool_name: str,
+                              tool_args: str = "{}") -> dict:
+    """Server-side wrapper for the confirm_and_execute tool."""
+    try:
+        args = json.loads(tool_args) if isinstance(tool_args, str) else dict(tool_args or {})
+    except Exception:
+        args = {}
+    canon, args = _normalize_tool_call(tool_name or "", args)
+    if canon not in TOOL_MAP or canon == "confirm_and_execute":
+        return {"success": False, "message": f"[-] Unknown tool to confirm: {tool_name}"}
+    return _create_pending(canon, args, action_description or _describe_action(canon, args))
+
+
+TOOL_MAP["confirm_and_execute"] = _confirm_and_execute_tool
+
 _NATIVE_NAMES = frozenset(TOOL_MAP.keys())
+
+# Tools that drive macOS through AppleScript / Accessibility / screenshots.
+# They cannot work when the server runs in a Linux container.
+_MACOS_ONLY_MODULES = frozenset({
+    "actuators.system_control", "actuators.browser", "actuators.web_agent",
+    "sensors.vision", "actuators.communication",
+})
+_MACOS_ONLY_TOOLS = frozenset({
+    "click_ui_element", "open_file", "delete_file", "summarize_selected_pdf",
+    "get_system_info", "set_default_browser",
+})
+
+
+def _is_macos_only(name: str, func) -> bool:
+    return name in _MACOS_ONLY_TOOLS or getattr(func, "__module__", "") in _MACOS_ONLY_MODULES
+
+
+def _get_tool_args(func, raw_args: dict) -> dict:
+    """Map raw JSON arguments onto the tool's signature with light coercion.
+    Raises TypeError naming any missing required argument."""
+    sig = inspect.signature(func)
+    cleaned = {}
+    missing = []
+    for param_name, param in sig.parameters.items():
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+        if param_name in raw_args and raw_args[param_name] is not None:
+            val = raw_args[param_name]
+            ann = param.annotation
+            default = param.default
+            if ann is bool or isinstance(default, bool):
+                if isinstance(val, str):
+                    val = val.strip().lower() in ("true", "1", "yes")
+            elif (ann is int or (isinstance(default, int) and not isinstance(default, bool))) \
+                    and isinstance(val, (str, float)):
+                try:
+                    val = int(float(val))
+                except ValueError:
+                    pass
+            elif (ann is float or isinstance(default, float)) and isinstance(val, (str, int)):
+                try:
+                    val = float(val)
+                except ValueError:
+                    pass
+            cleaned[param_name] = val
+        elif param.default is inspect.Parameter.empty:
+            missing.append(param_name)
+    if missing:
+        raise TypeError(f"missing required argument(s): {', '.join(missing)}")
+    return cleaned
+
+
+def _dispatch_native(name: str, args: dict, *, confirmed: bool = False) -> tuple[str, bool, object]:
+    """Run a native tool.  Returns (serialized_result, failed, raw_result).
+    Destructive tools return a pending-confirmation request unless
+    `confirmed` is True (only set by the /confirm endpoint)."""
+    func = TOOL_MAP.get(name)
+    if func is None:
+        return f"[-] Unknown tool: {name}", True, None
+
+    if sys.platform != "darwin" and _is_macos_only(name, func):
+        msg = (f"[-] {name} needs macOS (AppleScript/Accessibility) and is not "
+               "available when the tool server runs in Docker/Linux.")
+        return msg, True, None
+
+    if name in CONFIRM_REQUIRED_TOOLS and not confirmed:
+        pending = _create_pending(name, args, _describe_action(name, args))
+        return _serialize_result(pending), False, pending
+
+    try:
+        safe_args = _get_tool_args(func, args)
+        raw = func(**safe_args)
+    except TypeError as e:
+        return f"[-] Bad arguments for {name}: {e}", True, None
+    except Exception as e:
+        return f"[-] Tool error ({name}): {e}", True, None
+
+    return _serialize_result(raw), _result_failed(raw), raw
 
 # ── Active Context (cross-turn persistent state) ─────────────────────
 # Replaces the old SESSION_STATE with richer fields that track what the
@@ -328,10 +509,22 @@ ACTIVE_CONTEXT = {
 }
 
 
-def _update_context(tool_name: str, args: dict, result: str, success: bool):
+# Read-only bookkeeping tools the daemon calls on its own every turn —
+# they must not overwrite "what the user last did".
+_CONTEXT_SILENT_TOOLS = frozenset({
+    "retrieve_memories", "get_active_window_tree", "list_open_windows",
+})
+
+
+def _update_context(tool_name: str, args: dict, result, success: bool):
     """Auto-update ACTIVE_CONTEXT after every tool call.
     Tracks app/folder/file/url, detects multi-match file results,
-    and sets pending state for continuation detection."""
+    and sets pending state for continuation detection.
+
+    `result` may be the raw tool return value (dict/str) or its JSON text."""
+    if tool_name in _CONTEXT_SILENT_TOOLS:
+        return
+
     now = _dt.datetime.now().isoformat()
     ACTIVE_CONTEXT["last_updated"] = now
     ACTIVE_CONTEXT["turn_count"] += 1
@@ -340,12 +533,13 @@ def _update_context(tool_name: str, args: dict, result: str, success: bool):
     ACTIVE_CONTEXT["last_tool"] = tool_name
     ACTIVE_CONTEXT["last_tool_args"] = args
 
-    if not success or (isinstance(result, str) and result.startswith("[-]")):
+    result_text = _serialize_result(result)[:500]
+    if not success or _result_failed(result):
         ACTIVE_CONTEXT["last_failed_action"] = f"{tool_name}({args})"
-        ACTIVE_CONTEXT["last_tool_result"] = result
+        ACTIVE_CONTEXT["last_tool_result"] = result_text
         return
 
-    ACTIVE_CONTEXT["last_tool_result"] = result
+    ACTIVE_CONTEXT["last_tool_result"] = result_text
     ACTIVE_CONTEXT["last_action_summary"] = f"{tool_name}({args})"
 
     # ── App tracking ──
@@ -394,8 +588,7 @@ def _update_context(tool_name: str, args: dict, result: str, success: bool):
     # ── find_file → detect multi-match for continuation ──
     elif tool_name == "find_file":
         try:
-            import json as _json
-            parsed = _json.loads(result) if isinstance(result, str) else result
+            parsed = _parse_result(result)
             if isinstance(parsed, dict):
                 matches = parsed.get("matches", [])
                 count = parsed.get("count", len(matches))
@@ -473,41 +666,65 @@ def _context_block() -> str:
     return "\n".join(parts)
 
 
+_TLDS = r"(?:com|org|net|edu|gov|io|ai|co|in|uk|us|dev|app|me|info|ac)"
+# A spoken/ASR-mangled domain: "lms . bennett . edu . in", "google dot com".
+_SPOKEN_DOMAIN_RE = re.compile(
+    rf"\b[a-z0-9-]+(?:\s*\.\s*[a-z0-9-]+)*\s*\.\s*{_TLDS}\b", re.IGNORECASE
+)
+
+
 def _normalize_user_command(command: str) -> str:
-    """Lightweight autocorrection for noisy speech-to-text command text."""
+    """Lightweight autocorrection for noisy speech-to-text command text.
+
+    Only touches explicit ASR artifacts (spoken domains, whole-utterance
+    repeats).  Case is preserved so names, email subjects and file names
+    reach the tools exactly as spoken."""
     text = str(command or "").strip()
     if not text:
         return text
 
     original = text
-    low = text.lower()
 
-    # Common speech spelling forms for domains
-    low = re.sub(r"\bdouble\s+([a-z])\b", lambda m: m.group(1) * 2, low)
-    low = low.replace(" dot ", ".")
-    low = re.sub(r"\s*\.\s*", ".", low)
-    low = low.replace(" adu ", " edu ")
+    # "double u" style spelling → letters ("double t" → "tt")
+    text = re.sub(r"\bdouble\s+([a-z])\b", lambda m: m.group(1) * 2, text, flags=re.IGNORECASE)
+    # "google dot com" → "google.com"
+    text = re.sub(
+        rf"(?<=[a-z0-9])\s+dot\s+(?=(?:{_TLDS}\b|[a-z0-9-]+\s+dot\s))", ".",
+        text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\badu\b(?=\s*\.)", "edu", text, flags=re.IGNORECASE)
+    # Fix common TLD truncations after speech recognition ("edu . n")
+    text = re.sub(r"\bedu\s*\.\s*(?:n|i)\b", "edu.in", text, flags=re.IGNORECASE)
+
+    # Collapse spaces around dots ONLY inside something that looks like a
+    # domain.  A sentence break ("Safari. Then …") is left untouched.
+    def _join_domain(m: re.Match) -> str:
+        span = m.group(0)
+        if re.search(r"\.\s+[A-Z]", span):   # ". Capital" = new sentence
+            return span
+        return re.sub(r"\s*\.\s*", ".", span)
+
+    text = _SPOKEN_DOMAIN_RE.sub(_join_domain, text)
 
     # Canonical LMS domain correction for common recognition variants
-    if "lms" in low and any(tok in low for tok in [
+    low = text.lower()
+    if "lms" in low and any(tok in low for tok in (
         "bennit", "benit", "bennet", "benned", "bewewd", "penit", "paneth", "bennett"
-    ]):
-        low = re.sub(r"lms\.[a-z0-9.-]+", "lms.bennett.edu.in", low)
+    )):
+        text = re.sub(r"lms\.[a-z0-9.-]+", "lms.bennett.edu.in", text, flags=re.IGNORECASE)
 
-    # Collapse immediate repeated phrase patterns from ASR
-    # e.g. "start my study routine start my study routine" -> "start my study routine"
-    low = re.sub(r"\b(.{5,80}?)\s+\1\b", r"\1", low)
-
-    # Fix common TLD truncations after speech recognition
-    low = re.sub(r"\.edu\.n\b", ".edu.in", low)
-    low = re.sub(r"\.edu\.i\b", ".edu.in", low)
+    # ASR sometimes emits the whole utterance twice:
+    # "start my study routine start my study routine" → once.
+    # Only an exact whole-utterance repeat is collapsed, never inner text.
+    m = re.fullmatch(r"(.{5,200}?)[\s,.]+\1[.!?]?", text, flags=re.IGNORECASE)
+    if m:
+        text = m.group(1)
 
     # Study routine should map clearly to workflow behavior
-    if "study routine" in low and "workflow" not in low:
-        low = low + " workflow"
+    if re.search(r"\bstudy routine\b", text, re.IGNORECASE) and "workflow" not in text.lower():
+        text = text + " workflow"
 
-    # Preserve capitalization only where useful; commands are generally case-insensitive.
-    fixed = low.strip()
+    fixed = text.strip()
     if fixed != original:
         print(f"[AUTOCORRECT] '{original}' -> '{fixed}'")
     return fixed
@@ -577,7 +794,10 @@ TOOL_ALIASES = {
 
 def _normalize_tool_call(name: str, args: dict) -> tuple[str, dict]:
     """Map alias tool names/arguments into canonical native tool calls."""
-    canonical = TOOL_ALIASES.get(name.strip().lower(), name)
+    name = (name or "").strip()
+    # Real tool names always win — an alias must never hijack a real tool
+    # (e.g. "web_research" used to be rewritten to web_research_and_report).
+    canonical = name if name in TOOL_MAP else TOOL_ALIASES.get(name.lower(), name)
     normalized = dict(args or {})
 
     # Generic noisy fields sometimes emitted by the model
@@ -750,6 +970,31 @@ UI_MUTATING_TOOLS = frozenset({
 
 app = Flask(__name__)
 
+# ── Request guard ────────────────────────────────────────────────────
+# The tool server can click, type, delete files and run commands, so it
+# must only be reachable by the local daemon and agents — never by a web
+# page.  Browsers always send an Origin (or Sec-Fetch-Site) header on
+# cross-site requests; libcurl and python-requests never do.  The Host
+# check defeats DNS-rebinding attacks.
+
+_DEFAULT_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _allowed_hosts() -> set[str]:
+    extra = os.getenv("DEMASCAS_ALLOWED_HOSTS", "")
+    return _DEFAULT_ALLOWED_HOSTS | {h.strip().lower() for h in extra.split(",") if h.strip()}
+
+
+@app.before_request
+def _guard_request():
+    host = (request.host or "").lower()
+    hostname = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+    if hostname not in _allowed_hosts():
+        return jsonify({"error": f"Host '{host}' not allowed"}), 403
+    if request.headers.get("Origin") or request.headers.get("Sec-Fetch-Site"):
+        return jsonify({"error": "Browser requests are not allowed"}), 403
+    return None
+
 # ── MCP singleton — booted once at server start ─────────────────────
 
 _mcp: MCPManager | None = None
@@ -824,75 +1069,71 @@ def execute_tool():
 
     name = data["name"]
     args = data.get("arguments", {})
+    if not isinstance(args, dict):
+        args = {}
     name, args = _normalize_tool_call(name, args)
 
-    def _get_tool_args(func, raw_args: dict) -> dict:
-        """Safely extract and type-coerce arguments for a tool function."""
-        import inspect
-        sig = inspect.signature(func)
-        cleaned = {}
-        for param_name, param in sig.parameters.items():
-            if param_name in raw_args:
-                val = raw_args[param_name]
-                # Coerce string "true"/"false" to bool if param expects bool
-                if param.annotation is bool or (
-                    param.default is not inspect.Parameter.empty
-                    and isinstance(param.default, bool)):
-                    if isinstance(val, str):
-                        val = val.lower() in ("true", "1", "yes")
-                cleaned[param_name] = val
-            elif param.default is not inspect.Parameter.empty:
-                pass  # use default
-            else:
-                cleaned[param_name] = raw_args.get(param_name)
-        return cleaned
-
     # Priority 1: native (in-process, ~0 µs overhead)
-    func = TOOL_MAP.get(name)
-    if func is not None:
-        try:
-            safe_args = _get_tool_args(func, args)
-            result = str(func(**safe_args))
-            response = {"result": result}
+    if name in TOOL_MAP:
+        result, failed, raw = _run_and_track(name, args)
+        response = {"result": result, "success": not failed}
 
-            # Track active context
-            _update_context(name, args, result, success=True)
-
-            # Auto-learn from tool results (non-fatal)
+        # Screen state after UI actions costs a full accessibility-tree read
+        # (~1-2 s), so it is only done when the caller asks for it (the
+        # daemon's ReAct loop does, for actions whose follow-up needs element
+        # names).  Agents never ask, so their UI steps stay fast.
+        if (data.get("include_screen") and name in UI_MUTATING_TOOLS
+                and not failed and sys.platform == "darwin"):
             try:
-                from core.knowledge import auto_save_from_tool_result
-                auto_save_from_tool_result(name, args, result, success=True)
+                time.sleep(0.3)  # let UI settle
+                screen = get_active_window_tree()
+                if screen and len(screen) < 5000:  # don't bloat response
+                    response["screen_state"] = screen
             except Exception:
-                pass
+                pass  # non-fatal
 
-            # Auto-capture screen state after UI-mutating tools
-            if name in UI_MUTATING_TOOLS:
-                try:
-                    import time
-                    time.sleep(0.3)  # let UI settle
-                    screen = get_active_window_tree()
-                    if screen and len(screen) < 5000:  # don't bloat response
-                        response["screen_state"] = screen
-                except Exception:
-                    pass  # non-fatal
-
-            return jsonify(response), 200
-        except TypeError as e:
-            _update_context(name, args, str(e), success=False)
-            return jsonify({"result": f"[-] Bad arguments for {name}: {e}"}), 200
-        except Exception as e:
-            _update_context(name, args, str(e), success=False)
-            return jsonify({"result": f"[-] Tool error ({name}): {e}"}), 200
+        return jsonify(response), 200
 
     # Priority 2: MCP (JSON-RPC over stdio, ~5-10 ms)
     if _mcp is not None and _mcp.is_mcp_tool(name):
         try:
-            result = _mcp.call_tool(name, args)
-            return jsonify({"result": result}), 200
+            result = _serialize_result(_mcp.call_tool(name, args))
+            return jsonify({"result": result, "success": not _result_failed(result)}), 200
         except Exception as e:
-            return jsonify({"result": f"[-] MCP tool error ({name}): {e}"}), 200
+            return jsonify({"result": f"[-] MCP tool error ({name}): {e}", "success": False}), 200
 
-    return jsonify({"result": f"[-] Unknown tool: {name}. Use get_active_window_tree to read the screen."}), 200
+    return jsonify({"result": f"[-] Unknown tool: {name}. Use get_active_window_tree to read the screen.",
+                    "success": False}), 200
+
+
+def _run_and_track(name: str, args: dict, *, confirmed: bool = False) -> tuple[str, bool, object]:
+    """Dispatch a native tool, then update active context + auto-learning."""
+    result, failed, raw = _dispatch_native(name, args, confirmed=confirmed)
+    _update_context(name, args, raw if raw is not None else result, success=not failed)
+    if not failed:
+        try:
+            from core.knowledge import auto_save_from_tool_result
+            auto_save_from_tool_result(name, args, raw if raw is not None else result, success=True)
+        except Exception:
+            pass
+    return result, failed, raw
+
+
+@app.route("/confirm", methods=["POST"])
+def confirm_endpoint():
+    """Resolve a pending confirmation created by a destructive tool.
+    Body: {"token": "...", "approve": true|false}"""
+    data = request.get_json(silent=True) or {}
+    token = str(data.get("token", ""))
+    approve = bool(data.get("approve", False))
+    with _PENDING_LOCK:
+        pending = _PENDING.pop(token, None)
+    if pending is None or time.time() - pending["created"] > _CONFIRM_TTL_SEC:
+        return jsonify({"result": "[-] That confirmation has expired.", "success": False}), 200
+    if not approve:
+        return jsonify({"result": "Cancelled.", "success": True}), 200
+    result, failed, _ = _run_and_track(pending["tool"], pending["args"], confirmed=True)
+    return jsonify({"result": result, "success": not failed}), 200
 
 
 @app.route("/tools", methods=["GET"])
@@ -927,13 +1168,35 @@ def get_filtered_tools():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Readiness probe — includes native + MCP counts."""
+    """Readiness probe — includes native + MCP counts and LLM status."""
+    from core.config import LLM
     mcp_count = len(_mcp.get_mcp_tool_names()) if _mcp else 0
     return jsonify({
         "status": "ok",
         "native": len(TOOL_MAP),
         "mcp": mcp_count,
         "tools": len(TOOL_MAP) + mcp_count,
+        "llm": {"configured": LLM.configured, "model": LLM.model, "runtime": LLM.runtime},
+    })
+
+
+@app.route("/llm", methods=["GET"])
+def llm_config_endpoint():
+    """The plugged-in LLM + hardware-aware thread counts.
+
+    The C++ daemon reads this ONCE at startup (no per-command cost) instead
+    of compile-time constants, so any OpenAI-compatible local runtime works."""
+    from core.config import LLM
+    from core.llm.hardware import component_threads
+    return jsonify({
+        "configured": LLM.configured,
+        "runtime": LLM.runtime,
+        "chat_url": LLM.chat_url,
+        "model": LLM.model,
+        "context_tokens": LLM.context_tokens,
+        "vision": {"chat_url": LLM.vision.chat_url, "model": LLM.vision.model},
+        "source": LLM.source,
+        **component_threads(),
     })
 
 
@@ -1127,33 +1390,9 @@ def plan_and_execute_endpoint():
     # ── Execute ──────────────────────────────────────────────
     def tool_dispatch(name: str, args: dict) -> str:
         """Dispatch a tool call through the normal TOOL_MAP pipeline."""
-        import inspect
-        canon_name, canon_args = _normalize_tool_call(name, args)
-        func = TOOL_MAP.get(canon_name)
-        if func is None:
-            return f"[-] Unknown tool: {canon_name}"
-        try:
-            sig = inspect.signature(func)
-            cleaned = {}
-            for param_name, param in sig.parameters.items():
-                if param_name in canon_args:
-                    val = canon_args[param_name]
-                    if param.annotation is bool or (
-                        param.default is not inspect.Parameter.empty
-                        and isinstance(param.default, bool)):
-                        if isinstance(val, str):
-                            val = val.lower() in ("true", "1", "yes")
-                    cleaned[param_name] = val
-                elif param.default is not inspect.Parameter.empty:
-                    pass
-                else:
-                    cleaned[param_name] = canon_args.get(param_name)
-            result = str(func(**cleaned))
-            _update_context(canon_name, canon_args, result, success=True)
-            return result
-        except Exception as e:
-            _update_context(canon_name, canon_args, str(e), success=False)
-            return f"[-] Tool error ({canon_name}): {e}"
+        canon_name, canon_args = _normalize_tool_call(name, args or {})
+        result, _failed, _raw = _run_and_track(canon_name, canon_args)
+        return result
 
     def screen_capture() -> str:
         """Capture current screen state."""
@@ -1255,6 +1494,13 @@ def get_learned_context():
         return jsonify({"context_text": "", "error": str(e)})
 
 
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+# Learning writes (ChromaDB insert + profile update) run on ONE background
+# worker so /learn returns immediately and the daemon never waits on it.
+_LEARN_EXECUTOR = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="learn")
+
+
 @app.route("/learn", methods=["POST"])
 def log_learning():
     """
@@ -1270,11 +1516,23 @@ def log_learning():
       "success": true
     }
     """
-    from core.learning import after_command, track_app_open, record_successful_sequence
     data = request.get_json(silent=True)
     if not data or "command" not in data:
         return jsonify({"error": "Missing 'command'"}), 400
+    _LEARN_EXECUTOR.submit(_record_learning, dict(data))
+    return jsonify({"status": "queued"})
 
+
+def _record_learning(data: dict) -> None:
+    """Background half of /learn (see _LEARN_EXECUTOR)."""
+    from core.learning import after_command, record_successful_sequence
+    try:
+        # Keep the model warm while DEMASCAS is in use (Ollama).
+        from core.config import LLM
+        from core.llm.governor import touch
+        touch(LLM)
+    except Exception:
+        pass
     try:
         tools_used = data.get("tools", [])
         success = data.get("success", True)
@@ -1317,9 +1575,8 @@ def log_learning():
             except Exception:
                 pass  # non-fatal
 
-        return jsonify({"status": "ok"})
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 200
+        print(f"[LEARN] Failed to record interaction: {e}")
 
 
 @app.route("/agent", methods=["POST"])
@@ -1330,25 +1587,42 @@ def agent_endpoint():
                "tool_calls": [str], "error": str|null, "data": dict|null}
     """
     if not _AGENTS_AVAILABLE:
-        return jsonify({"error": "Agent system not loaded"}), 503
+        return jsonify({"success": False, "summary": "", "error": "Agent system not loaded"}), 503
 
-    data = request.get_json(force=True) or {}
+    # Strict JSON (no force=True): a browser cannot send application/json
+    # cross-site without a CORS preflight, which this server never grants.
+    data = request.get_json(silent=True) or {}
     command = _normalize_user_command(str(data.get("command", "")).strip())
     if not command:
-        return jsonify({"error": "Missing or empty 'command'"}), 400
+        return jsonify({"success": False, "summary": "", "error": "Missing or empty 'command'"}), 400
 
     context = data.get("context") or dict(ACTIVE_CONTEXT)
+    started = time.time()
 
     try:
         result = run_agent(command, context)
-        return jsonify({
+        payload = {
             "success": result.success,
-            "summary": result.summary,
+            "summary": result.summary or "",
             "steps_taken": result.steps_taken,
             "tool_calls": result.tool_calls,
-            "error": result.error,
-            "data": result.data,
-        }), 200
+            "error": result.error or "",
+            "data": result.data or {},
+        }
+        # Surface any confirmation the agent triggered so the daemon asks.
+        with _PENDING_LOCK:
+            fresh = [(p["created"], tok) for tok, p in _PENDING.items() if p["created"] >= started]
+        if fresh:
+            tok = max(fresh)[1]
+            with _PENDING_LOCK:
+                p = _PENDING.get(tok)
+            if p is not None:
+                payload["pending_confirmation"] = {
+                    "confirm_token": tok,
+                    "pending_tool": p["tool"],
+                    "confirm_speech": _describe_action(p["tool"], p["args"]),
+                }
+        return jsonify(payload), 200
     except Exception as e:
         logger.exception(f"[/agent] {e}")
         return jsonify({
@@ -1357,6 +1631,7 @@ def agent_endpoint():
             "steps_taken": 0,
             "tool_calls": [],
             "error": str(e),
+            "data": {},
         }), 500
 
 
@@ -1369,7 +1644,7 @@ def agent_route_debug():
     if not _AGENTS_AVAILABLE:
         return jsonify({"error": "Agent system not loaded"}), 503
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     command = _normalize_user_command(str(data.get("command", "")).strip())
     if not command:
         return jsonify({"error": "Missing or empty 'command'"}), 400
@@ -1384,13 +1659,74 @@ def agent_route_debug():
 
 # ── Entry point ──────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def _flush_learning() -> None:
+    """Persist batched learning data (profile, people graph) on shutdown."""
+    try:
+        from core.learning import flush
+        flush()
+    except Exception:
+        pass
+
+
+def _warm_up() -> None:
+    """Load the embedding model and ChromaDB collections in the background
+    so the FIRST spoken command doesn't pay ~1 s of cold-start cost."""
+    t0 = time.time()
+    try:
+        from core.embeddings import warm_up
+        warm_up()
+        from core.memory import retrieve_memories
+        retrieve_memories("warm up", top_k=1)
+        from core.learning import get_context_for_http
+        get_context_for_http("warm up")
+        from core.knowledge import get_knowledge_context
+        get_knowledge_context("warm up")
+        print(f"[✓] Memory/embedding warm-up done in {time.time() - t0:.1f} s")
+    except Exception as e:
+        print(f"[!] Warm-up failed (non-fatal): {e}")
+
+    # Load the LLM now (Ollama) unless the laptop is short on free RAM.
+    try:
+        from core.config import LLM
+        from core.llm import catalog, governor, hardware
+        if LLM.configured:
+            cm = catalog.find(LLM.model)
+            free = hardware.profile().ram_available_gb
+            print(f"[*] LLM preload: {governor.preload(LLM, free, cm.ram_gb if cm else None)}")
+    except Exception as e:
+        print(f"[!] LLM preload failed (non-fatal): {e}")
+
+
+def _on_sigterm(signum, frame):
+    # Default SIGTERM kills Python without running atexit handlers, which
+    # would drop batched profile writes and leak MCP subprocesses.
+    raise SystemExit(0)
+
+
+def run_server() -> None:
+    """Start the tool server.  Used by both `python main.py` and
+    `python server/tool_server.py` so they behave identically."""
     if _should_boot_mcp():
         # Boot MCP servers before Flask starts accepting requests
         _boot_mcp()
         atexit.register(_shutdown_mcp)
     else:
         print("[*] MCP boot disabled via DEMASCAS_SKIP_MCP_BOOT=1; native tools only.")
+
+    from core.config import LLM
+    if LLM.configured:
+        print(f"[✓] LLM: {LLM.model} via {LLM.runtime} ({LLM.chat_url}) [{LLM.source}]")
+    else:
+        print("[!] No language model is set up yet — DEMASCAS will only run shortcuts\n"
+              "    and non-LLM actions.  Plug one in with:  python main.py setup")
+
+    atexit.register(_flush_learning)
+    atexit.register(lambda: _LEARN_EXECUTOR.shutdown(wait=True))
+    threading.Thread(target=_warm_up, name="warm-up", daemon=True).start()
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:
+        pass  # not in main thread (e.g. imported by a test runner)
 
     mcp_count = len(_mcp.get_mcp_tool_names()) if _mcp else 0
     total = len(TOOL_MAP) + mcp_count
@@ -1409,11 +1745,17 @@ if __name__ == "__main__":
     print(f"      GET  http://{_server_host()}:{_server_port()}/mcp/status")
     print(f"      GET  http://{_server_host()}:{_server_port()}/context?query=...")
     print(f"      POST http://{_server_host()}:{_server_port()}/learn")
+    print(f"      POST http://{_server_host()}:{_server_port()}/agent")
+    print(f"      POST http://{_server_host()}:{_server_port()}/confirm")
     print()
 
-    # Disable Flask's default banner and request logging for clean output
-    import logging
-    log = logging.getLogger("werkzeug")
-    log.setLevel(logging.WARNING)
+    # Disable Flask's default request logging for clean output
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
-    app.run(host=_server_host(), port=_server_port(), debug=False, use_reloader=False)
+    # threaded=True: agents call back into /tool while /agent is running.
+    app.run(host=_server_host(), port=_server_port(), debug=False,
+            use_reloader=False, threaded=True)
+
+
+if __name__ == "__main__":
+    run_server()

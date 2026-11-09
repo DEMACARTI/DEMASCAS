@@ -13,8 +13,8 @@ from .base_agent import (
     AgentResult,
     StepRecord,
     LLM_TIMEOUT,
-    MLX_TEXT_MODEL,
-    MLX_TEXT_URL,
+    LLM_MODEL,
+    LLM_CHAT_URL,
 )
 
 
@@ -289,7 +289,7 @@ class ResearchAgent(AgentBase):
             "Return only the questions, one per line, no numbering."
         )
         payload = {
-            "model": MLX_TEXT_MODEL,
+            "model": LLM_MODEL,
             "stream": False,
             "temperature": 0.2,
             "max_tokens": 180,
@@ -299,7 +299,7 @@ class ResearchAgent(AgentBase):
             ],
         }
         try:
-            resp = requests.post(MLX_TEXT_URL, json=payload, timeout=LLM_TIMEOUT)
+            resp = requests.post(LLM_CHAT_URL, json=payload, timeout=LLM_TIMEOUT)
             if resp.status_code != 200:
                 return fallback
             body = resp.json()

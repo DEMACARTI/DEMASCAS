@@ -577,7 +577,7 @@ def web_smart_click(element_description: str) -> dict:
     # 4) Try partial text match via DOM search
     js = f'''
     (function() {{
-        var target = '{element_description.replace(chr(39), chr(92)+chr(39))}'.toLowerCase();
+        var target = {json.dumps(str(element_description))}.toLowerCase();
         var all = document.querySelectorAll('*');
         for (var i = 0; i < all.length; i++) {{
             var el = all[i];

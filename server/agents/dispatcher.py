@@ -110,6 +110,9 @@ _PRIORITY = [
 ]
 
 _FORCE_PATTERNS = [
+    # Local document summaries must reach the File agent (it has the PDF
+    # tools) — checked before the generic "summarize" → research rule.
+    ("file", r"\b(summari[sz]e|read)\b.{0,40}\b(pdfs?|documents?|docx|files?|pptx|presentation|slides)\b"),
     # New domains
     ("app_learner", r"\b(learn how to use|learn the app|explore the app)\b"),
     ("workflow", r"\b(record a workflow|run the workflow|replay workflow)\b"),
@@ -126,8 +129,10 @@ _FORCE_PATTERNS = [
     ("workflow", r"\b(study routine|open my study routine|start study routine)\b"),
     ("app_builder", r"\b(build a script|create a script|write a script|build an app|create a tool|build me a|build me an|create me a|create me an)\b"),
     # Comms
-    ("comms", r"\b(compose|draft|write)\b.{0,25}\b(email|mail)\b"),
-    ("comms", r"\b(new|create)\b.{0,25}\b(email|mail)\b"),
+    # All email composing goes to the Comms agent (subject/body drafting,
+    # people-graph lookup) — including "Gmail draft" phrasing.
+    ("comms", r"\b(compose|draft|write|send)\b.{0,25}\b(e?mails?|gmail)\b"),
+    ("comms", r"\b(new|create)\b.{0,25}\b(e?mail|gmail)\b"),
     ("comms", r"\b(email|mail)\b.{0,20}\bto\b"),
     ("comms", r"\b(reply to|respond to|smart reply)\b"),
 

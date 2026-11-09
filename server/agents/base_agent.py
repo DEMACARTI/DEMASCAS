@@ -27,14 +27,17 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.INFO)
 
-MLX_TEXT_URL = "http://127.0.0.1:8081/v1/chat/completions"
-MLX_TEXT_MODEL = "mlx-community/Phi-4-mini-instruct-4bit"
-TOOL_SERVER = "http://127.0.0.1:5001"
+from core.config import LLM_CONFIGURED, LLM_MODEL, LLM_CHAT_URL, TOOL_SERVER_URL as TOOL_SERVER
 
 MAX_STEPS = 20
 MAX_ERRORS = 4
 LLM_TIMEOUT = 30
 TOOL_TIMEOUT = 30
+# Wall-clock budget for one agent run.  The C++ daemon waits up to
+# AGENT_TIMEOUT_SEC (config.hpp, 100 s) for /agent; the agent must stop
+# BEFORE that, otherwise it keeps clicking/typing after the daemon has
+# already told the user it failed and moved on.
+AGENT_TIME_BUDGET = 80
 TOOL_PREDICT = 256
 LLM_TEMPERATURE = 0.1
 HISTORY_WINDOW = 6
@@ -120,6 +123,16 @@ class AgentBase(ABC):
         self._active_context = context if isinstance(context, dict) else {}
         tool_calls_made: list[str] = []
 
+        if not LLM_CONFIGURED:
+            return AgentResult(
+                success=False,
+                summary="I need a language model for that, and none is set up yet. "
+                        "Run python main.py setup to plug one in.",
+                steps_taken=0,
+                tool_calls=[],
+                error="llm_not_configured",
+            )
+
         self._tool_schemas = self._fetch_tool_schemas()
         if not self._tool_schemas:
             return AgentResult(
@@ -134,6 +147,8 @@ class AgentBase(ABC):
 
         for step_num in range(1, MAX_STEPS + 1):
             self._step_count = step_num
+            if self._time_left() <= 5:
+                return self._abort("Ran out of time before finishing.")
             history_block = self._build_history_block()
             context_block = self._build_context_block()
 
@@ -196,6 +211,21 @@ class AgentBase(ABC):
             print(f"[STEP] {self.domain_name} #{step_num} {tool_name}({json.dumps(tool_args)[:120]})")
             logger.info("[🤖 STEP %d] %s(%s)", step_num, tool_name, json.dumps(tool_args)[:80])
             result = self._call_tool(tool_name, tool_args)
+
+            # A destructive tool asked for the user's spoken approval.  Stop
+            # here: the daemon asks yes/no and the server runs the action only
+            # if approved.  (Continuing could make the model claim it's done.)
+            pending = self._pending_confirmation(result)
+            if pending is not None:
+                tool_calls_made.append(tool_name)
+                return AgentResult(
+                    success=True,
+                    summary=pending.get("confirm_speech", "Should I go ahead?"),
+                    steps_taken=step_num,
+                    tool_calls=tool_calls_made,
+                    data={"awaiting_confirmation": pending.get("pending_tool", tool_name)},
+                )
+
             is_error = self._is_tool_error(result)
             status = "✅" if not is_error else "❌"
             print(f"[RESULT] {self.domain_name} #{step_num} {tool_name} {status} {result[:180].replace(chr(10), ' ')}")
@@ -223,7 +253,7 @@ class AgentBase(ABC):
         Build prompt and request one JSON action from the shared MLX endpoint.
         """
         now_ist = datetime.now(IST)
-        now_str = now_ist.strftime("%Y-%m-%d %H:%M:%S %Z")
+        now_str = now_ist.strftime("%Y-%m-%d %H:%M %Z")
         tools_block = self._format_tool_schemas()
 
         rules = [
@@ -245,17 +275,22 @@ class AgentBase(ABC):
         if extra:
             rules_block = f"{rules_block}\n{extra}"
 
+        # Order matters for speed: the MLX server reuses its KV cache for the
+        # longest shared prompt PREFIX.  Stable text (role, tools, rules) goes
+        # first; things that change every step (history, context, clock) go
+        # last.  The clock used to sit near the top WITH SECONDS, so every
+        # step re-processed the entire prompt.
         system_prompt = (
             f"{self.system_prompt}\n\n"
-            f"Current IST time: {now_str}\n\n"
             f"Available tools (scoped):\n{tools_block}\n\n"
             f"Execution rules:\n{rules_block}\n\n"
+            f"Recent steps (last 6):\n{history_block}\n\n"
             f"Active context:\n{context_block}\n\n"
-            f"Recent steps (last 6):\n{history_block}"
+            f"Current IST time: {now_str}"
         )
 
         payload = {
-            "model": MLX_TEXT_MODEL,
+            "model": LLM_MODEL,
             "stream": False,
             "temperature": LLM_TEMPERATURE,
             "max_tokens": TOOL_PREDICT,
@@ -266,7 +301,8 @@ class AgentBase(ABC):
         }
 
         try:
-            resp = requests.post(MLX_TEXT_URL, json=payload, timeout=LLM_TIMEOUT)
+            resp = requests.post(LLM_CHAT_URL, json=payload,
+                                 timeout=max(3.0, min(LLM_TIMEOUT, self._time_left())))
             if resp.status_code != 200:
                 logger.warning("Agent LLM call failed: %s %s", resp.status_code, resp.text[:200])
                 return None
@@ -339,7 +375,8 @@ class AgentBase(ABC):
         """POST {name, arguments: args} to TOOL_SERVER/tool. Return result string."""
         try:
             payload = {"name": name, "arguments": args}
-            resp = requests.post(f"{TOOL_SERVER}/tool", json=payload, timeout=TOOL_TIMEOUT)
+            resp = requests.post(f"{TOOL_SERVER}/tool", json=payload,
+                                 timeout=max(3.0, min(TOOL_TIMEOUT, self._time_left())))
             if resp.status_code != 200:
                 return f"error: tool server HTTP {resp.status_code}"
             body = resp.json()
@@ -355,14 +392,22 @@ class AgentBase(ABC):
         """Backward-compatible alias used by some domain agents."""
         return self._call_tool(name, args)
 
+    def _time_left(self) -> float:
+        """Seconds remaining in this run's wall-clock budget."""
+        if not self._start_time:
+            return float(AGENT_TIME_BUDGET)
+        return AGENT_TIME_BUDGET - (time.time() - self._start_time)
+
     def _fetch_tool_schemas(self) -> Optional[list]:
         """
-        POST {query: self.domain_name, max_tools: len(self.tool_names)+4}.
-        Keep only whitelisted tool names.
+        GET /tools and keep only this agent's whitelisted tools, so the LLM
+        sees each tool's real description and parameter names.
+        (Previously this asked the keyword router about the domain name
+        — e.g. "comms" — which matched nothing and fell back to arg-less
+        stubs, so the model had to guess argument names.)
         """
         try:
-            payload = {"query": self.domain_name, "max_tools": len(self.tool_names) + 4}
-            resp = requests.post(f"{TOOL_SERVER}/tools_for_query", json=payload, timeout=TOOL_TIMEOUT)
+            resp = requests.get(f"{TOOL_SERVER}/tools", timeout=TOOL_TIMEOUT)
             if resp.status_code != 200:
                 return None
             schemas = resp.json()
@@ -407,14 +452,16 @@ class AgentBase(ABC):
 
             pparts: list[str] = []
             if isinstance(props, dict):
-                for p_name in required:
+                # Required params first, then optional ones (marked "?") —
+                # tools like gmail_compose_draft have only optional params.
+                ordered = list(required) + [n for n in props if n not in required]
+                for p_name in ordered:
                     p_meta = props.get(p_name, {})
-                    p_type = "any"
-                    if isinstance(p_meta, dict):
-                        p_type = p_meta.get("type", "any")
-                    pparts.append(f"{p_name}: {p_type}")
+                    p_type = p_meta.get("type", "any") if isinstance(p_meta, dict) else "any"
+                    opt = "" if p_name in required else "?"
+                    pparts.append(f"{p_name}{opt}: {p_type}")
 
-            ptext = ", ".join(pparts) if pparts else "no required args"
+            ptext = ", ".join(pparts) if pparts else "no args"
             lines.append(f"- {name}({ptext}) - {desc.splitlines()[0][:80]}".strip())
 
         return "\n".join(lines)
@@ -481,10 +528,40 @@ class AgentBase(ABC):
         return self._is_duplicate(tool, args)
 
     def _is_tool_error(self, result: str) -> bool:
-        """True if result starts with common failure markers."""
+        """True if a tool result represents a failure.
+
+        Handles plain strings ("[-] ...", "Failed: ...") and JSON results
+        like {"success": false, ...} returned by browser/file tools."""
         if not result:
             return True
-        return result.lower().startswith(ERROR_PREFIXES)
+        text = str(result).lstrip()
+        if text.lower().startswith(ERROR_PREFIXES):
+            return True
+        if text.startswith("{"):
+            try:
+                obj = json.loads(text)
+            except Exception:
+                return False
+            if isinstance(obj, dict):
+                if obj.get("success") is False or obj.get("error"):
+                    return True
+                msg = obj.get("message")
+                if isinstance(msg, str) and msg.lstrip().lower().startswith(ERROR_PREFIXES):
+                    return True
+        return False
+
+    @staticmethod
+    def _pending_confirmation(result: str) -> Optional[dict]:
+        """Return the pending-confirmation payload if `result` is one."""
+        if not result or "pending_confirmation" not in result:
+            return None
+        try:
+            obj = json.loads(result)
+        except Exception:
+            return None
+        if isinstance(obj, dict) and obj.get("status") == "pending_confirmation":
+            return obj
+        return None
 
     def _is_error(self, result: str) -> bool:
         """Backward-compatible alias used by some domain agents."""
@@ -518,18 +595,8 @@ class AgentBase(ABC):
         strategy = recoveries.get(most_failed)
 
         if not strategy:
-            if "get_active_window_tree" in self.tool_names:
-                r = self._run_tool("get_active_window_tree", {})
-                if not self._is_error(r):
-                    self._run_tool(
-                        "save_memory",
-                        {
-                            "text": (
-                                f"Recovery diagnostic: {self.domain_name} failed on '{goal[:50]}'. "
-                                f"Most failed tool: {most_failed}. Screen state: {r[:200]}"
-                            )
-                        },
-                    )
+            # (Previously a raw screen dump was written into the user's
+            # long-term memory here, which then polluted later prompts.)
             return None
 
         alt_tool, alt_args = strategy
@@ -566,10 +633,19 @@ class AgentBase(ABC):
         Base class provides cross-domain fallbacks.
         """
         return {
-            "click_ui_element": ("find_and_click", {"text": self._goal[:30]}),
+            "click_ui_element": ("find_and_click", {"search_text": self._failed_click_target()}),
             "browser_navigate_and_wait": ("open_url", {"url": self._last_nav_url()}),
             "browser_navigate": ("open_url", {"url": self._last_nav_url()}),
         }
+
+    def _failed_click_target(self) -> str:
+        """Element name from the most recent failed click, else the goal."""
+        for s in reversed(self._steps):
+            if s.tool == "click_ui_element" and not s.ok:
+                name = s.args.get("element_name") or s.args.get("element")
+                if name:
+                    return str(name)
+        return self._goal[:30]
 
     def _last_nav_url(self) -> str:
         """Extract URL from the last navigation attempt."""

@@ -31,20 +31,30 @@ public:
     /// Release VRAM / model weights.
     void shutdown();
 
-    /// Fast transcription (tiny model, ~50 ms on M1).
+    /// Wake-word transcription (tiny model, full window; ~130 ms on M1).
     std::string transcribe_wake(const std::vector<float>& pcm);
 
-    /// Accurate transcription (base model, ~200 ms on M1).
+    /// Command transcription (base model, clip-sized window; ~90 ms on M1).
     std::string transcribe_command(const std::vector<float>& pcm);
+
+    /// Run both models once on silence so Metal pipelines/graphs are built
+    /// at startup instead of during the user's first command.
+    void warm_up();
 
     /// Set initial prompt context for better recognition.
     void set_prompt(const std::string& prompt);
 
+    /// CPU threads for decoding (hardware-aware, from GET /llm).
+    void set_threads(int n) { n_threads_ = n > 0 ? n : 4; }
+
 private:
-    std::string run(struct whisper_context* ctx,
-                    const std::vector<float>& pcm);
+    std::string run(struct whisper_context* ctx, const std::vector<float>& pcm,
+                    bool adaptive_ctx);
+    std::string run_once(struct whisper_context* ctx, const std::vector<float>& pcm,
+                         int audio_ctx);
 
     std::string prompt_;
+    int n_threads_ = 4;
 
     struct whisper_context* tiny_ = nullptr;
     struct whisper_context* base_ = nullptr;

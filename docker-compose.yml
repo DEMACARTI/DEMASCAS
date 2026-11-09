@@ -4,11 +4,21 @@ services:
       context: .
     image: demascas-tool-server:latest
     ports:
-      - "5001:5001"
+      # Bind to the host's loopback only — the tool server has no
+      # authentication and must never be reachable from the network.
+      - "127.0.0.1:5001:5001"
     environment:
-      DEMASCAS_HOST: 0.0.0.0
+      DEMASCAS_HOST: 0.0.0.0          # inside the container; exposure is limited by the port mapping above
       DEMASCAS_PORT: 5001
       DEMASCAS_SKIP_MCP_BOOT: "1"
+      # Your LLM runtime runs on the host (DEMASCAS ships without a model).
+      # Set DEMASCAS_LLM_MODEL in your shell first, e.g.:
+      #   DEMASCAS_LLM_MODEL=qwen2.5:3b docker compose up --build tool-server
+      DEMASCAS_LLM_URL: ${DEMASCAS_LLM_URL:-http://host.docker.internal:11434}
+      DEMASCAS_LLM_MODEL: ${DEMASCAS_LLM_MODEL:-}
+      DEMASCAS_LLM_RUNTIME: ${DEMASCAS_LLM_RUNTIME:-ollama}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - demascas-home:/home/demascas/.demascas
     restart: unless-stopped

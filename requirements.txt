@@ -2,19 +2,19 @@
 # Install with: pip install -r requirements.txt
 #
 # The C++ daemon handles audio capture (PortAudio), STT (whisper.cpp),
-# streaming LLM (libcurl), and TTS (macOS say) natively.
+# streaming LLM (libcurl → MLX), and TTS (Kokoro / macOS say) natively.
 # Python only runs the tool server that the daemon calls over HTTP.
+#
+# DEMASCAS ships WITHOUT a language model.  Plug in any local runtime
+# (Ollama, LM Studio, llama.cpp, MLX, Jan) with:  python main.py setup
 
-# Ollama client — used by tool server for learning context queries
-ollama
-
-# PDF summarization
+# PDF summarization (text extraction; summary uses the MLX text server)
 PyPDF2
 
 # File-system watcher (optional)
 watchdog
 
-# HTTP client (tool server internals)
+# HTTP client (tool server internals, agents, LLM calls)
 requests
 
 # Environment variables
@@ -30,8 +30,19 @@ chromadb
 # Tool micro-service for C++ daemon (Polyglot Architecture)
 flask
 
-# Audio buffer manipulation (used by sensors/vision numpy operations)
+# Array maths (sensors/vision)
 numpy
+
+# Hardware profiling for sizing the plug-in LLM (CPU/RAM/battery on macOS,
+# Windows, Linux).  Optional — OS-native fallbacks are used without it.
+psutil
+
+# Coordinate clicks / typing / scrolling for the VLM vision fallback (macOS only)
+pyautogui; sys_platform == "darwin"
+
+# Optional legacy backend: if installed, PDF summaries fall back to Ollama
+# when the MLX server is unreachable.
+# ollama
 
 # MCP (Model Context Protocol) — OPTIONAL
 # DEMASCAS includes a built-in pure-Python MCP client (zero deps).

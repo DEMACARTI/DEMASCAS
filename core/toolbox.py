@@ -396,10 +396,7 @@ TOOLS = [
             "description": (
                 "Creates a new file at the given path with optional text content. "
                 "Parent directories are created automatically. "
-                "IMPORTANT: You MUST ask the user for verbal confirmation BEFORE calling this tool. "
-                "Say something like 'I will create a file called X at Y. Should I proceed?' "
-                "and ONLY call this tool AFTER the user confirms. "
-                "If the file already exists, the tool will refuse and you should inform the user."
+                "It never overwrites: if the file already exists it refuses — tell the user."
             ),
             "parameters": {
                 "type": "object",
@@ -422,12 +419,10 @@ TOOLS = [
         "function": {
             "name": "delete_file",
             "description": (
-                "Deletes a file by moving it to the macOS Trash (recoverable). "
-                "IMPORTANT: You MUST ask the user for verbal confirmation BEFORE calling this tool. "
-                "Say something like 'I will delete the file X. Are you sure?' "
-                "and ONLY call this tool AFTER the user confirms with 'yes', 'go ahead', 'do it', etc. "
-                "NEVER delete without explicit user approval. "
-                "Will refuse to delete non-empty directories for safety."
+                "Moves a file to the macOS Trash (recoverable). Call it directly when the user "
+                "asks to delete a file: the system ALWAYS asks the user to confirm by voice "
+                "before anything is deleted, so do not ask yourself and do not call it twice. "
+                "Refuses non-empty directories."
             ),
             "parameters": {
                 "type": "object",
@@ -1840,12 +1835,13 @@ TOOLS = [
         "function": {
             "name": "run_shell_command",
             "description": (
-                "Executes a strictly allowlisted read-only shell command on macOS. "
+                "Executes a strictly allowlisted read-only command on macOS (no shell). "
                 "Use this to answer questions about system processes, disk space, "
-                "uptime, network, etc. Safe commands include: ps, top, df, uptime, "
-                "whoami, sw_vers, system_profiler, networksetup, pmset, sysctl, "
-                "launchctl list, ifconfig, which, cat, head, tail, wc, sort, grep, "
-                "find, ls, echo, date, cal. Commands not on the allowlist are rejected."
+                "uptime, network, etc. Allowed: ps, top -l 1, df, uptime, whoami, sw_vers, "
+                "system_profiler, networksetup -get…, pmset -g, sysctl (read), launchctl list, "
+                "ifconfig, which, cat, head, tail, wc, sort, grep, find, ls, echo, date, cal. "
+                "Simple pipes like 'ps aux | grep python' work; no other shell syntax "
+                "($, ;, &, >, quotes-escaping, globs) is supported."
             ),
             "parameters": {
                 "type": "object",
@@ -1994,4 +1990,96 @@ TOOLS = [
             },
         },
     },
+    # ── Tools that existed in TOOL_MAP but had no schema (LLM couldn't call them) ──
+    {   'type': 'function',
+        'function': {   'name': 'browser_check_checkbox',
+                        'description': 'Check or uncheck a checkbox in Brave Browser by CSS selector.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'selector': {   'type': 'string',
+                                                                            'description': 'CSS '
+                                                                                           'selector '
+                                                                                           'of the '
+                                                                                           'checkbox '
+                                                                                           '(e.g. '
+                                                                                           "'#agree')."},
+                                                            'check': {   'type': 'boolean',
+                                                                         'description': 'true to '
+                                                                                        'check, false '
+                                                                                        'to uncheck '
+                                                                                        '(default '
+                                                                                        'true).'}},
+                                          'required': ['selector']}}},
+    {   'type': 'function',
+        'function': {   'name': 'browser_click_xpath',
+                        'description': 'Click an element in Brave Browser by XPath (use when CSS '
+                                       'selectors and text matching fail).',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'xpath': {   'type': 'string',
+                                                                         'description': 'XPath '
+                                                                                        'expression, '
+                                                                                        'e.g. '
+                                                                                        "//button[text()='Next']."}},
+                                          'required': ['xpath']}}},
+    {   'type': 'function',
+        'function': {   'name': 'browser_element_exists',
+                        'description': 'Check whether an element matching a CSS selector exists on the '
+                                       'current Brave page.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'selector': {   'type': 'string',
+                                                                            'description': 'CSS '
+                                                                                           'selector '
+                                                                                           'to look '
+                                                                                           'for.'}},
+                                          'required': ['selector']}}},
+    {   'type': 'function',
+        'function': {   'name': 'browser_get_page_html',
+                        'description': 'Get the raw HTML of the current Brave page (truncated). Prefer '
+                                       'browser_get_dom_summary or browser_get_page_text.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'max_chars': {   'type': 'integer',
+                                                                             'description': 'Maximum '
+                                                                                            'characters '
+                                                                                            'to return '
+                                                                                            '(default '
+                                                                                            '10000).'}},
+                                          'required': []}}},
+    {   'type': 'function',
+        'function': {   'name': 'browser_scroll_to_element',
+                        'description': 'Scroll the current Brave page until the element matching a CSS '
+                                       'selector is visible.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'selector': {   'type': 'string',
+                                                                            'description': 'CSS '
+                                                                                           'selector '
+                                                                                           'of the '
+                                                                                           'element.'}},
+                                          'required': ['selector']}}},
+    {   'type': 'function',
+        'function': {   'name': 'browser_submit_form',
+                        'description': 'Submit a form on the current Brave page.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'selector': {   'type': 'string',
+                                                                            'description': 'CSS '
+                                                                                           'selector '
+                                                                                           'of the '
+                                                                                           'form '
+                                                                                           '(default '
+                                                                                           "'form')."}},
+                                          'required': []}}},
+    {   'type': 'function',
+        'function': {   'name': 'browser_wait_for_page_load',
+                        'description': 'Wait until the current Brave page has finished loading.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'timeout': {   'type': 'number',
+                                                                           'description': 'Maximum '
+                                                                                          'seconds to '
+                                                                                          'wait '
+                                                                                          '(default '
+                                                                                          '10).'}},
+                                          'required': []}}},
+    {   'type': 'function',
+        'function': {   'name': 'web_youtube_play_first',
+                        'description': 'Play the first video in the current YouTube search results '
+                                       '(use after web_youtube_search).',
+                        'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
 ]

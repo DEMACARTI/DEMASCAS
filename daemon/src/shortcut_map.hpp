@@ -24,6 +24,28 @@
 
 namespace demascas {
 
+/// Whole-word / whole-phrase containment: "rain" does NOT match "brain",
+/// "use" does NOT match "because".  Leading/trailing spaces in `phrase`
+/// are ignored.  Both strings are expected to be lowercase.
+inline bool contains_phrase(const std::string& text, const std::string& phrase_in) {
+    auto a = phrase_in.find_first_not_of(' ');
+    auto b = phrase_in.find_last_not_of(' ');
+    if (a == std::string::npos) return false;
+    const std::string phrase = phrase_in.substr(a, b - a + 1);
+    auto is_word = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '\'';
+    };
+    size_t pos = 0;
+    while ((pos = text.find(phrase, pos)) != std::string::npos) {
+        bool left_ok  = pos == 0 || !is_word(text[pos - 1]) || !is_word(phrase.front());
+        size_t end = pos + phrase.size();
+        bool right_ok = end >= text.size() || !is_word(text[end]) || !is_word(phrase.back());
+        if (left_ok && right_ok) return true;
+        ++pos;
+    }
+    return false;
+}
+
 class ShortcutMap {
 public:
     ShortcutMap() {
@@ -83,7 +105,7 @@ public:
         s_["search"]             = "command+space";
         s_["screenshot"]         = "command+shift+3";
         s_["screenshot region"]  = "command+shift+4";
-        s_["screenshot window"]  = "command+shift+4+space";
+        s_["screenshot window"]  = "command+shift+4, space";  // two-step sequence
         s_["screen recording"]   = "command+shift+5";
         s_["lock screen"]        = "command+control+q";
         s_["log out"]            = "command+shift+q";
@@ -204,24 +226,40 @@ public:
      * (e.g. "summarize PDF", "open Safari", "scroll down").
      */
     std::optional<std::string> match(const std::string& text) const {
-        std::string t = lower(trim(text));
+        std::string raw = lower(trim(text));
+        if (raw.empty()) return std::nullopt;
+
+        // ── Questions are answered, never executed ──────────────
+        // "how do I lock my screen?" must not lock the screen.
+        if (raw.back() == '?') return std::nullopt;
+        std::string t = normalize_words(raw);
+        auto tokens = split_vec(t);
+        if (tokens.empty()) return std::nullopt;
+        static const std::set<std::string> QUESTION_STARTS = {
+            "how", "what", "what's", "whats", "why", "when", "where", "which",
+            "who", "is", "are", "does", "should", "could", "would", "will",
+            "explain", "tell", "describe",
+        };
+        if (QUESTION_STARTS.count(tokens.front())) return std::nullopt;
 
         // ── Phrases that MUST go to the LLM tool path ──────────
         static const std::vector<std::string> tool_only = {
             "summarize", "summarise", "read pdf", "list files", "what files",
-            "what's in", "show files", "files in", "open ", "launch ",
-            "start ", "click ", "type ", "activate ", "switch to ",
+            "what's in", "show files", "files in", "open", "launch",
+            "start", "click", "type", "activate", "switch to",
             "which app", "what app", "running app", "what is open",
             "downloads folder", "documents folder", "desktop folder",
             "search the web", "search online", "look up", "google",
             "browse", "read webpage", "read website", "fetch url",
             "remember", "save memory", "recall", "do you remember",
-            "scroll ", "drag ",
+            "scroll", "drag",
             "list windows", "what windows", "show windows", "all windows",
             "[file]",
         };
-        for (const auto& p : tool_only)
-            if (t.find(p) != std::string::npos) return std::nullopt;
+        for (const auto& p : tool_only) {
+            if (p == "open" && starts_with(t, "reopen")) continue;  // "reopen tab" is a shortcut
+            if (contains_phrase(raw, p)) return std::nullopt;
+        }
 
         // ── "close X" / "quit X" where X is an app name ────────
         static const std::vector<std::string> quit_w = {
@@ -233,46 +271,49 @@ public:
                 if (!after.empty()) {
                     auto first = after.substr(0, after.find(' '));
                     if (first != "window" && first != "tab" &&
-                        first != "this" && first != "the" && first != "all")
+                        first != "this" && first != "the" && first != "all" &&
+                        first != "app" && first != "application")
                         return std::nullopt;  // "close Safari" → tool
                 }
             }
         }
-        if (t.find("close it") != std::string::npos ||
-            t.find("quit it")  != std::string::npos ||
-            t.find("exit it")  != std::string::npos)
+        if (contains_phrase(t, "close it") || contains_phrase(t, "quit it") ||
+            contains_phrase(t, "exit it"))
             return std::nullopt;
 
         // ── Direct exact lookup ─────────────────────────────────
         auto it = s_.find(t);
         if (it != s_.end()) return it->second;
 
-        // ── Fuzzy match: prefer longer (more specific) phrases ──
-        auto words_set = split_set(t);
-        int input_word_count = static_cast<int>(words_set.size());
+        // ── Phrase match: the utterance must consist ONLY of the
+        //    shortcut's words plus filler words.  Substring matching used
+        //    to turn "check the logs about the outage" into ⌘⇧Q (log out)
+        //    and "how much disk space is left" into ⌃← (switch space).
+        static const std::set<std::string> FILLER = {
+            "please", "can", "could", "would", "will", "you", "the", "a", "an",
+            "this", "that", "it", "my", "me", "now", "current", "just",
+            "quickly", "go", "ahead", "and", "hey", "demascas", "damascus",
+            "take", "do", "window", "app", "for", "right", "okay", "ok",
+            "alright", "then", "thanks", "thank", "kindly", "hit", "press",
+            "file", "page", "document", "make", "turn", "to", "again",
+        };
+        std::set<std::string> token_set(tokens.begin(), tokens.end());
         std::optional<std::string> best;
         size_t best_len = 0;
-
         for (const auto& [phrase, keys] : s_) {
             auto pwords = split_vec(phrase);
-            if (pwords.size() == 1) {
-                // Single-word shortcut: only match in short inputs (≤ 3 words)
-                // to prevent false positives like "back" matching in
-                // "greet him back as if he was greeting you"
-                if (input_word_count <= 3 &&
-                    words_set.count(pwords[0]) && 1 > best_len) {
-                    best     = keys;
-                    best_len = 1;
-                }
-            } else {
-                // Multi-word: all words must appear
-                bool all = true;
-                for (const auto& w : pwords)
-                    if (t.find(w) == std::string::npos) { all = false; break; }
-                if (all && pwords.size() > best_len) {
-                    best     = keys;
-                    best_len = pwords.size();
-                }
+            std::set<std::string> pset(pwords.begin(), pwords.end());
+            bool all_present = true;
+            for (const auto& w : pwords)
+                if (!token_set.count(w)) { all_present = false; break; }
+            if (!all_present) continue;
+            bool only_filler_left = true;
+            for (const auto& tok : tokens)
+                if (!pset.count(tok) && !FILLER.count(tok)) { only_filler_left = false; break; }
+            if (!only_filler_left) continue;
+            if (pwords.size() > best_len) {
+                best = keys;
+                best_len = pwords.size();
             }
         }
         return best;
@@ -301,7 +342,7 @@ public:
             "what time is it in",
         };
         for (const auto& kw : realtime_triggers)
-            if (t.find(kw) != std::string::npos) return true;
+            if (contains_phrase(t, kw)) return true;
         return false;
     }
 
@@ -345,9 +386,14 @@ public:
             "check your", "logs", "error", "delegate", "iot",
             "remember that", "always use",
             "do it", "set it", "change it", "go ahead", "execute", "remember", "save",
+            // Questions about what's on screen / local data need tools
+            // (the fast path has none and would just make something up).
+            "screen", "on my screen", "this page", "this window", "this tab",
+            "clipboard", "selected", "folder", "my files", "inbox",
+            "my email", "my emails", "my mail", "read my", "unread",
         };
         for (const auto& kw : force_tool)
-            if (t.find(kw) != std::string::npos) return false;
+            if (contains_phrase(t, kw)) return false;
 
         // Explicit tool triggers → NOT simple
         static const std::vector<std::string> triggers = {
@@ -375,7 +421,7 @@ public:
             "[file]",  // transcription normalizer tags file-related queries
         };
         for (const auto& tr : triggers)
-            if (t.find(tr) != std::string::npos) return false;
+            if (contains_phrase(t, tr)) return false;
 
         // Action phrasing can still be prefixed with conversational lead-ins
         // like "so" or "alright". Do not fast-path those.
@@ -388,7 +434,7 @@ public:
         };
         bool has_action = false;
         for (const auto& v : action_verbs) {
-            if (t.find(v) != std::string::npos) {
+            if (contains_phrase(t, v)) {
                 has_action = true;
                 break;
             }
@@ -441,6 +487,22 @@ private:
         auto b = s.find_last_not_of(" \t\n\r");
         if (a == std::string::npos) return "";
         return s.substr(a, b - a + 1);
+    }
+
+    /// Lowercase text → words separated by single spaces; sentence
+    /// punctuation removed (apostrophes and [file] tags kept).
+    static std::string normalize_words(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if (c == '.' || c == ',' || c == '!' || c == '?' || c == ';' ||
+                c == ':' || c == '"' || c == '\t' || c == '\n')
+                c = ' ';
+            if (c == ' ' && (out.empty() || out.back() == ' ')) continue;
+            out += c;
+        }
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+        return out;
     }
 
     static bool starts_with(const std::string& s, const std::string& prefix) {
@@ -542,7 +604,7 @@ inline bool is_agent_command(const std::string& cmd) {
     }
 
     for (const auto& trigger : AGENT_TRIGGERS) {
-        if (lower.find(trigger) != std::string::npos) return true;
+        if (contains_phrase(lower, trigger)) return true;
     }
     return false;
 }

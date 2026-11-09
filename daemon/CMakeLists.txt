@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Must be set BEFORE project() to take effect (native Apple Silicon build).
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Target architecture" FORCE)
+endif()
+
 project(demascas_daemon LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -114,10 +120,6 @@ if(APPLE)
         "-framework CoreAudio"
         "-framework AudioToolbox"
     )
-    # Ensure we build a universal or native ARM binary
-    if(NOT CMAKE_OSX_ARCHITECTURES)
-        set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "" FORCE)
-    endif()
 endif()
 
 # ── Release build flags ──────────────────────────────────────────────

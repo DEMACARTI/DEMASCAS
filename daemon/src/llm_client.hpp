@@ -43,8 +43,17 @@ class LLMClient {
 public:
     LLMClient() = default;
 
-    /// Health-check the MLX text server.
-    void prewarm();
+    /// Use the user's plugged-in LLM (from GET /llm).  Until this is called
+    /// (or if no model is configured) LLM paths reply with setup guidance.
+    void configure(const std::string& chat_url, const std::string& model,
+                   int context_tokens);
+    bool configured() const { return !chat_url_.empty() && !model_.empty(); }
+
+    /// Health-check the LLM runtime, then (in the background) run 1-token
+    /// generations with the tool and fast-path system prompts.  That compiles
+    /// the Metal kernels and seeds the server's prompt cache with the static
+    /// prompt prefix, so the FIRST real command isn't slower than the rest.
+    void prewarm(ToolBridge& bridge);
 
     // ── Streaming ───────────────────────────────────────────────
 
@@ -76,6 +85,27 @@ public:
 
     /// Returns the path taken in the last call ("shortcut", "fast", "tool").
     const std::string& last_path() const { return last_path_; }
+
+    /// False if the last fast/tool call failed (LLM unreachable, tool errors,
+    /// gave up) — used so learning never records failures as successes.
+    bool last_success() const { return last_success_; }
+
+    /// A destructive tool asked for a spoken yes/no during the last tool call.
+    struct PendingConfirmation {
+        std::string token;    // one-time token for POST /confirm
+        std::string speech;   // question to ask the user
+        std::string tool;     // tool that will run if approved
+    };
+    bool has_pending_confirmation() const { return !pending_confirmation_.token.empty(); }
+    PendingConfirmation take_pending_confirmation() {
+        auto p = pending_confirmation_; pending_confirmation_ = {}; return p;
+    }
+
+    /// find_file returned several matches during the last tool call —
+    /// the daemon should ask which one ({name, path}).
+    std::vector<std::pair<std::string, std::string>> take_file_choices() {
+        auto c = std::move(file_choices_); file_choices_.clear(); return c;
+    }
 
     // ── Planner — decompose multi-step commands ─────────────────
 
@@ -140,7 +170,7 @@ private:
     /// POST to MLX /v1/chat/completions with SSE stream=true.
     /// Calls on_sentence for each sentence boundary.
     /// Returns the full generated text.
-    std::string call_mlx_streaming(const nlohmann::json& messages,
+    std::string call_llm_streaming(const nlohmann::json& messages,
                                     SentenceCallback on_sentence,
                                     std::atomic<bool>& cancel,
                                     int max_tokens,
@@ -148,7 +178,7 @@ private:
 
     /// POST to MLX /v1/chat/completions with stream=false.
     /// Used for planner (no streaming needed).
-    std::string call_mlx_blocking(const nlohmann::json& messages,
+    std::string call_llm_blocking(const nlohmann::json& messages,
                                    int max_tokens);
 
     /// Parse the LLM's raw text output into a structured action.
@@ -159,10 +189,21 @@ private:
 
     void trim_history();
 
+    /// Keep [system + history] inside the runtime's context window (Ollama
+    /// defaults to 4096 tokens and silently truncates longer prompts).
+    void fit_history_to_context(const nlohmann::json& sys);
+
+    std::string chat_url_;
+    std::string model_;
+    int         ctx_tokens_ = 4096;
+
     std::vector<nlohmann::json> history_;
     std::vector<std::string>    last_tools_;    // tools used in last interaction
     std::string                 last_path_;     // "shortcut" | "fast" | "tool"
     int                         error_count_ = 0;  // consecutive tool errors in current ReAct loop
+    bool                        last_success_ = true;
+    PendingConfirmation         pending_confirmation_;
+    std::vector<std::pair<std::string, std::string>> file_choices_;
 };
 
 }  // namespace demascas

@@ -39,6 +39,11 @@ def _get_collection():
     try:
         import chromadb
 
+        # Persistent, cached embedder for every collection (memory,
+        # episodes, knowledge) — ~90 ms → a few ms per query.
+        from core.embeddings import install as _install_fast_embeddings
+        _install_fast_embeddings()
+
         os.makedirs(_MEMORY_DIR, exist_ok=True)
         _client = chromadb.PersistentClient(path=_MEMORY_DIR)
         _collection = _client.get_or_create_collection(
@@ -101,10 +106,19 @@ def save_memory(text: str) -> str:
     return f"Remembered: '{text[:60]}...' (total memories: {count})"
 
 
-def retrieve_memories(query: str, top_k: int = 5) -> str:
+# Cosine distance above which a memory is considered unrelated to the query.
+# Measured with all-MiniLM-L6-v2: direct matches ≈ 0.1–0.45, loose
+# paraphrases ≈ 0.7, unrelated ≈ 0.73+.  Explicit recall uses the looser
+# default; the daemon's automatic per-command injection passes a stricter
+# value so unrelated memories never leak into prompts.
+_MAX_DISTANCE = float(os.getenv("DEMASCAS_MEMORY_MAX_DISTANCE", "0.75"))
+
+
+def retrieve_memories(query: str, top_k: int = 5, max_distance: float = _MAX_DISTANCE) -> str:
     """
     Searches DEMASCAS's long-term memory for information relevant to the query.
-    Uses semantic similarity (cosine distance on embeddings).
+    Uses semantic similarity (cosine distance on embeddings); memories that
+    are not actually related to the query are filtered out.
 
     Args:
         query:  The search query (e.g. "What is the user's name?",
@@ -112,8 +126,8 @@ def retrieve_memories(query: str, top_k: int = 5) -> str:
         top_k:  Maximum number of results to return (default 5).
 
     Returns:
-        A formatted string of relevant memories with timestamps, or a message
-        if no memories are found.
+        A formatted string starting with "Relevant memories" when something
+        relevant was found, otherwise a message starting with "No ".
     """
     print(f"[🧠 MEMORY] Retrieving memories for: '{query}'...")
     collection = _get_collection()
@@ -128,16 +142,24 @@ def retrieve_memories(query: str, top_k: int = 5) -> str:
     try:
         results = collection.query(
             query_texts=[query],
-            n_results=min(top_k, collection.count()),
+            n_results=min(int(top_k), collection.count()),
+            include=["documents", "metadatas", "distances"],
         )
 
-        if not results["documents"] or not results["documents"][0]:
+        docs = (results.get("documents") or [[]])[0]
+        metas = (results.get("metadatas") or [[]])[0]
+        dists = (results.get("distances") or [[]])[0] or [0.0] * len(docs)
+
+        relevant = [
+            (doc, meta or {})
+            for doc, meta, dist in zip(docs, metas, dists)
+            if dist is None or dist <= float(max_distance)
+        ]
+        if not relevant:
             return f"No relevant memories found for '{query}'."
 
         lines = [f"Relevant memories for '{query}':\n"]
-        for i, (doc, meta) in enumerate(
-            zip(results["documents"][0], results["metadatas"][0]), 1
-        ):
+        for i, (doc, meta) in enumerate(relevant, 1):
             date = meta.get("date", "unknown date")
             lines.append(f"{i}. [{date}] {doc}")
 

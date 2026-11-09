@@ -30,8 +30,7 @@ from core.screen_context import get_screen_context_block, get_tree_only_context
 
 # ── Configuration ────────────────────────────────────────────────────
 
-_MLX_URL = "http://127.0.0.1:8081/v1/chat/completions"
-_MLX_MODEL = os.getenv("DEMASCAS_MLX_TEXT_MODEL", "mlx-community/Phi-4-mini-instruct-4bit")
+from core.config import LLM_CONFIGURED, LLM_NOT_CONFIGURED_MSG, LLM_MODEL as _MLX_MODEL, LLM_CHAT_URL as _MLX_URL
 _REQUEST_TIMEOUT = 30  # seconds
 
 
@@ -71,6 +70,9 @@ def architect_plan(goal: str) -> str:
         JSON string: {"steps": [...], "tool_hint": "..."} on success,
         or {"error": "..."} on failure.
     """
+    if not LLM_CONFIGURED:
+        return LLM_NOT_CONFIGURED_MSG
+
     screen_ctx = _get_screen_context()
 
     messages = [

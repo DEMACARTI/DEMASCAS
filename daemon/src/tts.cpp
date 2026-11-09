@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>          // memset
 #include <iostream>
+#include <set>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -70,7 +71,7 @@ bool TTS::init_kokoro() {
     tts_cfg.model.kokoro.data_dir  = data_dir.c_str();
     tts_cfg.model.kokoro.length_scale = 1.0f / cfg::KOKORO_SPEED;
 
-    tts_cfg.model.num_threads = 2;       // keep 2 threads — plenty for M1
+    tts_cfg.model.num_threads = threads_;  // hardware-aware (4 on M1: ~30% faster than 2)
     tts_cfg.model.provider    = "cpu";   // GPU stays free for whisper Metal
     tts_cfg.model.debug       = 0;
     tts_cfg.max_num_sentences = 1;       // generate one sentence at a time
@@ -103,11 +104,15 @@ bool TTS::init_kokoro() {
 #endif
 }
 
-bool TTS::open_output_stream(int sample_rate) {
+bool TTS::open_output_stream(int sample_rate, bool test_tone) {
     if (out_stream_) return true;
 
     // TTS manages its own PA reference count
-    Pa_Initialize();
+    if (!pa_held_) {
+        if (Pa_Initialize() != paNoError) return false;
+        pa_held_ = true;
+    }
+    sample_rate_ = sample_rate;
 
     // Find and log the default output device
     PaDeviceIndex out_dev = Pa_GetDefaultOutputDevice();
@@ -158,7 +163,7 @@ bool TTS::open_output_stream(int sample_rate) {
     std::cout << "[✓] TTS PortAudio stream open (" << sample_rate << " Hz, float32, mono)\n";
 
     // Play a short test tone (440 Hz, 0.15s) to verify audio output works
-    {
+    if (test_tone) {
         constexpr int TEST_SAMPLES = 3600;  // 0.15s at 24kHz
         float test_buf[TEST_SAMPLES];
         for (int i = 0; i < TEST_SAMPLES; ++i)
@@ -175,12 +180,20 @@ bool TTS::open_output_stream(int sample_rate) {
 
 // ── Constructor / Destructor ────────────────────────────────────────
 
-TTS::TTS() {
+TTS::TTS(int threads) : threads_(threads > 0 ? threads : cfg::KOKORO_THREADS) {
     // Try Kokoro first (if enabled and model files exist)
     if (cfg::USE_KOKORO && init_kokoro()) {
         backend_ = Backend::KOKORO;
     } else {
         backend_ = Backend::SAY;
+    }
+
+    // Fixed phrases are synthesized once, in the background, then played
+    // instantly (the worker builds them while idle).
+    if (backend_ == Backend::KOKORO) {
+        for (const char* p : cfg::TTS_CACHED_PHRASES)
+            for (auto& piece : split_sentences(p))
+                warm_queue_.push_back(piece);
     }
 
     // Start worker thread
@@ -280,6 +293,10 @@ void TTS::worker_loop() {
             if (stop_) break;
             if (queue_.empty()) {
                 if (playing_) playing_ = false;
+                if (!warm_queue_.empty()) {
+                    lk.unlock();
+                    warm_one_cached_phrase();
+                }
                 continue;
             }
             sentence = std::move(queue_.front());
@@ -287,6 +304,21 @@ void TTS::worker_loop() {
         }
 
         playing_ = true;
+        const uint64_t my_gen = gen_.load();
+
+#ifdef HAS_SHERPA_ONNX
+        // Pre-synthesized fixed phrase → play immediately (no synthesis).
+        if (backend_ == Backend::KOKORO) {
+            auto hit = phrase_pcm_.find(sanitize(sentence));
+            if (hit != phrase_pcm_.end()) {
+                play_samples(hit->second.data(),
+                             static_cast<int32_t>(hit->second.size()), my_gen);
+                std::lock_guard<std::mutex> lk(mu_);
+                if (queue_.empty()) playing_ = false;
+                continue;
+            }
+        }
+#endif
 
         // ── Double-buffer: synthesize THIS sentence's audio while
         //    we peek at the NEXT sentence so we can pre-synthesize it
@@ -313,6 +345,7 @@ void TTS::worker_loop() {
                         std::lock_guard<std::mutex> lk(mu_);
                         if (!queue_.empty()) {
                             next_safe = sanitize(queue_.front());
+                            if (phrase_pcm_.count(next_safe)) next_safe.clear();
                         }
                     }
                     if (!next_safe.empty() && !stop_) {
@@ -324,13 +357,15 @@ void TTS::worker_loop() {
                     }
 
                     // Play current sentence via PortAudio (blocks)
-                    play_pcm(audio);
+                    play_pcm(audio, my_gen);
                     SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
 
                     // If we pre-synthesized the next sentence, play it immediately
                     if (prefetch.joinable()) {
                         prefetch.join();
-                        if (next_audio && next_audio->n > 0 && !stop_) {
+                        // After a barge-in (gen_ changed) the prefetched
+                        // sentence must NOT be played over the user.
+                        if (next_audio && next_audio->n > 0 && !stop_ && gen_.load() == my_gen) {
                             // Pop the sentence we already synthesized
                             {
                                 std::lock_guard<std::mutex> lk(mu_);
@@ -341,20 +376,22 @@ void TTS::worker_loop() {
                                     }
                                 }
                             }
-                            play_pcm(next_audio);
+                            play_pcm(next_audio, my_gen);
                         }
                         if (next_audio)
                             SherpaOnnxDestroyOfflineTtsGeneratedAudio(next_audio);
                     }
                 } else {
                     if (audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
-                    speak_one_say(sentence);  // fallback
+                    if (gen_.load() == my_gen)
+                        speak_one_say(sentence);  // fallback
                 }
             }
         } else
 #endif
         {
-            speak_one(sentence);
+            if (gen_.load() == my_gen)
+                speak_one(sentence);
         }
 
         // Check if queue is now empty
@@ -376,28 +413,96 @@ void TTS::speak_one(const std::string& text) {
 
 // Shared PCM playback — used by both the double-buffer worker loop
 // and the legacy speak_one_kokoro fallback path.
-void TTS::play_pcm(const void* audio_ptr) {
+void TTS::play_pcm(const void* audio_ptr, uint64_t gen) {
 #ifdef HAS_SHERPA_ONNX
     auto* audio = static_cast<const SherpaOnnxGeneratedAudio*>(audio_ptr);
-    if (!audio || audio->n <= 0 || !out_stream_) return;
+    if (!audio || audio->n <= 0) return;
+    play_samples(audio->samples, audio->n, gen);
+#else
+    (void)audio_ptr; (void)gen;
+#endif
+}
 
-    // Ensure stream is active
-    if (!Pa_IsStreamActive(out_stream_))
-        Pa_StartStream(out_stream_);
+void TTS::play_samples(const float* samples, int32_t n, uint64_t gen) {
+    if (!samples || n <= 0) return;
+    if (gen_.load() != gen) return;   // interrupted before we started
 
     constexpr int32_t CHUNK = 2400;  // ~100 ms at 24 kHz
     int32_t offset = 0;
-    while (offset < audio->n && !stop_) {
-        int32_t count = std::min(CHUNK, audio->n - offset);
-        PaError err = Pa_WriteStream(out_stream_, audio->samples + offset,
+    while (offset < n && !stop_ && gen_.load() == gen) {
+        std::lock_guard<std::mutex> lk(pa_mu_);
+        if (!out_stream_) break;
+        // Restart only if this utterance is still current (an interrupt
+        // aborts the stream; a stale sentence must not restart it).
+        if (!Pa_IsStreamActive(out_stream_)) {
+            if (gen_.load() != gen) break;
+            Pa_StartStream(out_stream_);
+        }
+        int32_t count = std::min(CHUNK, n - offset);
+        PaError err = Pa_WriteStream(out_stream_, samples + offset,
                                       static_cast<unsigned long>(count));
         if (err != paNoError && err != paOutputUnderflowed) {
-            std::cerr << "[!] PA write error: " << Pa_GetErrorText(err) << "\n";
+            if (gen_.load() == gen)
+                std::cerr << "[!] PA write error: " << Pa_GetErrorText(err) << "\n";
             break;
         }
         offset += count;
     }
+}
+
+void TTS::warm_one_cached_phrase() {
+#ifdef HAS_SHERPA_ONNX
+    if (warm_queue_.empty() || !tts_handle_ || stop_) return;
+    std::string phrase = warm_queue_.front();
+    warm_queue_.pop_front();
+    std::string key = sanitize(phrase);
+    if (key.empty() || phrase_pcm_.count(key)) return;
+    auto* tts = reinterpret_cast<const SherpaOnnxOfflineTts*>(tts_handle_);
+    const SherpaOnnxGeneratedAudio* audio =
+        SherpaOnnxOfflineTtsGenerate(tts, key.c_str(), cfg::KOKORO_SPEAKER_ID, cfg::KOKORO_SPEED);
+    if (audio && audio->n > 0)
+        phrase_pcm_[key].assign(audio->samples, audio->samples + audio->n);
+    if (audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+    if (warm_queue_.empty())
+        std::cout << "[✓] TTS phrase cache ready (" << phrase_pcm_.size() << " phrases)\n";
 #endif
+}
+
+std::vector<std::string> TTS::split_sentences(const std::string& text) {
+    // Split after . ! ? when followed by whitespace + an uppercase letter /
+    // digit, the piece is long enough, and the word isn't an abbreviation.
+    static const std::set<std::string> ABBREV = {
+        "mr", "mrs", "ms", "dr", "st", "jr", "sr", "vs", "etc", "e.g", "i.e", "no", "prof",
+    };
+    std::vector<std::string> out;
+    std::string cur;
+    const size_t n = text.size();
+    for (size_t i = 0; i < n; ++i) {
+        char c = text[i];
+        cur += c;
+        if ((c == '.' || c == '!' || c == '?') && i + 2 < n &&
+            std::isspace(static_cast<unsigned char>(text[i + 1]))) {
+            size_t k = i + 1;
+            while (k < n && std::isspace(static_cast<unsigned char>(text[k]))) ++k;
+            bool next_starts_sentence = k < n &&
+                (std::isupper(static_cast<unsigned char>(text[k])) ||
+                 std::isdigit(static_cast<unsigned char>(text[k])));
+            // last word before the punctuation
+            size_t w = cur.size() - 1;
+            while (w > 0 && !std::isspace(static_cast<unsigned char>(cur[w - 1]))) --w;
+            std::string word;
+            for (size_t q = w; q + 1 < cur.size(); ++q)
+                word += static_cast<char>(std::tolower(static_cast<unsigned char>(cur[q])));
+            if (next_starts_sentence && cur.size() >= 12 && !ABBREV.count(word)) {
+                out.push_back(cur);
+                cur.clear();
+                i = k - 1;  // skip the whitespace
+            }
+        }
+    }
+    auto a = cur.find_first_not_of(" \t\n");
+    if (a != std::string::npos) out.push_back(cur.substr(a));
+    return out;
 }
 
 void TTS::speak_one_kokoro(const std::string& text) {
@@ -405,61 +510,20 @@ void TTS::speak_one_kokoro(const std::string& text) {
     if (text.empty() || stop_ || !tts_handle_) return;
     std::string safe = sanitize(text);
     if (safe.empty()) return;
-
-    // Ensure output stream is running (may have been aborted by interrupt)
-    if (out_stream_ && !Pa_IsStreamActive(out_stream_)) {
-        Pa_StartStream(out_stream_);
-    }
+    const uint64_t my_gen = gen_.load();
 
     auto* tts = reinterpret_cast<const SherpaOnnxOfflineTts*>(tts_handle_);
-
-    // Generate float32 PCM audio
     const SherpaOnnxGeneratedAudio* audio =
         SherpaOnnxOfflineTtsGenerate(tts, safe.c_str(),
                                      cfg::KOKORO_SPEAKER_ID,
                                      cfg::KOKORO_SPEED);
     if (!audio || audio->n <= 0) {
         if (audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
-        // Fall back to macOS say
         std::cerr << "[!] Kokoro generated 0 samples — falling back to say\n";
-        speak_one_say(text);
+        if (gen_.load() == my_gen) speak_one_say(text);
         return;
     }
-
-    std::cout << "[*] Kokoro generated " << audio->n << " samples ("
-              << (audio->n / (float)audio->sample_rate) << " s)\n";
-
-    // Stream float32 samples to PortAudio in ~100 ms chunks (2400 samples at 24 kHz)
-    constexpr int32_t CHUNK_SAMPLES = 2400;
-    int32_t offset = 0;
-
-    // Ensure output stream is running
-    if (out_stream_ && !Pa_IsStreamActive(out_stream_)) {
-        std::cout << "[*] Restarting PA output stream...\n";
-        Pa_StartStream(out_stream_);
-    }
-
-    while (offset < audio->n) {
-        if (stop_) break;
-
-        int32_t remaining = audio->n - offset;
-        int32_t count = (remaining < CHUNK_SAMPLES) ? remaining : CHUNK_SAMPLES;
-
-        if (out_stream_) {
-            PaError err = Pa_WriteStream(out_stream_, audio->samples + offset,
-                                         static_cast<unsigned long>(count));
-            if (err != paNoError && err != paOutputUnderflowed) {
-                std::cerr << "[!] PA write error: " << Pa_GetErrorText(err) << "\n";
-                break;
-            }
-        } else {
-            std::cerr << "[!] out_stream_ is null during playback!\n";
-            break;
-        }
-
-        offset += count;
-    }
-
+    play_pcm(audio, my_gen);
     SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
 #else
     // Shouldn't reach here, but fallback just in case
@@ -495,9 +559,14 @@ void TTS::speak_one_say(const std::string& text) {
 
 void TTS::enqueue(const std::string& text) {
     if (text.empty()) return;
+    auto pieces = split_sentences(text);
+    if (pieces.empty()) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        queue_.push(text);
+        for (auto& p : pieces) queue_.push(p);
+        // Mark busy immediately so wait_done()/is_playing() called right
+        // after enqueue() don't return before the worker picks it up.
+        playing_ = true;
     }
     cv_.notify_one();
 }
@@ -512,6 +581,10 @@ void TTS::speak_async(const std::string& text) {
 }
 
 void TTS::interrupt() {
+    // 0. Invalidate everything already synthesized or being synthesized
+    //    (including the double-buffer prefetch) so it is never played.
+    gen_.fetch_add(1);
+
     // 1. Drain the sentence queue
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -560,6 +633,28 @@ void TTS::play_sound(const std::string& name) {
     }).detach();
 }
 
+// ── PortAudio release / reacquire (sleep-wake recovery) ─────────────
+
+void TTS::release_audio() {
+    std::lock_guard<std::mutex> lk(pa_mu_);
+    if (out_stream_) {
+        Pa_AbortStream(out_stream_);
+        Pa_CloseStream(out_stream_);
+        out_stream_ = nullptr;
+    }
+    if (pa_held_) {
+        Pa_Terminate();
+        pa_held_ = false;
+    }
+}
+
+void TTS::reacquire_audio() {
+    if (backend_ != Backend::KOKORO || sample_rate_ <= 0) return;
+    std::lock_guard<std::mutex> lk(pa_mu_);
+    if (!open_output_stream(sample_rate_, /*test_tone=*/false))
+        std::cerr << "[!] TTS: could not reopen audio output after wake.\n";
+}
+
 // ── Canned lines ────────────────────────────────────────────────────
 
 void TTS::greet()   { speak("At your service."); }
@@ -574,12 +669,7 @@ void TTS::shutdown() {
     if (worker_.joinable()) worker_.join();
 
     // Close PortAudio output
-    if (out_stream_) {
-        Pa_StopStream(out_stream_);
-        Pa_CloseStream(out_stream_);
-        out_stream_ = nullptr;
-        Pa_Terminate();
-    }
+    release_audio();
 
     // Destroy sherpa-onnx TTS engine
 #ifdef HAS_SHERPA_ONNX

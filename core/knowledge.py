@@ -236,8 +236,25 @@ def get_fact(query: str, top_k: int = 5) -> list[str]:
         if coll.count() == 0:
             return []
 
-        results = coll.query(query_texts=[query], n_results=min(top_k, coll.count()))
-        return results.get("documents", [[]])[0]
+        results = coll.query(
+            query_texts=[query],
+            n_results=min(top_k, coll.count()),
+            include=["documents", "metadatas", "distances"],
+        )
+        docs = (results.get("documents") or [[]])[0]
+        metas = (results.get("metadatas") or [[]])[0] or [{}] * len(docs)
+        dists = (results.get("distances") or [[]])[0] or [0.0] * len(docs)
+        out = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            # Old builds cached raw web-search snippets as "facts"; they go
+            # stale (weather, news) and must never be injected as truth.
+            if (meta or {}).get("category") == "search_cache":
+                continue
+            # Skip facts that aren't actually related to the query.
+            if dist is not None and dist > 0.6:
+                continue
+            out.append(doc)
+        return out
     except Exception:
         return []
 
@@ -315,8 +332,25 @@ def get_relevant_corrections(query: str, top_k: int = 3) -> list[str]:
         if coll.count() == 0:
             return []
 
-        results = coll.query(query_texts=[query], n_results=min(top_k, coll.count()))
-        return results.get("documents", [[]])[0]
+        results = coll.query(
+            query_texts=[query],
+            n_results=min(top_k, coll.count()),
+            include=["documents", "metadatas", "distances"],
+        )
+        docs = (results.get("documents") or [[]])[0]
+        metas = (results.get("metadatas") or [[]])[0] or [{}] * len(docs)
+        dists = (results.get("distances") or [[]])[0] or [0.0] * len(docs)
+        out = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            # Old builds cached raw web-search snippets as "facts"; they go
+            # stale (weather, news) and must never be injected as truth.
+            if (meta or {}).get("category") == "search_cache":
+                continue
+            # Skip facts that aren't actually related to the query.
+            if dist is not None and dist > 0.6:
+                continue
+            out.append(doc)
+        return out
     except Exception:
         return []
 
@@ -334,8 +368,7 @@ def auto_save_from_tool_result(
 
     Currently auto-saves:
     - Contact info from extract_contact results
-    - File locations from find_file results (as facts)
-    - Search results summaries from smart_search/search_web
+    - File locations from find_file results (as facts, single match only)
     """
     if not success:
         return
@@ -367,17 +400,9 @@ def auto_save_from_tool_result(
             except Exception:
                 pass
 
-        # Auto-save search result summaries
-        elif tool_name in ("smart_search", "search_web"):
-            query = args.get("query", "")
-            if query and result and not result.startswith("[-]"):
-                # Save a condensed version as a fact (first 300 chars)
-                snippet = result[:300].strip()
-                if len(snippet) > 50:
-                    save_fact(
-                        f"Search result for '{query}': {snippet}",
-                        category="search_cache",
-                    )
+        # NOTE: web search results are intentionally NOT saved as facts —
+        # they go stale (weather, news, prices) and were being re-injected
+        # into later prompts as if they were true.
     except Exception:
         pass  # never let auto-learning crash a tool call
 

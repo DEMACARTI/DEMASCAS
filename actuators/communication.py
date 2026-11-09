@@ -35,7 +35,7 @@ from sensors.vision import (
 from actuators.network import search_web, read_webpage
 
 
-MLX_TEXT_MODEL = os.getenv("DEMASCAS_MLX_TEXT_MODEL", "mlx-community/Phi-4-mini-instruct-4bit")
+from core.config import LLM_MODEL, LLM_CHAT_URL, LLM_CONFIGURED, LLM_NOT_CONFIGURED_MSG
 
 
 def _extract_first_json_object(text: str) -> dict | None:
@@ -122,6 +122,7 @@ def compose_email(
     subject: str = "",
     key_points: str = "",
     tone: str = "professional",
+    use_screen: bool = True,
 ) -> str:
     """
     Composes an email draft. Does NOT send — returns the draft for
@@ -135,10 +136,16 @@ def compose_email(
         subject: Email subject (optional — will be generated if empty)
         key_points: What the email should convey
         tone: "formal", "casual", or "professional" (default)
+        use_screen: Include a screen digest for context (costs ~1-2 s:
+                    accessibility tree + optional VLM).  Pass False when
+                    the request already contains everything needed.
 
     Returns:
         JSON string with: {subject, body, to, tone, confirm}
     """
+    if not LLM_CONFIGURED:
+        return LLM_NOT_CONFIGURED_MSG
+
     import requests
 
     print(f"[📧 COMM] Composing email to '{recipient}' about '{key_points[:50]}'...")
@@ -146,7 +153,7 @@ def compose_email(
     from core.prompt_templates import compose_email_prompt
     from core.screen_context import get_screen_context_block
 
-    screen_ctx = get_screen_context_block()
+    screen_ctx = get_screen_context_block() if use_screen else ""
 
     # Build prompt
     system_prompt = compose_email_prompt(
@@ -164,9 +171,9 @@ def compose_email(
 
     try:
         resp = requests.post(
-            "http://127.0.0.1:8081/v1/chat/completions",
+            LLM_CHAT_URL,
             json={
-                "model": MLX_TEXT_MODEL,
+                "model": LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},
@@ -175,7 +182,7 @@ def compose_email(
                 "temperature": 0.3,
                 "stream": False,
             },
-            timeout=15,
+            timeout=45,  # 300 tokens on an 8 GB M1 can take >15 s
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
@@ -226,6 +233,9 @@ def smart_reply(
     Returns:
         JSON string with: {reply, original_subject, tone, confirm}
     """
+    if not LLM_CONFIGURED:
+        return LLM_NOT_CONFIGURED_MSG
+
     import requests
 
     print("[📧 COMM] Smart reply — reading screen and drafting...")
@@ -254,9 +264,9 @@ def smart_reply(
 
     try:
         resp = requests.post(
-            "http://127.0.0.1:8081/v1/chat/completions",
+            LLM_CHAT_URL,
             json={
-                "model": MLX_TEXT_MODEL,
+                "model": LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},
@@ -416,6 +426,9 @@ def web_research_and_report(
     Returns:
         Synthesized research report as spoken text.
     """
+    if not LLM_CONFIGURED:
+        return LLM_NOT_CONFIGURED_MSG
+
     import requests
 
     print(f"[🔍 RESEARCH] Researching: '{topic}' (depth={depth})")
@@ -479,9 +492,9 @@ def web_research_and_report(
 
     try:
         resp = requests.post(
-            "http://127.0.0.1:8081/v1/chat/completions",
+            LLM_CHAT_URL,
             json={
-                "model": MLX_TEXT_MODEL,
+                "model": LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},

@@ -15,7 +15,8 @@ class FileAgent(AgentBase):
     tool_names = [
         "open_application",
         "find_file", "open_file", "list_files_in_folder", "create_file", "delete_file",
-        "summarize_latest_pdf", "get_active_window_tree", "get_clipboard", "set_clipboard",
+        "summarize_latest_pdf", "summarize_selected_pdf",
+        "get_active_window_tree", "get_clipboard", "set_clipboard",
         "press_keyboard_shortcut",
     ]
 
@@ -46,8 +47,12 @@ class FileAgent(AgentBase):
         )
         list_files = re.search(r"\b(list|show|what files|what's in|whats in)\b", g)
 
+        summarize = re.search(r"\b(summari[sz]e|summary)\b", g)
+
         if open_folder:
             return self._open_known_folder_flow(g)
+        if summarize:
+            return self._summarize_flow(goal, context)
         if direct_open:
             return self._direct_open_flow(goal, context)
         if list_files:
@@ -146,6 +151,48 @@ class FileAgent(AgentBase):
             data={"pending_file_choices": matches[:8]},
         )
 
+    def _summarize_flow(self, goal, context):
+        """Summarize a named PDF, the PDF selected in Finder, or the latest one."""
+        g = (goal or "").lower()
+        if re.search(r"\b(selected|highlighted)\b", g):
+            res = self._call_tool("summarize_selected_pdf", {})
+            if self._is_tool_error(res):
+                return AgentResult(False, "I couldn't summarize the selected file.", 1,
+                                   ["summarize_selected_pdf"], error=res)
+            return AgentResult(True, res[:600], 1, ["summarize_selected_pdf"])
+
+        partial_name, _ext, folder = self._extract_file_params(goal)
+        partial_name = re.sub(r"\b(summari[sz]e|summary|of|latest|last|newest|recent|most)\b", " ",
+                              partial_name or "")
+        partial_name = re.sub(r"\s+", " ", partial_name).strip()
+
+        if partial_name:
+            for f in ([folder] if folder else list(DEFAULT_SEARCH_FOLDERS)):
+                found = self._call_tool("find_file", {"partial_name": partial_name,
+                                                      "extension": "pdf", "folder": f})
+                if self._is_tool_error(found):
+                    continue
+                try:
+                    data = json.loads(found)
+                except Exception:
+                    data = {}
+                matches = data.get("matches", []) if isinstance(data, dict) else []
+                if len(matches) == 1:
+                    path = matches[0].get("path", "")
+                    res = self._call_tool("summarize_selected_pdf", {"file_path": path})
+                    if self._is_tool_error(res):
+                        return AgentResult(False, "I found the PDF but couldn't summarize it.", 2,
+                                           ["find_file", "summarize_selected_pdf"], error=res)
+                    return AgentResult(True, res[:600], 2, ["find_file", "summarize_selected_pdf"])
+                if len(matches) > 1:
+                    return self._handle_find_result(found, partial_name, "pdf", goal, context)
+
+        res = self._call_tool("summarize_latest_pdf", {})
+        if self._is_tool_error(res):
+            return AgentResult(False, "I couldn't summarize your latest PDF.", 1,
+                               ["summarize_latest_pdf"], error=res)
+        return AgentResult(True, res[:600], 1, ["summarize_latest_pdf"])
+
     def _list_files_flow(self, goal, context):
         g = (goal or "").lower()
         folder = "~/Downloads"
@@ -154,7 +201,7 @@ class FileAgent(AgentBase):
         elif "desktop" in g:
             folder = "~/Desktop"
 
-        result = self._call_tool("list_files_in_folder", {"folder": folder})
+        result = self._call_tool("list_files_in_folder", {"folder_path": folder})
         if self._is_tool_error(result):
             return AgentResult(False, "I couldn't list files in that folder.", 1, ["list_files_in_folder"], error=result)
 

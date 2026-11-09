@@ -47,6 +47,12 @@ public:
     /// Record a fixed-duration chunk (for periodic wake-word scans).
     std::vector<float> capture_chunk(float seconds);
 
+    /// Wait until at least `seconds` of NEW audio has arrived since the last
+    /// drain and return everything buffered.  Unlike capture_chunk() it never
+    /// discards audio, so nothing is lost while whisper is busy (used by the
+    /// sliding wake-word window).
+    std::vector<float> collect(float seconds);
+
     /// Wait for speech onset, then record until silence.
     /// Returns an empty vector on timeout (no speech detected).
     std::vector<float> capture_utterance(float timeout_sec,

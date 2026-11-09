@@ -28,7 +28,19 @@ _APP_NAME = "Brave Browser"
 
 def _sanitize_js(js: str) -> str:
     """Escape JS for embedding inside AppleScript double-quoted string."""
-    return js.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+    return js.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+
+
+def _js(value) -> str:
+    """Return `value` as a complete, safely-escaped JavaScript string literal
+    (including the surrounding quotes).  json.dumps escapes quotes,
+    apostrophes-in-context, backslashes, newlines and U+2028/2029."""
+    return json.dumps("" if value is None else str(value))
+
+
+def _as_quote(value) -> str:
+    """Escape a value for use inside an AppleScript double-quoted string."""
+    return str(value).replace('\\', '\\\\').replace('"', '\\"')
 
 
 def browser_execute_js(js_code: str) -> dict:
@@ -119,7 +131,7 @@ def browser_navigate(url: str) -> dict:
     applescript = f'''
     tell application "{_APP_NAME}"
         tell active tab of window 1
-            set URL to "{url}"
+            set URL to "{_as_quote(url)}"
         end tell
     end tell
     '''
@@ -177,7 +189,7 @@ def browser_new_tab(url: str = "") -> dict:
         applescript = f'''
         tell application "{_APP_NAME}"
             tell window 1
-                set newTab to make new tab with properties {{URL:"{url}"}}
+                set newTab to make new tab with properties {{URL:"{_as_quote(url)}"}}
                 set active tab index to (count of tabs)
             end tell
         end tell
@@ -259,7 +271,7 @@ def browser_switch_to_tab(tab_index: int) -> dict:
     applescript = f'''
     tell application "{_APP_NAME}"
         tell window 1
-            set active tab index to {tab_index}
+            set active tab index to {int(tab_index)}
         end tell
     end tell
     '''
@@ -310,7 +322,7 @@ def browser_get_page_text(max_chars: int = 5000) -> dict:
         remove.forEach(function(el) {{ el.remove(); }});
         var text = body.innerText || body.textContent || '';
         text = text.replace(/\\s+/g, ' ').trim();
-        return text.substring(0, {max_chars});
+        return text.substring(0, {int(max_chars)});
     }})()
     '''
     result = browser_execute_js(js)
@@ -335,7 +347,7 @@ def browser_get_page_html(max_chars: int = 10000) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    js = f"document.documentElement.outerHTML.substring(0, {max_chars})"
+    js = f"document.documentElement.outerHTML.substring(0, {int(max_chars)})"
     return browser_execute_js(js)
 
 
@@ -352,7 +364,7 @@ def browser_get_links(max_links: int = 20) -> dict:
     js = f'''
     (function() {{
         var links = Array.from(document.querySelectorAll('a[href]'));
-        var result = links.slice(0, {max_links}).map(function(a) {{
+        var result = links.slice(0, {int(max_links)}).map(function(a) {{
             return {{ text: (a.innerText || '').trim().substring(0, 80), href: a.href }};
         }}).filter(function(l) {{ return l.text.length > 0; }});
         return JSON.stringify(result);
@@ -427,10 +439,10 @@ def browser_click(selector: str = None) -> dict:
         if clean:
             return browser_click_text(clean)
 
-    safe_sel = selector.replace("'", "\\'")
+    safe_sel = _js(selector)
     js = f'''
     (function() {{
-        var el = document.querySelector('{safe_sel}');
+        var el = document.querySelector({safe_sel});
         if (!el) return 'NOT_FOUND';
         el.focus();
         el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
@@ -470,10 +482,10 @@ def browser_click_text(text: str = None) -> dict:
         '', text, flags=re.IGNORECASE
     ).replace('_', ' ').replace('-', ' ').strip() or text
 
-    safe_text = text.replace("'", "\\'").replace('"', '\\"')
+    safe_text = _js(text)
     js = f'''
     (function() {{
-        var target = '{safe_text}'.toLowerCase();
+        var target = {safe_text}.toLowerCase();
         var candidates = document.querySelectorAll('button,a,[role=button],[onclick],input[type=button],input[type=submit]');
         for (var i = 0; i < candidates.length; i++) {{
             var el = candidates[i];
@@ -505,10 +517,10 @@ def browser_click_xpath(xpath: str) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_xpath = xpath.replace("'", "\\'").replace('"', '\\"')
+    safe_xpath = _js(xpath)
     js = f'''
     (function() {{
-        var result = document.evaluate('{safe_xpath}', document, null,
+        var result = document.evaluate({safe_xpath}, document, null,
             XPathResult.FIRST_ORDERED_NODE_TYPE, null);
         var el = result.singleNodeValue;
         if (!el) return 'NOT_FOUND';
@@ -557,18 +569,18 @@ def browser_type(selector: str = None, text: str = None, clear_first: bool = Tru
             "message": "[-] No text provided. Specify the text to type."
         }
 
-    safe_sel = selector.replace("'", "\\'")
-    safe_text = text.replace("'", "\\'").replace("\\", "\\\\")
+    safe_sel = _js(selector)
+    safe_text = _js(text)
     js = f'''
     (function() {{
-        var el = document.querySelector('{safe_sel}');
+        var el = document.querySelector({safe_sel});
         if (!el) return 'NOT_FOUND';
         el.focus();
         if (el.getAttribute('contenteditable') === 'true' || el.isContentEditable) {{
             if ({str(clear_first).lower()}) {{
                 el.innerHTML = '';
             }}
-            document.execCommand('insertText', false, '{safe_text}');
+            document.execCommand('insertText', false, {safe_text});
         }} else {{
             if ({str(clear_first).lower()}) {{
                 el.value = '';
@@ -582,9 +594,9 @@ def browser_type(selector: str = None, text: str = None, clear_first: bool = Tru
                 );
             }}
             if (nativeInputValueSetter) {{
-                nativeInputValueSetter.set.call(el, '{safe_text}');
+                nativeInputValueSetter.set.call(el, {safe_text});
             }} else {{
-                el.value = '{safe_text}';
+                el.value = {safe_text};
             }}
         }}
         el.dispatchEvent(new Event('input', {{bubbles: true}}));
@@ -611,11 +623,11 @@ def browser_type_by_label(label_or_placeholder: str, text: str,
     Returns:
         {"success": bool, "message": str}
     """
-    safe_label = label_or_placeholder.replace("'", "\\'")
-    safe_text = text.replace("'", "\\'").replace("\\", "\\\\")
+    safe_label = _js(label_or_placeholder)
+    safe_text = _js(text)
     js = f'''
     (function() {{
-        var target = '{safe_label}'.toLowerCase();
+        var target = {safe_label}.toLowerCase();
         var inputs = document.querySelectorAll('input,textarea,select,[contenteditable=true]');
         for (var i = 0; i < inputs.length; i++) {{
             var el = inputs[i];
@@ -627,7 +639,7 @@ def browser_type_by_label(label_or_placeholder: str, text: str,
                 el.focus();
                 if (el.isContentEditable) {{
                     if ({str(clear_first).lower()}) el.innerHTML = '';
-                    document.execCommand('insertText', false, '{safe_text}');
+                    document.execCommand('insertText', false, {safe_text});
                 }} else {{
                     if ({str(clear_first).lower()}) el.value = '';
                     var setter = Object.getOwnPropertyDescriptor(
@@ -635,8 +647,8 @@ def browser_type_by_label(label_or_placeholder: str, text: str,
                     ) || Object.getOwnPropertyDescriptor(
                         window.HTMLTextAreaElement.prototype, 'value'
                     );
-                    if (setter) setter.set.call(el, '{safe_text}');
-                    else el.value = '{safe_text}';
+                    if (setter) setter.set.call(el, {safe_text});
+                    else el.value = {safe_text};
                 }}
                 el.dispatchEvent(new Event('input', {{bubbles: true}}));
                 el.dispatchEvent(new Event('change', {{bubbles: true}}));
@@ -653,7 +665,7 @@ def browser_type_by_label(label_or_placeholder: str, text: str,
                     if (el) {{
                         el.focus();
                         if ({str(clear_first).lower()}) el.value = '';
-                        el.value = '{safe_text}';
+                        el.value = {safe_text};
                         el.dispatchEvent(new Event('input', {{bubbles: true}}));
                         el.dispatchEvent(new Event('change', {{bubbles: true}}));
                         return 'typed into: ' + (el.name || el.id || el.tagName);
@@ -689,10 +701,10 @@ def browser_press_key(key: str, selector: str = "") -> dict:
     elif not isinstance(selector, str):
         selector = str(selector)
 
-    safe_key = key.replace("'", "\\'")
+    safe_key = _js(key)
     if selector:
-        safe_sel = selector.replace("'", "\\'")
-        target_code = f"document.querySelector('{safe_sel}')"
+        safe_sel = _js(selector)
+        target_code = f"document.querySelector({safe_sel})"
     else:
         target_code = "document.activeElement"
 
@@ -700,10 +712,10 @@ def browser_press_key(key: str, selector: str = "") -> dict:
     (function() {{
         var el = {target_code};
         if (!el) return 'NO_TARGET';
-        el.dispatchEvent(new KeyboardEvent('keydown', {{key: '{safe_key}', bubbles: true}}));
-        el.dispatchEvent(new KeyboardEvent('keypress', {{key: '{safe_key}', bubbles: true}}));
-        el.dispatchEvent(new KeyboardEvent('keyup', {{key: '{safe_key}', bubbles: true}}));
-        return 'pressed: {safe_key}';
+        el.dispatchEvent(new KeyboardEvent('keydown', {{key: {safe_key}, bubbles: true}}));
+        el.dispatchEvent(new KeyboardEvent('keypress', {{key: {safe_key}, bubbles: true}}));
+        el.dispatchEvent(new KeyboardEvent('keyup', {{key: {safe_key}, bubbles: true}}));
+        return 'pressed: ' + {safe_key};
     }})()
     '''
     return browser_execute_js(js)
@@ -726,13 +738,13 @@ def browser_scroll(direction: str = "down", pixels: int = 500) -> dict:
     """
     direction = direction.lower().strip()
     if direction == "down":
-        js = f"window.scrollBy(0, {pixels}); 'scrolled down {pixels}px'"
+        js = f"window.scrollBy(0, {int(pixels)}); 'scrolled down {int(pixels)}px'"
     elif direction == "up":
-        js = f"window.scrollBy(0, -{pixels}); 'scrolled up {pixels}px'"
+        js = f"window.scrollBy(0, -{int(pixels)}); 'scrolled up {int(pixels)}px'"
     elif direction == "right":
-        js = f"window.scrollBy({pixels}, 0); 'scrolled right {pixels}px'"
+        js = f"window.scrollBy({int(pixels)}, 0); 'scrolled right {int(pixels)}px'"
     elif direction == "left":
-        js = f"window.scrollBy(-{pixels}, 0); 'scrolled left {pixels}px'"
+        js = f"window.scrollBy(-{int(pixels)}, 0); 'scrolled left {int(pixels)}px'"
     elif direction == "top":
         js = "window.scrollTo(0, 0); 'scrolled to top'"
     elif direction == "bottom":
@@ -753,10 +765,10 @@ def browser_scroll_to_element(selector: str) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_sel = selector.replace("'", "\\'")
+    safe_sel = _js(selector)
     js = f'''
     (function() {{
-        var el = document.querySelector('{safe_sel}');
+        var el = document.querySelector({safe_sel});
         if (!el) return 'NOT_FOUND';
         el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
         return 'scrolled to: ' + el.tagName;
@@ -807,15 +819,15 @@ def browser_select_option(selector: str, value: str) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_sel = selector.replace("'", "\\'")
-    safe_val = value.replace("'", "\\'")
+    safe_sel = _js(selector)
+    safe_val = _js(value)
     js = f'''
     (function() {{
-        var sel = document.querySelector('{safe_sel}');
+        var sel = document.querySelector({safe_sel});
         if (!sel) return 'NOT_FOUND';
         // Try by value first
         for (var i = 0; i < sel.options.length; i++) {{
-            if (sel.options[i].value === '{safe_val}' || sel.options[i].text === '{safe_val}') {{
+            if (sel.options[i].value === {safe_val} || sel.options[i].text === {safe_val}) {{
                 sel.selectedIndex = i;
                 sel.dispatchEvent(new Event('change', {{bubbles: true}}));
                 return 'selected: ' + sel.options[i].text;
@@ -841,10 +853,10 @@ def browser_check_checkbox(selector: str, check: bool = True) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_sel = selector.replace("'", "\\'")
+    safe_sel = _js(selector)
     js = f'''
     (function() {{
-        var el = document.querySelector('{safe_sel}');
+        var el = document.querySelector({safe_sel});
         if (!el) return 'NOT_FOUND';
         if (el.checked !== {str(check).lower()}) {{
             el.click();
@@ -868,10 +880,10 @@ def browser_submit_form(selector: str = "form") -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_sel = selector.replace("'", "\\'")
+    safe_sel = _js(selector)
     js = f'''
     (function() {{
-        var form = document.querySelector('{safe_sel}');
+        var form = document.querySelector({safe_sel});
         if (!form) return 'NOT_FOUND';
         form.submit();
         return 'submitted form';
@@ -898,10 +910,10 @@ def browser_wait_for_element(selector: str, timeout: int = 10) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_sel = selector.replace("'", "\\'")
+    safe_sel = _js(selector)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        js = f"document.querySelector('{safe_sel}') ? 'FOUND' : 'WAITING'"
+        js = f"document.querySelector({safe_sel}) ? 'FOUND' : 'WAITING'"
         result = browser_execute_js(js)
         if result.get("value") == "FOUND":
             return {"success": True, "message": f"Element found: {selector}"}
@@ -940,8 +952,8 @@ def browser_element_exists(selector: str) -> dict:
     Returns:
         {"success": True, "message": "exists" or "not_found"}
     """
-    safe_sel = selector.replace("'", "\\'")
-    result = browser_execute_js(f"document.querySelector('{safe_sel}') ? 'exists' : 'not_found'")
+    safe_sel = _js(selector)
+    result = browser_execute_js(f"document.querySelector({safe_sel}) ? 'exists' : 'not_found'")
     return {"success": True, "message": result.get("value", "error")}
 
 
@@ -968,7 +980,7 @@ def browser_get_dom_summary(max_elements: int = 50) -> dict:
         var selectors = 'button,a[href],input,textarea,select,[role=button],[role=link],[role=tab],[role=menuitem],[contenteditable=true]';
         var elements = document.querySelectorAll(selectors);
         var count = 0;
-        for (var i = 0; i < elements.length && count < {max_elements}; i++) {{
+        for (var i = 0; i < elements.length && count < {int(max_elements)}; i++) {{
             var el = elements[i];
             // Skip hidden/off-screen elements
             if (el.offsetWidth === 0 && el.offsetHeight === 0) continue;
@@ -1038,7 +1050,7 @@ def gmail_fill_to(recipient: str) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_recip = recipient.replace("'", "\\'")
+    safe_recip = _js(recipient)
     js = f'''
     (function() {{
         // Gmail To field is an input inside a div with aria-label "To recipients"
@@ -1047,10 +1059,10 @@ def gmail_fill_to(recipient: str) -> dict:
             || document.querySelector('textarea[name="to"]');
         if (!toField) return 'NOT_FOUND';
         toField.focus();
-        toField.value = '{safe_recip}';
+        toField.value = {safe_recip};
         toField.dispatchEvent(new Event('input', {{bubbles: true}}));
         toField.dispatchEvent(new Event('change', {{bubbles: true}}));
-        return 'filled to: {safe_recip}';
+        return 'filled to: ' + {safe_recip};
     }})()
     '''
     result = browser_execute_js(js)
@@ -1069,14 +1081,14 @@ def gmail_fill_subject(subject: str) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_subj = subject.replace("'", "\\'")
+    safe_subj = _js(subject)
     js = f'''
     (function() {{
         var subj = document.querySelector('input[name="subjectbox"]')
             || document.querySelector('input[aria-label="Subject"]');
         if (!subj) return 'NOT_FOUND';
         subj.focus();
-        subj.value = '{safe_subj}';
+        subj.value = {safe_subj};
         subj.dispatchEvent(new Event('input', {{bubbles: true}}));
         subj.dispatchEvent(new Event('change', {{bubbles: true}}));
         return 'filled subject';
@@ -1100,7 +1112,7 @@ def gmail_fill_body(body: str) -> dict:
     Returns:
         {"success": bool, "message": str}
     """
-    safe_body = body.replace("'", "\\'").replace("\n", "\\n")
+    safe_body = _js(body)
     js = f'''
     (function() {{
         var bodyDiv = document.querySelector('div[aria-label="Message Body"]')
@@ -1109,7 +1121,7 @@ def gmail_fill_body(body: str) -> dict:
         if (!bodyDiv) return 'NOT_FOUND';
         bodyDiv.focus();
         bodyDiv.innerHTML = '';
-        document.execCommand('insertText', false, '{safe_body}');
+        document.execCommand('insertText', false, {safe_body});
         bodyDiv.dispatchEvent(new Event('input', {{bubbles: true}}));
         return 'filled body';
     }})()
