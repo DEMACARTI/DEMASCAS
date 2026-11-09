@@ -378,7 +378,12 @@ def web_search(query: str) -> dict:
     try:
         data = json.loads(result.get("value", "[]"))
         if not data:
-            return {"success": True, "message": "No search results found. Google may be showing a different layout."}
+            # Google's layout changes often; don't report an empty success.
+            from actuators.network import search_web
+            ddg = search_web(query)
+            if ddg.startswith("Search results"):
+                return {"success": True, "message": ddg}
+            return {"success": False, "message": f"[-] No search results for '{query}'."}
         lines = []
         for i, r in enumerate(data, 1):
             lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r.get('snippet', '')}")

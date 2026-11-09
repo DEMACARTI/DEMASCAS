@@ -548,22 +548,14 @@ static std::string normalize_transcription(const std::string& raw) {
     while (!s.empty() && s.back() == ' ')  s.pop_back();
 
     // ── STEP 6: Targeted speech autocorrections for common domains ──
+    // Applied case-insensitively WITHOUT lowercasing the whole command, so
+    // names ("Albert Einstein", "Aman"), subjects and file names keep their
+    // capitalization.
     {
+        static const std::regex LOFI(R"(\b(?:low\s+five|low\s+fi|lo\s+fi)\b)", std::regex::icase);
+        s = std::regex_replace(s, LOFI, "lofi");
+
         std::string sl = to_lower(s);
-
-        // lofi query normalization from common ASR variants
-        auto repl_all = [](std::string& x, const std::string& from, const std::string& to) {
-            size_t pos = 0;
-            while ((pos = x.find(from, pos)) != std::string::npos) {
-                x.replace(pos, from.size(), to);
-                pos += to.size();
-            }
-        };
-        repl_all(sl, "low five", "lofi");
-        repl_all(sl, "low fi", "lofi");
-        repl_all(sl, "lo fi", "lofi");
-
-        // Canonical Bennett LMS normalization for noisy transcripts
         if (sl.find("lms") != std::string::npos) {
             static const std::vector<std::string> bennett_variants = {
                 "bennit", "benit", "bennet", "benned", "bewewd", "penit", "bennett"
@@ -573,16 +565,13 @@ static std::string normalize_transcription(const std::string& raw) {
                 if (sl.find(v) != std::string::npos) { looks_bennett = true; break; }
             }
             if (looks_bennett) {
-                sl = std::regex_replace(sl, std::regex(R"(lms\.[a-z0-9.-]+)", std::regex::icase),
-                                        "lms.bennett.edu.in");
+                s = std::regex_replace(s, std::regex(R"(lms\.[a-z0-9.-]+)", std::regex::icase),
+                                       "lms.bennett.edu.in");
             }
-
             // TLD truncations from speech models
-            sl = std::regex_replace(sl, std::regex(R"(\.edu\.n\b)", std::regex::icase), ".edu.in");
-            sl = std::regex_replace(sl, std::regex(R"(\.edu\.i\b)", std::regex::icase), ".edu.in");
+            s = std::regex_replace(s, std::regex(R"(\.edu\.n\b)", std::regex::icase), ".edu.in");
+            s = std::regex_replace(s, std::regex(R"(\.edu\.i\b)", std::regex::icase), ".edu.in");
         }
-
-        s = sl;
     }
 
     return s;
@@ -1092,15 +1081,9 @@ int main() {
                         reply = ar.confirm_speech;
                         state = State::CONFIRMING;
                     } else if (!ar.summary.empty()) {
-                        std::string buf;
-                        for (char c : ar.summary) {
-                            buf += c;
-                            if ((c == '.' || c == '!' || c == '?') && buf.size() > 10) {
-                                on_sentence(buf);
-                                buf.clear();
-                            }
-                        }
-                        if (!buf.empty()) on_sentence(buf);
+                        // TTS splits sentences itself (URL/decimal-safe); the
+                        // old per-'.' split read "https://www." aloud.
+                        on_sentence(ar.summary);
                         reply = ar.summary;
                     } else if (!ar.error.empty()) {
                         reply = "I ran into an issue: " + ar.error.substr(0, 80);

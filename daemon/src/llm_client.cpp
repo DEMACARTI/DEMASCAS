@@ -899,6 +899,7 @@ std::string LLMClient::chat_with_tools_streaming(
     std::string prev_tool;   // for dedup detection
     json        prev_args;   // for dedup detection
     bool        prev_failed = false;  // did the most recent tool call fail?
+    bool        any_success = false;  // did ANY tool call in this command succeed?
 
     while (depth < cfg::MAX_TOOL_DEPTH && !cancel.load()) {
         ++depth;
@@ -950,7 +951,9 @@ std::string LLMClient::chat_with_tools_streaming(
         if (fn == prev_tool && args == prev_args) {
             std::cout << "[!] Duplicate tool call detected (" << fn
                       << ") — breaking ReAct loop.\n";
-            if (prev_failed) {
+            // Only report failure if nothing worked — e.g. a memory that was
+            // saved before the model wandered into a failing extra step.
+            if (prev_failed && !any_success) {
                 final_text = "I couldn't get that to work.";
                 last_success_ = false;
             } else {
@@ -984,6 +987,7 @@ std::string LLMClient::chat_with_tools_streaming(
         // Prefer the server's explicit success flag; fall back to parsing.
         bool tool_failed = tr.has_success ? !tr.success : is_tool_error(tr.result);
         prev_failed = tool_failed;
+        if (!tool_failed) any_success = true;
 
         // ── Destructive action needs a spoken yes/no ────────────
         if (!tool_failed && tr.result.find("pending_confirmation") != std::string::npos) {
@@ -1108,7 +1112,7 @@ std::string LLMClient::chat_with_tools_streaming(
 
     // If the loop ended without a final answer, report honestly.
     if (final_text.empty() && !cancel.load()) {
-        if (prev_failed || last_tools_.empty()) {
+        if ((prev_failed && !any_success) || last_tools_.empty()) {
             final_text = "I wasn't able to finish that.";
             last_success_ = false;
         } else {

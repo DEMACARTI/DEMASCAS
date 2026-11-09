@@ -496,6 +496,10 @@ ACTIVE_CONTEXT = {
     "pending_file_choices": None,     # list of {name, path} from find_file multi-match
     "awaiting_user_choice": False,    # if True, next turn is a continuation
 
+    # Previous exchange — lets agents resolve follow-ups ("show that elsewhere")
+    "last_command": None,
+    "last_reply": None,
+
     # Pre-resolved real paths
     "home_dir": _HOME,
     "downloads_dir": str(_pathlib.Path.home() / "Downloads"),
@@ -804,6 +808,15 @@ def _normalize_tool_call(name: str, args: dict) -> tuple[str, dict]:
     normalized.pop("window_title", None)
     normalized.pop("args", None)
 
+    # Generic aliases must never rename a parameter the tool really has
+    # (e.g. "key" → "keys" stole set_preference's `key` argument).
+    target = TOOL_MAP.get(canonical)
+    try:
+        real_params = set(inspect.signature(target).parameters) if target else set()
+    except (TypeError, ValueError):
+        real_params = set()
+    stash = {k: normalized.pop(k) for k in list(normalized) if k in real_params}
+
     # Common argument aliases
     if "app" in normalized and "app_name" not in normalized:
         normalized["app_name"] = normalized.pop("app")
@@ -928,6 +941,18 @@ def _normalize_tool_call(name: str, args: dict) -> tuple[str, dict]:
                 normalized["element_description"] = normalized.pop(alias)
                 break
 
+    if canonical == "save_memory":
+        for alias in ("memory", "content", "fact", "info", "note", "value", "message"):
+            if alias in normalized and "text" not in normalized and "text" not in stash:
+                normalized["text"] = normalized.pop(alias)
+                break
+
+    if canonical == "set_preference":
+        for alias in ("name", "preference", "setting"):
+            if alias in normalized and "key" not in normalized and "key" not in stash:
+                normalized["key"] = normalized.pop(alias)
+                break
+
     if canonical == "gmail_compose_draft":
         # Accept common aliases for recipient
         for alias in ("recipient", "email", "to_address", "address"):
@@ -939,6 +964,7 @@ def _normalize_tool_call(name: str, args: dict) -> tuple[str, dict]:
         if "content" in normalized and "body" not in normalized:
             normalized["body"] = normalized.pop("content")
 
+    normalized.update(stash)   # real parameters always win
     return canonical, normalized
 
 # ── UI-mutating tools — auto-capture screen state after execution ────
@@ -1525,6 +1551,8 @@ def log_learning():
 
 def _record_learning(data: dict) -> None:
     """Background half of /learn (see _LEARN_EXECUTOR)."""
+    ACTIVE_CONTEXT["last_command"] = str(data.get("command", ""))[:300]
+    ACTIVE_CONTEXT["last_reply"] = str(data.get("result", ""))[:300]
     from core.learning import after_command, record_successful_sequence
     try:
         # Keep the model warm while DEMASCAS is in use (Ollama).

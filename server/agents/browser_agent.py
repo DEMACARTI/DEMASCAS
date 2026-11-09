@@ -25,6 +25,7 @@ class BrowserAgent(AgentBase):
         "gmail_compose_draft", "gmail_read_email",
         "web_smart_click", "web_scan_for_obstacles", "web_handle_obstacle",
         "web_search", "web_read_article", "web_youtube_search", "web_youtube_play_first",
+        "search_web",
     ]
 
     @property
@@ -54,8 +55,54 @@ class BrowserAgent(AgentBase):
             "13. web_read_article is faster than browser_get_page_text for article content."
         )
 
+    _EXCLUDE_RE = re.compile(
+        r"\b(?:except(?:\s+for)?|other\s+than|instead\s+of|not\s+(?:on|from)|besides|"
+        r"apart\s+from|rather\s+than|without)\s+(?:the\s+)?([a-z0-9][a-z0-9.-]*)",
+        re.IGNORECASE,
+    )
+    _TOPIC_NOISE = re.compile(
+        r"\b(can|could|would|will|you|please|i|want|wanted|meant|what|was|that|this|it|to|"
+        r"show|me|open|display|find|bring|up|all|of|yours|your|the|a|an|some|information|info|"
+        r"details|regarding|about|on|in|from|for|another|other|different|website|websites|"
+        r"site|sites|page|pages|web|browser|theory|something|else|except|than|instead|"
+        r"besides|apart|rather|without|alright|okay|so|well|just|my)\b",
+        re.IGNORECASE,
+    )
+
+    def _topic_from(self, text: str) -> str:
+        t = self._EXCLUDE_RE.sub(" ", text or "")
+        t = self._TOPIC_NOISE.sub(" ", t)
+        return re.sub(r"[^\w\s'-]", " ", re.sub(r"\s+", " ", t)).strip()
+
+    def _alternative_site_flow(self, goal: str, excluded: str, context: dict) -> AgentResult:
+        """'Show that on a site other than X' — search, skip X, open the next
+        best result.  Deterministic: one search + one page load."""
+        topic = self._topic_from(goal)
+        if len(topic) < 3:
+            topic = self._topic_from(str((context or {}).get("last_command", "")))
+        if len(topic) < 3:
+            return AgentResult(False, "Which topic should I look up?", 0, [], error="no_topic")
+        res = self._call_tool("search_web", {"query": topic, "max_results": 8})
+        urls = re.findall(r"URL:\s*(\S+)", res or "")
+        excl = excluded.lower().split(".")[0]
+        pick = next((u for u in urls if excl not in u.lower()), "")
+        if not pick:
+            return AgentResult(False, f"I couldn't find another site about {topic}.", 1,
+                               ["search_web"], error=res[:200] if res else "no results")
+        r = self._call_tool("open_url_and_wait",
+                            {"url": pick, "browser": "Brave Browser", "wait_seconds": 3})
+        if self._is_tool_error(r):
+            return AgentResult(False, "I found a page but couldn't open it.", 2,
+                               ["search_web", "open_url_and_wait"], error=r)
+        host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", pick).split("/")[0])
+        return AgentResult(True, f"Here's {topic.title()} on {host}.", 2,
+                           ["search_web", "open_url_and_wait"])
+
     def run(self, goal: str, context: dict) -> AgentResult:
         goal_lower = (goal or "").lower()
+        m = self._EXCLUDE_RE.search(goal or "")
+        if m and re.search(r"\b(site|website|page|another|other|different|elsewhere)\b", goal_lower):
+            return self._alternative_site_flow(goal, m.group(1), context)
         if any(k in goal_lower for k in ["open gmail", "gmail in browser", "open mail.google.com"]):
             return self._open_gmail_flow()
         if any(k in goal_lower for k in ["fill in the form", "fill the form", "fill form"]):

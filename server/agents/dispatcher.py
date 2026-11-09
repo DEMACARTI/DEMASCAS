@@ -137,7 +137,7 @@ _FORCE_PATTERNS = [
     ("comms", r"\b(reply to|respond to|smart reply)\b"),
 
     # System (macOS app productivity)
-    ("system", r"\b(create|new|blank)\b.{0,40}\b(powerpoint|power point|presentation|slides)\b"),
+    ("system", r"\b(create|creating|make|making|new|blank|start|build|prepare)\b.{0,40}\b(powerpoint|power point|presentation|slides|deck)\b"),
     ("system", r"\b(close|quit|exit)\b.{0,40}\b(powerpoint|power point|presentation|slides|keynote|word|excel|app)\b"),
     # Research
     ("research", r"\b(research|summarize|look up|news about|weather in)\b"),
