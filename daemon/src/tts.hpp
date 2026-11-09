@@ -99,6 +99,11 @@ private:
     void play_pcm(const void* audio_ptr, uint64_t gen);
     void play_samples(const float* samples, int32_t n, uint64_t gen);
 
+    /// Write frames, but never block forever: if the output device doesn't
+    /// accept audio in time (stalled/vanished device), return false.
+    /// Caller must hold pa_mu_.  gen=0 → no interrupt check.
+    bool write_frames(const float* data, int32_t n, uint64_t gen);
+
     /// Split text into sentences so long answers start playing after the
     /// first sentence is synthesized instead of after the whole answer.
     static std::vector<std::string> split_sentences(const std::string& text);

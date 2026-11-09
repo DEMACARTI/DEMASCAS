@@ -45,7 +45,10 @@ def _get_collection():
         _install_fast_embeddings()
 
         os.makedirs(_MEMORY_DIR, exist_ok=True)
-        _client = chromadb.PersistentClient(path=_MEMORY_DIR)
+        # 100 % local: ChromaDB's anonymized usage telemetry is ON by default.
+        from chromadb.config import Settings
+        _client = chromadb.PersistentClient(
+            path=_MEMORY_DIR, settings=Settings(anonymized_telemetry=False))
         _collection = _client.get_or_create_collection(
             name="demascas_memory",
             metadata={"hnsw:space": "cosine"},  # cosine similarity

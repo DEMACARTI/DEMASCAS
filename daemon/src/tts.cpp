@@ -14,7 +14,9 @@
 #include "tts.hpp"
 #include "config.hpp"
 
-#include <algorithm>         // std::min
+#include <algorithm>
+#include <chrono>
+#include <thread>         // std::min
 #include <climits>          // PATH_MAX
 #include <cmath>            // sinf
 #include <csignal>
@@ -162,17 +164,24 @@ bool TTS::open_output_stream(int sample_rate, bool test_tone) {
 
     std::cout << "[✓] TTS PortAudio stream open (" << sample_rate << " Hz, float32, mono)\n";
 
-    // Play a short test tone (440 Hz, 0.15s) to verify audio output works
+    // Short test tone (440 Hz, 0.15 s) — also proves the device actually
+    // consumes audio.  A stalled device used to block here FOREVER (the
+    // whole daemon hung at startup); now it falls back to macOS `say`.
     if (test_tone) {
         constexpr int TEST_SAMPLES = 3600;  // 0.15s at 24kHz
         float test_buf[TEST_SAMPLES];
         for (int i = 0; i < TEST_SAMPLES; ++i)
             test_buf[i] = 0.2f * sinf(2.0f * 3.14159265f * 440.0f * i / sample_rate);
-        PaError te = Pa_WriteStream(out_stream_, test_buf, TEST_SAMPLES);
-        if (te == paNoError)
+        if (write_frames(test_buf, TEST_SAMPLES, 0)) {
             std::cout << "[✓] TTS test tone played (440 Hz, 0.15 s)\n";
-        else
-            std::cerr << "[!] TTS test tone FAILED: " << Pa_GetErrorText(te) << "\n";
+        } else {
+            std::cerr << "[!] Audio output device is not accepting audio — "
+                         "falling back to macOS `say`.\n";
+            Pa_AbortStream(out_stream_);
+            Pa_CloseStream(out_stream_);
+            out_stream_ = nullptr;
+            return false;
+        }
     }
 
     return true;
@@ -439,15 +448,41 @@ void TTS::play_samples(const float* samples, int32_t n, uint64_t gen) {
             Pa_StartStream(out_stream_);
         }
         int32_t count = std::min(CHUNK, n - offset);
-        PaError err = Pa_WriteStream(out_stream_, samples + offset,
-                                      static_cast<unsigned long>(count));
-        if (err != paNoError && err != paOutputUnderflowed) {
-            if (gen_.load() == gen)
-                std::cerr << "[!] PA write error: " << Pa_GetErrorText(err) << "\n";
-            break;
-        }
+        if (!write_frames(samples + offset, count, gen)) break;
         offset += count;
     }
+}
+
+bool TTS::write_frames(const float* data, int32_t n, uint64_t gen) {
+    if (!out_stream_) return false;
+    // Wait for room in the device buffer instead of blocking inside
+    // Pa_WriteStream: a healthy device frees room within the chunk's own
+    // duration; allow that plus 1.5 s of slack before declaring a stall.
+    const int sr = sample_rate_ > 0 ? sample_rate_ : cfg::KOKORO_SAMPLE_RATE;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(1500 + 1000LL * n / sr);
+    while (true) {
+        if (stop_ || (gen != 0 && gen_.load() != gen)) return false;
+        signed long avail = Pa_GetStreamWriteAvailable(out_stream_);
+        if (avail < 0) {
+            std::cerr << "[!] Audio output error: " << Pa_GetErrorText(static_cast<PaError>(avail)) << "\n";
+            return false;
+        }
+        if (avail >= std::min<signed long>(n, 256)) break;
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::cerr << "[!] Audio output stalled — skipping playback.\n";
+            Pa_AbortStream(out_stream_);   // restarted on the next sentence
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    PaError err = Pa_WriteStream(out_stream_, data, static_cast<unsigned long>(n));
+    if (err != paNoError && err != paOutputUnderflowed) {
+        if (gen == 0 || gen_.load() == gen)
+            std::cerr << "[!] PA write error: " << Pa_GetErrorText(err) << "\n";
+        return false;
+    }
+    return true;
 }
 
 void TTS::warm_one_cached_phrase() {

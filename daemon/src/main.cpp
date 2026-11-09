@@ -618,6 +618,10 @@ static bool is_dismiss(const std::string& text) {
 enum class State { SLEEPING, LISTENING, PROCESSING, CONFIRMING, CLARIFYING };
 
 int main() {
+    // Flush log lines immediately (stdout is block-buffered when redirected
+    // to a file, which hid all daemon output in run.sh logs).
+    std::cout << std::unitbuf;
+
     std::signal(SIGINT,  on_signal);
     std::signal(SIGTERM, on_signal);
 
@@ -821,7 +825,17 @@ int main() {
             }
 
             auto hop = audio.collect(cfg::WAKE_HOP_SEC);
-            if (hop.empty()) break;
+            if (hop.empty()) {
+                // No samples at all = the OS isn't delivering mic audio
+                // (usually missing Microphone permission).  Say so instead
+                // of sitting silently forever.
+                static int empty_hops = 0;
+                if (++empty_hops == 4)
+                    std::cerr << "[!] The microphone is delivering no audio. Grant Microphone "
+                                 "access to the app running DEMASCAS (System Settings → Privacy "
+                                 "& Security → Microphone), then restart.\n";
+                break;
+            }
 
             // VAD gate — skip whisper while it's quiet (most of the time).
             float energy = demascas::AudioEngine::rms(hop.data(), hop.size());

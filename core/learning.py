@@ -90,7 +90,8 @@ def _get_episodes():
             import chromadb
             memory_dir = os.path.join(_DEMASCAS_DIR, "memory")
             os.makedirs(memory_dir, exist_ok=True)
-            client = chromadb.PersistentClient(path=memory_dir)
+            client = chromadb.PersistentClient(
+                path=memory_dir, settings=chromadb.config.Settings(anonymized_telemetry=False))
 
         _episodes_collection = client.get_or_create_collection(
             name="demascas_episodes",
