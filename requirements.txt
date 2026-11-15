@@ -48,3 +48,11 @@ pyautogui; sys_platform == "darwin"
 # DEMASCAS includes a built-in pure-Python MCP client (zero deps).
 # Only install the SDK if you want to build servers using the official SDK:
 # mcp                       # pip install mcp  (official Python MCP SDK)
+
+# Documents (create_presentation / create_document / create_spreadsheet)
+python-pptx>=1.0
+python-docx>=1.1
+openpyxl>=3.1
+
+# Fast accessibility reads + Electron apps (Discord, Slack…) — macOS only
+pyobjc-framework-ApplicationServices>=10; sys_platform == "darwin"

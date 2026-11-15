@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
-# DEMASCAS — Build Script (macOS / Apple Silicon)
+# DEMASCAS — Build Script (macOS / Apple Silicon · Linux: Arch, Debian/Ubuntu, Fedora)
 #
 # What this does:
-#   1. Checks prerequisites (cmake, brew, portaudio)
+#   1. Checks prerequisites (cmake, pkg-config, portaudio, speexdsp) and
+#      installs missing ones with Homebrew / pacman / apt / dnf
 #   2. Downloads whisper.cpp GGML models if missing
 #   3. Installs Python deps (flask) for the tool server
 #   4. Compiles the C++ daemon via CMake (Release mode)
@@ -19,38 +20,61 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+OS="$(uname -s)"          # Darwin | Linux
+ARCH="$(uname -m)"        # arm64 | x86_64 | aarch64
+
 echo ""
 echo "╔══════════════════════════════════════════╗"
-echo "║    DEMASCAS Build Script (macOS ARM64)    ║"
+echo "║        DEMASCAS Build Script              ║"
 echo "╚══════════════════════════════════════════╝"
+echo "     System: ${OS} ${ARCH}"
 echo ""
 
 # ── 1. Check prerequisites ──────────────────────────────────────────
 
 echo "[1/5] Checking prerequisites..."
 
-command -v brew  >/dev/null 2>&1 || {
-    echo "❌  Homebrew not found.  Install from https://brew.sh"; exit 1; }
-
-command -v cmake >/dev/null 2>&1 || {
-    echo "[*] Installing cmake via Homebrew..."
-    brew install cmake
-}
-
-command -v pkg-config >/dev/null 2>&1 || {
-    echo "[*] Installing pkg-config via Homebrew..."
-    brew install pkg-config
-}
-
-# ── 2. Install PortAudio ────────────────────────────────────────────
-
-echo "[2/5] Checking PortAudio..."
-if ! brew list portaudio &>/dev/null; then
-    echo "[*] Installing PortAudio..."
-    brew install portaudio
+if [ "$OS" = "Darwin" ]; then
+    command -v brew >/dev/null 2>&1 || {
+        echo "❌  Homebrew not found.  Install from https://brew.sh"; exit 1; }
+    for pkg in cmake pkg-config portaudio speexdsp; do
+        if ! brew list "$pkg" &>/dev/null; then
+            echo "[*] Installing $pkg via Homebrew..."
+            brew install "$pkg"
+        fi
+    done
+elif [ "$OS" = "Linux" ]; then
+    # Package names per distro: build tools, PortAudio (mic + speaker),
+    # speexdsp (echo cancellation), curl/bzip2 (model downloads).
+    if command -v pacman >/dev/null 2>&1; then          # Arch / Manjaro / EndeavourOS
+        PKGS="base-devel cmake pkgconf git curl bzip2 lsof portaudio speexdsp python"
+        MISSING=$(pacman -T $PKGS 2>/dev/null || true)
+        if [ -n "$MISSING" ]; then
+            echo "[*] Installing with pacman: $MISSING"
+            sudo pacman -S --needed --noconfirm $MISSING
+        fi
+    elif command -v apt-get >/dev/null 2>&1; then       # Debian / Ubuntu
+        sudo apt-get update -qq
+        sudo apt-get install -y build-essential cmake pkg-config git curl bzip2 lsof \
+            portaudio19-dev libspeexdsp-dev python3-venv
+    elif command -v dnf >/dev/null 2>&1; then           # Fedora
+        sudo dnf install -y gcc-c++ make cmake pkgconf-pkg-config git curl bzip2 lsof \
+            portaudio-devel speexdsp-devel python3
+    else
+        echo "⚠️  Unknown package manager — install: cmake, pkg-config, a C++17 compiler,"
+        echo "   PortAudio (dev headers), speexdsp (dev headers), curl, bzip2."
+    fi
 else
-    echo "     PortAudio ✓"
+    echo "❌  Unsupported system: $OS (use macOS or Linux; on Windows use WSL2)."; exit 1
 fi
+for tool in cmake pkg-config curl; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "❌  $tool is still missing."; exit 1; }
+done
+pkg-config --exists portaudio-2.0 || { echo "❌  PortAudio development files not found."; exit 1; }
+
+# ── 2. (macOS: Homebrew packages are checked above) ─────────────────
+
+echo "[2/5] Prerequisites ✓"
 
 # ── 3. Download whisper.cpp GGML models ─────────────────────────────
 
@@ -77,19 +101,26 @@ SHERPA_DIR="daemon/models/sherpa-onnx"
 SHERPA_VER="v1.12.28"
 
 if [ ! -d "$SHERPA_DIR/lib" ]; then
-    SHERPA_ASSET="sherpa-onnx-${SHERPA_VER}-osx-universal2-shared.tar.bz2"
+    # Pre-built shared library for this system (Kokoro neural voice).
+    case "${OS}-${ARCH}" in
+        Darwin-*)        SHERPA_ASSET="sherpa-onnx-${SHERPA_VER}-osx-universal2-shared.tar.bz2" ;;
+        Linux-x86_64)    SHERPA_ASSET="sherpa-onnx-${SHERPA_VER}-linux-x64-shared.tar.bz2" ;;
+        Linux-aarch64)   SHERPA_ASSET="sherpa-onnx-${SHERPA_VER}-linux-aarch64-shared-cpu.tar.bz2" ;;
+        *) echo "❌  No sherpa-onnx build for ${OS} ${ARCH}"; exit 1 ;;
+    esac
     SHERPA_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/${SHERPA_VER}/${SHERPA_ASSET}"
     echo "     Downloading sherpa-onnx shared library (${SHERPA_ASSET})..."
-    curl -L --progress-bar -o "/tmp/sherpa-onnx.tar.bz2" "$SHERPA_URL"
+    TMP_TAR="$(mktemp -t sherpa.XXXXXX).tar.bz2"
+    curl -L --fail --progress-bar -o "$TMP_TAR" "$SHERPA_URL"
 
     mkdir -p "$SHERPA_DIR"
-    tar -xjf "/tmp/sherpa-onnx.tar.bz2" -C "$SHERPA_DIR" --strip-components=1
-    rm -f "/tmp/sherpa-onnx.tar.bz2"
+    tar -xjf "$TMP_TAR" -C "$SHERPA_DIR" --strip-components=1
+    rm -f "$TMP_TAR"
 
     if [ -d "$SHERPA_DIR/lib" ]; then
-        echo "     sherpa-onnx library ✓  (native arm64 + x86_64)"
+        echo "     sherpa-onnx library ✓  (${OS} ${ARCH})"
     else
-        echo "     ⚠️  sherpa-onnx download failed — will use macOS 'say' as fallback"
+        echo "     ⚠️  sherpa-onnx download failed — DEMASCAS will have no neural voice"
     fi
 else
     echo "     sherpa-onnx library ✓"
@@ -103,32 +134,47 @@ KOKORO_DIR="daemon/models/kokoro-en-v0_19"
 if [ ! -f "$KOKORO_DIR/model.onnx" ]; then
     KOKORO_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2"
     echo "     Downloading Kokoro-82M voice model (~335 MB)..."
-    curl -L --progress-bar -o "/tmp/kokoro.tar.bz2" "$KOKORO_URL"
+    TMP_TAR="$(mktemp -t kokoro.XXXXXX).tar.bz2"
+    curl -L --fail --progress-bar -o "$TMP_TAR" "$KOKORO_URL"
 
-    tar -xjf "/tmp/kokoro.tar.bz2" -C "daemon/models/"
-    rm -f "/tmp/kokoro.tar.bz2"
+    tar -xjf "$TMP_TAR" -C "daemon/models/"
+    rm -f "$TMP_TAR"
 
     if [ -f "$KOKORO_DIR/model.onnx" ]; then
         echo "     Kokoro model ✓  (82 M params, 24 kHz, 11 voices)"
     else
-        echo "     ⚠️  Kokoro download failed — will use macOS 'say' as fallback"
+        echo "     ⚠️  Kokoro download failed — DEMASCAS will have no neural voice"
     fi
 else
     echo "     Kokoro model ✓"
 fi
+
+# ── 3d. Speech detector (Silero VAD, 644 KB) — tells a human voice from
+#        fans/typing/music, and powers barge-in at a normal speaking voice.
+echo "[3d/5] Checking speech detector model..."
+VAD_MODEL="daemon/models/silero_vad.onnx"
+if [ ! -f "$VAD_MODEL" ]; then
+    curl -L --progress-bar -o "$VAD_MODEL" \
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx" \
+        || echo "     ⚠️  VAD download failed — falling back to loudness-based listening"
+fi
+[ -f "$VAD_MODEL" ] && echo "     Silero VAD ✓"
 
 # ── 4. Install Python dependencies ──────────────────────────────────
 
 echo "[4/5] Checking Python dependencies..."
 VENV_DIR="$(cd "$PROJECT_ROOT/.." && pwd)/venv"
 
-if [ -d "$VENV_DIR" ]; then
-    source "$VENV_DIR/bin/activate"
-    pip install -q flask 2>/dev/null
-    echo "     Flask ✓ (venv)"
-else
-    echo "     ⚠️  No venv found at $VENV_DIR — install flask manually"
+if [ ! -d "$VENV_DIR" ]; then
+    # Arch's system Python is "externally managed" (PEP 668): never pip
+    # install into it — make the project venv instead.
+    echo "     Creating virtual environment at $VENV_DIR ..."
+    python3 -m venv "$VENV_DIR"
 fi
+source "$VENV_DIR/bin/activate"
+pip install -q --upgrade pip
+pip install -q -r requirements.txt
+echo "     Python packages ✓ (venv)"
 
 # ── 5. Build C++ daemon ─────────────────────────────────────────────
 
@@ -136,12 +182,14 @@ echo "[5/5] Building C++ daemon..."
 mkdir -p daemon/build
 cd daemon/build
 
-cmake .. \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release)
+if [ "$OS" = "Darwin" ]; then
+    CMAKE_ARGS+=(-DCMAKE_OSX_ARCHITECTURES=arm64)
+fi
+cmake .. "${CMAKE_ARGS[@]}" \
     2>&1 | grep -E "^(--|Fetching|Configuring|Building|\\[)" || true
 
-NPROC=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 cmake --build . --config Release -j"$NPROC"
 
 cd "$PROJECT_ROOT"

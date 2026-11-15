@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -62,7 +63,8 @@ public:
     std::string fast_chat_streaming(const std::string& user_msg,
                                      ToolBridge& bridge,
                                      SentenceCallback on_sentence,
-                                     std::atomic<bool>& cancel);
+                                     std::atomic<bool>& cancel,
+                                     const std::string& knowledge = "");
 
     /// Streaming full-path: ReAct loop + sentence-by-sentence TTS.
     std::string chat_with_tools_streaming(const std::string& user_msg,
@@ -158,7 +160,18 @@ public:
 
     DeepIntentAction parse_deep_intent(const std::string& raw_text) const;
 
+    /// The ~14 most-used tools, listed in the CACHED part of the tool prompt
+    /// (per-command tools used to change the prompt's middle, so the model
+    /// re-read ~half of it on every command).  Set once at startup.
+    void set_core_tools(const nlohmann::json& schemas);
+
+    /// "timeout" when the last LLM call hit its deadline, else "".
+    const std::string& last_error() const { return last_error_; }
+
 private:
+    std::string core_tools_text_;
+    std::set<std::string> core_tool_names_;
+    std::string last_error_;
     /// Build the agentic system prompt with tool list embedded as text.
     nlohmann::json build_tool_prompt(const nlohmann::json& tool_schemas,
                                       ToolBridge& bridge,

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 import time
 
@@ -205,6 +206,11 @@ def cmd_doctor(args) -> int:
         print("Context  : " + warn)
     if cfg.vision.model:
         print(f"Vision   : {cfg.vision.model} ({cfg.vision.chat_url})")
+    try:
+        from core.finetune import adapters
+        print("Learning : " + adapters.status_line(cfg))
+    except Exception:
+        pass
     if up and args.bench:
         print("Speed    : " + benchmark.run(cfg).summary())
     return EXIT_OK if up else EXIT_UNREACHABLE
@@ -227,8 +233,76 @@ def cmd_llm_check(args) -> int:
         from urllib.parse import urlparse
         print(cfg.model)
         print(urlparse(cfg.chat_url).port or 8081)
+        ad = cfg.adapter_path        # 3rd line: learned LoRA adapter (or empty)
+        print(ad if ad and os.path.exists(os.path.join(ad, "adapters.safetensors")) else "")
         return EXIT_MLX_AUTOSTART
     return EXIT_UNREACHABLE
+
+
+def cmd_learn(args) -> int:
+    from core.finetune import scheduler
+    ok, why = scheduler.ready(force=True)
+    if not ok:
+        print(f"Not training: {why}.")
+        return EXIT_OK
+    print("Fine-tuning on your verified DEMASCAS experience (Ctrl+C to stop)...")
+    r = scheduler.run_once(force=True)
+    print(("✓ Adopted " if r.get("adopted") else "Kept the current model: ")
+          + str(r.get("reason", "")))
+    if r.get("adopted"):
+        print("  Restart DEMASCAS (scripts/run.sh) to load it.")
+    return EXIT_OK
+
+
+def cmd_adapters(args) -> int:
+    from core.finetune import adapters
+    rows = adapters.list_all()
+    print("Learning : " + adapters.status_line(settings.load()))
+    if not rows:
+        print("No adapters trained yet.")
+    for r in rows:
+        m = (r.get("metrics") or {}).get("adapter") or {}
+        acc = f"tool acc {m.get('tool_acc', 0):.0%}, {m.get('tok_s', 0):.1f} tok/s" if m else ""
+        print(f"{'*' if r['active'] else ' '} {r['version']:4s} "
+              f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(r.get('created', 0)))}  "
+              f"{r.get('samples', 0):4d} examples  {'adopted' if r.get('adopted') else 'rejected'}  "
+              f"{acc}  {r.get('reason', '')}")
+    return EXIT_OK
+
+
+def cmd_rollback(args) -> int:
+    from core.finetune import adapters
+    target = adapters.rollback()
+    print(f"Active: {target or 'base model'}.  Restart DEMASCAS to apply.")
+    return EXIT_OK
+
+
+def cmd_web(args) -> int:
+    from core.web import crawler, store
+    st = store.stats()
+    print(f"Web knowledge : {st['chunks']} notes from {st['pages']} pages on {st['sites']} sites "
+          f"(cap {st['max_chunks']})")
+    s = crawler._state()
+    print("Following     : " + (", ".join(f"{t} (every {int(w['every_hours'])} h)" for t, w in s["watch"].items())
+                                or "nothing — say 'keep an eye on <topic>'"))
+    print("To research   : " + ("; ".join(s["queue"][:5]) or "nothing queued"))
+    cfg = crawler.settings()
+    print(f"Background    : {'on' if cfg['auto_research'] else 'off'} (idle only, "
+          f"≤ {cfg['max_pages_per_hour']} pages/hour; set web.auto_research in config.json)")
+    return EXIT_OK
+
+
+def cmd_skills(args) -> int:
+    from core.skills.store import get_store
+    if getattr(args, "prune", False):
+        from core.skills.induce import prune_unsafe_learned
+        gone = prune_unsafe_learned()
+        print(f"Disabled {len(gone)} skill(s): {gone}" if gone else "Nothing to prune.")
+    for sk in sorted(get_store().skills.values(), key=lambda s: (s.source, s.name)):
+        st = sk.stats
+        print(f"{sk.source:8s} {sk.status:9s} {sk.name[:50]:50s} "
+              f"used {st.get('uses', 0)}x, {st.get('successes', 0)} ok, avg {sk.avg_ms / 1000:.1f} s")
+    return EXIT_OK
 
 
 def main(argv: list[str]) -> int:
@@ -243,9 +317,17 @@ def main(argv: list[str]) -> int:
     d.add_argument("--bench", action="store_true", help="also measure model speed")
     sub.add_parser("detect", help="list detected runtimes as JSON")
     sub.add_parser("llm-check", help="(internal) used by scripts/run.sh")
+    sub.add_parser("learn", help="fine-tune the model on what DEMASCAS learned, now")
+    sub.add_parser("adapters", help="list learned model adapters")
+    sub.add_parser("rollback", help="go back to the previous adapter (or the base model)")
+    sub.add_parser("web", help="what DEMASCAS has read on the web, and what it follows")
+    sk = sub.add_parser("skills", help="list learned and taught skills")
+    sk.add_argument("--prune", action="store_true",
+                    help="disable learned skills that replay typing/sending or settings changes")
     args = ap.parse_args(argv)
     return {"setup": cmd_setup, "doctor": cmd_doctor, "detect": cmd_detect,
-            "llm-check": cmd_llm_check}[args.cmd](args)
+            "llm-check": cmd_llm_check, "learn": cmd_learn, "adapters": cmd_adapters,
+            "rollback": cmd_rollback, "skills": cmd_skills, "web": cmd_web}[args.cmd](args)
 
 
 if __name__ == "__main__":

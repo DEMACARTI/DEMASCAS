@@ -213,15 +213,17 @@ Fourth state in the state machine: `SLEEPING → LISTENING → PROCESSING → CO
 
 ## Prerequisites
 
-| Requirement | How to Get It |
-|-------------|--------------|
-| **macOS** (Apple Silicon required) | — |
-| **Python 3.10+** | `brew install python@3.12` |
-| **Homebrew** | [brew.sh](https://brew.sh) |
-| **CMake 3.20+** | `brew install cmake` |
-| **PortAudio** | `brew install portaudio` |
-| **pkg-config** | `brew install pkg-config` |
-| **Microphone** | Built-in or external |
+`scripts/build.sh` installs the system packages for you (Homebrew on macOS, `pacman` on Arch, `apt`/`dnf` on Debian/Ubuntu/Fedora). For reference:
+
+| Requirement | macOS (Apple Silicon) | Arch Linux |
+|-------------|--------------|--------------|
+| **Python 3.10+** | `brew install python@3.12` | `sudo pacman -S python` |
+| **Package manager** | [Homebrew](https://brew.sh) | `pacman` (built in) |
+| **Compiler + CMake 3.20+** | Xcode Command Line Tools + `brew install cmake` | `sudo pacman -S base-devel cmake` |
+| **PortAudio** (mic + speaker) | `brew install portaudio` | `sudo pacman -S portaudio` |
+| **speexdsp** (echo cancellation) | `brew install speexdsp` | `sudo pacman -S speexdsp` |
+| **pkg-config, curl, lsof** | `brew install pkg-config` | `sudo pacman -S pkgconf curl bzip2 lsof git` |
+| **Microphone** | Built-in or external | Built-in or external (PipeWire or PulseAudio) |
 | **Brave Browser** (for web tools) | [brave.com](https://brave.com) — then enable **View → Developer → Allow JavaScript from Apple Events** (all `browser_*` / web-agent tools need it) |
 
 > **Note:** Ollama is **not** required. PDF summaries use the MLX text server; if the optional `ollama` package is installed it is only used as a fallback when MLX is unreachable.
@@ -241,6 +243,8 @@ Go to **System Settings → Privacy & Security** and grant:
 
 ## Installation
 
+> **Arch Linux status:** the voice pipeline (wake word, speech recognition, Kokoro voice, interrupting), the plug-in LLM, chat, skills, document creation and web research are built to run on Linux. Controlling apps (clicking, typing, menus, app learning, chat messages) still uses macOS-only APIs. Linux builds aren't tested in CI yet — please report problems.
+
 ### 1. Clone & enter the project
 
 ```bash
@@ -256,6 +260,8 @@ python3 -m venv ../venv
 source ../venv/bin/activate
 pip install -r requirements.txt
 ```
+
+On Arch, always use the venv. The system Python is "externally managed", so a plain `pip install` outside it is refused. `scripts/build.sh` creates the venv for you if it's missing.
 
 > `requirements.txt` includes `pyautogui` (macOS only) for the vision fallback's coordinate clicks/typing.
 
@@ -282,24 +288,37 @@ Typical recommendations (balanced mode, latency-first):
 
 No runtime yet? The setup prints exact install steps — e.g. Ollama (`brew install ollama` / `winget install Ollama.Ollama` / `curl -fsSL https://ollama.com/install.sh | sh`, then `ollama pull qwen2.5:3b`) or, on Apple Silicon, MLX (`pip install mlx-lm`; `scripts/run.sh` then starts the MLX server for you).
 
+On **Arch Linux**, install Ollama from the official repos. Pick the package for your GPU, start the service, then pull a model:
+
+```bash
+sudo pacman -S ollama          # CPU only
+sudo pacman -S ollama-cuda     # NVIDIA GPU (e.g. RTX 5060)
+sudo pacman -S ollama-rocm     # AMD GPU
+sudo systemctl enable --now ollama
+ollama pull qwen2.5:7b         # 8 GB VRAM; use qwen2.5:3b on CPU-only machines
+python main.py setup --yes
+```
+
 > **Context window:** DEMASCAS's tool prompt needs ≥ 4096 tokens. Ollama's default is 4096; 8192 is better for long tasks (`OLLAMA_CONTEXT_LENGTH=8192`). `setup`/`doctor` warn if yours is smaller.
 
 ### 4. Build the C++ daemon
 
-The build script handles everything — dependencies, model downloads, and compilation:
+The build script handles everything — dependencies, model downloads, and compilation — on macOS and Linux:
 
 ```bash
 chmod +x scripts/build.sh scripts/run.sh
 ./scripts/build.sh
 ```
 
+On Arch it asks for your `sudo` password once, to install any missing packages with `pacman -S --needed`.
+
 This will:
-1. Check / install CMake, PortAudio, pkg-config via Homebrew
+1. Detect the system and install missing CMake, pkg-config, PortAudio, speexdsp (and on Linux: `base-devel`, `curl`, `lsof`) via Homebrew / pacman / apt / dnf
 2. Download whisper GGML models (~75 MB tiny + ~147 MB base) to `daemon/models/`
-3. Download sherpa-onnx pre-built library (universal2 arm64+x86\_64)
-4. Download Kokoro-en-v0\_19 neural TTS model (~335 MB) to `daemon/models/`
-5. Install Flask for the Python tool server
-6. Compile the C++ daemon via CMake (Release, ARM64)
+3. Download the sherpa-onnx pre-built library for your system (macOS universal2, Linux x86\_64 or aarch64)
+4. Download Kokoro-en-v0\_19 neural TTS model (~335 MB) and the Silero speech detector (644 KB) to `daemon/models/`
+5. Create `../venv` if needed and install `requirements.txt` into it
+6. Compile the C++ daemon via CMake (Release; arm64 on macOS, native on Linux)
 
 On success you'll see:
 
@@ -423,9 +442,12 @@ python main.py
 
 ```bash
 cd ~/Desktop/OS_RAG/DEMASCAS/daemon
-export DYLD_LIBRARY_PATH="$PWD/models/sherpa-onnx/lib:${DYLD_LIBRARY_PATH:-}"
+export DYLD_LIBRARY_PATH="$PWD/models/sherpa-onnx/lib:${DYLD_LIBRARY_PATH:-}"   # macOS
+export LD_LIBRARY_PATH="$PWD/models/sherpa-onnx/lib:${LD_LIBRARY_PATH:-}"       # Linux (Arch)
 ./build/demascas_daemon
 ```
+
+On Arch, if the daemon can't open the microphone, check that PipeWire's audio server is running (`systemctl --user status pipewire pipewire-pulse`). Install `pipewire-alsa` or `pipewire-pulse` if PortAudio lists no input devices.
 
 ```
 [✓] Microphone opened (16 kHz mono)

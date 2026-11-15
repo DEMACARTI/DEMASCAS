@@ -44,6 +44,12 @@ public:
     /// Set initial prompt context for better recognition.
     void set_prompt(const std::string& prompt);
 
+    /// How sure whisper was about its LAST transcription: mean probability of
+    /// the text tokens (0..1) and the share of tokens below 0.3.  Garbled or
+    /// background speech ("Library Blathoreshar February Flodley") scores low.
+    float last_confidence() const { return last_conf_; }
+    float last_unsure_share() const { return last_unsure_; }
+
     /// CPU threads for decoding (hardware-aware, from GET /llm).
     void set_threads(int n) { n_threads_ = n > 0 ? n : 4; }
 
@@ -54,6 +60,8 @@ private:
                          int audio_ctx);
 
     std::string prompt_;
+    float last_conf_ = 1.0f;
+    float last_unsure_ = 0.0f;
     int n_threads_ = 4;
 
     struct whisper_context* tiny_ = nullptr;

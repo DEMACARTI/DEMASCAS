@@ -484,6 +484,15 @@ def get_knowledge_context(query: str) -> str:
     except Exception:
         pass
 
+    # What DEMASCAS has read on the web
+    try:
+        from core.web.store import context_block
+        web = context_block(query, max_chars=700, k=2)
+        if web:
+            parts.append(web)
+    except Exception:
+        pass
+
     # Relevant corrections
     try:
         corrections = get_relevant_corrections(query, top_k=2)

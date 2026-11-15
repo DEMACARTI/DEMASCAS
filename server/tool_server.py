@@ -25,7 +25,10 @@ import logging
 import re
 import secrets
 import signal
+import subprocess
 import threading
+import logging as _logging
+_logging.getLogger("primp").setLevel(_logging.WARNING)   # web-search request spam
 import time
 
 # Ensure the DEMASCAS package root is on the path so we can import
@@ -111,6 +114,17 @@ from actuators.web_agent import (
     web_ecommerce_search,
 )
 from core.screen_context import get_screen_context_block, get_screen_digest
+from actuators.app_script import (
+    run_app_script, is_destructive as _script_is_destructive, click_menu_item, is_risky_menu,
+)
+from core.appknowledge.learner import learn_app, guide_app
+from actuators.messaging import deliver_chat_message
+from core.web.crawler import (
+    research_web, scrape_webpage, watch_topic, unwatch_topic, web_knowledge, forget_web,
+)
+from actuators.documents import (
+    create_presentation, edit_presentation, create_document, create_spreadsheet,
+)
 from core.utils import resolve_safe_path
 
 logger = logging.getLogger(__name__)
@@ -286,6 +300,25 @@ TOOL_MAP = {
     "web_youtube_search":        web_youtube_search,
     "web_youtube_play_first":    web_youtube_play_first,
     "web_ecommerce_search":      web_ecommerce_search,
+    # ── Documents (built as files, opened in the user's apps) ────────
+    "create_presentation":       create_presentation,
+    "edit_presentation":         edit_presentation,
+    "create_document":           create_document,
+    "create_spreadsheet":        create_spreadsheet,
+    # ── App scripting (the app's own dictionary, guarded) ────────────
+    "run_app_script":            run_app_script,
+    "click_menu_item":           click_menu_item,
+    "learn_app":                 learn_app,
+    "guide_app":                 guide_app,
+    # ── Chat messages (read back, send only on a spoken yes) ─────────
+    "deliver_chat_message":      deliver_chat_message,
+    # ── Web knowledge (scraped, stored, reused in every task) ────────
+    "research_web":              research_web,
+    "scrape_webpage":            scrape_webpage,
+    "watch_topic":               watch_topic,
+    "unwatch_topic":             unwatch_topic,
+    "web_knowledge":             web_knowledge,
+    "forget_web":                forget_web,
 }
 
 # ── Result helpers ───────────────────────────────────────────────────
@@ -341,7 +374,7 @@ def _parse_result(obj):
 # daemon asks the user.  Only POST /confirm with that token executes it,
 # so a model can't "confirm" on its own by passing extra arguments.
 
-CONFIRM_REQUIRED_TOOLS = frozenset({"delete_file"})
+CONFIRM_REQUIRED_TOOLS = frozenset({"delete_file", "deliver_chat_message"})
 _CONFIRM_TTL_SEC = 120
 _PENDING: dict[str, dict] = {}
 _PENDING_LOCK = threading.Lock()
@@ -368,6 +401,13 @@ def _describe_action(tool: str, args: dict) -> str:
     if tool == "delete_file":
         path = str(args.get("file_path", "that file"))
         return f"Move {os.path.basename(path.rstrip('/')) or path} to the Trash?"
+    if tool == "deliver_chat_message":
+        return f"Send '{args.get('text', '')}' to {args.get('contact', 'them')} on {args.get('app', 'the app')}?"
+    if tool == "click_menu_item":
+        return f"In {args.get('app_name', 'the app')}, click {args.get('menu_path', 'that menu item')}?"
+    if tool == "run_app_script":
+        first = str(args.get("script", "")).strip().splitlines()[0][:80] if args.get("script") else ""
+        return f"In {args.get('app_name', 'the app')}, run \"{first}\"? It changes or closes something."
     return f"Run {tool.replace('_', ' ')}?"
 
 
@@ -439,6 +479,61 @@ def _get_tool_args(func, raw_args: dict) -> dict:
     return cleaned
 
 
+def _would_send_in_chat_app(name: str, args: dict) -> bool:
+    """Enter / submit while a chat app is in front sends a message to real
+    people — outside the read-back flow it needs a spoken yes."""
+    sends = name == "type_and_submit" or (
+        name == "press_keyboard_shortcut"
+        and re.fullmatch(r"\s*(return|enter)\s*", str(args.get("keys", "")), re.I))
+    if not sends:
+        return False
+    try:
+        from core.axui import frontmost_app
+        from actuators.messaging import is_chat_app
+        return is_chat_app(frontmost_app())
+    except Exception:
+        return False
+
+
+def _send_chat_message_tool(app: str = "", contact: str = "", text: str = "") -> dict:
+    """Open the chat, verify it, type the exact text, then ask before sending."""
+    from actuators.messaging import prepare_chat_message, is_chat_app, CHAT_APPS
+    if not app:
+        active = str(ACTIVE_CONTEXT.get("active_app", ""))
+        running = [a for a in CHAT_APPS if _app_running(a)]
+        app = active if is_chat_app(active) else (running[0] if len(running) == 1 else "")
+        if not app:
+            return {"success": False, "message": f"Which app should I use to message {contact or 'them'}?"}
+    if not text:
+        return {"success": False, "message": f"What should I say to {contact or 'them'}?"}
+    prep = prepare_chat_message(app, contact, text)
+    if not prep.get("success"):
+        return prep
+    args = {"app": prep["app"], "contact": prep["contact"], "text": prep["text"]}
+    return _create_pending("deliver_chat_message", args, _describe_action("deliver_chat_message", args))
+
+
+def _message_contact_tool(request: str) -> dict:
+    """Skill entry point: understand "send hi to Hatem on Discord" and run
+    the read-back-then-send flow."""
+    from actuators.messaging import parse_request
+    p = parse_request(request)
+    if not p["contact"]:
+        return {"success": False, "message": "Who should I message?"}
+    return _send_chat_message_tool(p["app"], p["contact"], p["text"])
+
+
+def _app_running(app: str) -> bool:
+    try:
+        return subprocess.run(["pgrep", "-x", app], capture_output=True, timeout=2).returncode == 0
+    except Exception:
+        return False
+
+
+TOOL_MAP["send_chat_message"] = _send_chat_message_tool
+TOOL_MAP["message_contact"] = _message_contact_tool
+
+
 def _dispatch_native(name: str, args: dict, *, confirmed: bool = False) -> tuple[str, bool, object]:
     """Run a native tool.  Returns (serialized_result, failed, raw_result).
     Destructive tools return a pending-confirmation request unless
@@ -452,7 +547,12 @@ def _dispatch_native(name: str, args: dict, *, confirmed: bool = False) -> tuple
                "available when the tool server runs in Docker/Linux.")
         return msg, True, None
 
-    if name in CONFIRM_REQUIRED_TOOLS and not confirmed:
+    needs_yes = name in CONFIRM_REQUIRED_TOOLS or _would_send_in_chat_app(name, args) or (
+        name == "run_app_script" and _script_is_destructive(str(args.get("script", "")))) or (
+        name == "click_menu_item" and is_risky_menu(str(args.get("menu_path", "")))) or (
+        name in ("find_and_click", "click_ui_element")
+        and is_risky_menu(str(args.get("search_text") or args.get("element_name") or "")))
+    if needs_yes and not confirmed:
         pending = _create_pending(name, args, _describe_action(name, args))
         return _serialize_result(pending), False, pending
 
@@ -727,6 +827,14 @@ def _normalize_user_command(command: str) -> str:
     # Study routine should map clearly to workflow behavior
     if re.search(r"\bstudy routine\b", text, re.IGNORECASE) and "workflow" not in text.lower():
         text = text + " workflow"
+
+    # Names the user taught / apps DEMASCAS learned ("this cord" → "Discord"),
+    # and DEMASCAS's own name (heard as "Damascus").
+    try:
+        from core.vocabulary import apply_corrections
+        text = apply_corrections(text)
+    except Exception:
+        pass
 
     fixed = text.strip()
     if fixed != original:
@@ -1011,6 +1119,25 @@ def _allowed_hosts() -> set[str]:
     return _DEFAULT_ALLOWED_HOSTS | {h.strip().lower() for h in extra.split(",") if h.strip()}
 
 
+_USER_ACTIVITY_PATHS = ("/skill/match", "/agent", "/tool", "/execute", "/feedback")
+
+
+@app.before_request
+def _note_user_activity():
+    """A command is arriving → background fine-tuning must yield NOW."""
+    if request.path.startswith(_USER_ACTIVITY_PATHS):
+        try:
+            from core.finetune.scheduler import note_activity
+            note_activity()
+        except Exception:
+            pass
+        try:
+            from core.web.crawler import note_activity as web_activity
+            web_activity()               # background web research yields too
+        except Exception:
+            pass
+
+
 @app.before_request
 def _guard_request():
     host = (request.host or "").lower()
@@ -1136,6 +1263,13 @@ def _run_and_track(name: str, args: dict, *, confirmed: bool = False) -> tuple[s
     """Dispatch a native tool, then update active context + auto-learning."""
     result, failed, raw = _dispatch_native(name, args, confirmed=confirmed)
     _update_context(name, args, raw if raw is not None else result, success=not failed)
+    if name == "open_application" and (failed or str(result).startswith("Failed")):
+        _LAST_UNRESOLVED.update(name=str(args.get("app_name", "")), ts=time.time())
+    try:
+        from core.skills.trajectories import note_tool_call
+        note_tool_call(name, args, result, not failed)
+    except Exception:
+        pass
     if not failed:
         try:
             from core.knowledge import auto_save_from_tool_result
@@ -1143,6 +1277,170 @@ def _run_and_track(name: str, args: dict, *, confirmed: bool = False) -> tuple[s
         except Exception:
             pass
     return result, failed, raw
+
+
+# ── Skills: learned procedures (fast path before agents) ─────────────
+
+_PENDING_SKILL: dict = {}       # skill waiting for a missing parameter
+_LAST_UNRESOLVED: dict = {}     # last app name that couldn't be opened (for "I meant X")
+
+
+@app.route("/vocabulary", methods=["GET"])
+def vocabulary_endpoint():
+    """Words the speech recogniser should expect (taught words, learned apps)."""
+    from core.vocabulary import terms
+    return jsonify({"terms": terms()}), 200
+
+
+def _skill_dispatch(name: str, args: dict):
+    """Dispatcher used by skills.  "__command__" steps (taught skills) run a
+    whole sub-command: another skill if one matches, else the agents."""
+    if name == "__command__":
+        sub = str(args.get("command", ""))
+        from core.skills import runner
+        m = runner.match(sub)
+        if m and not m.missing and m.skill.id != "__teach__":
+            r = runner.run(m.skill, m.params, _skill_dispatch)
+            return r.summary, not r.success, {"message": r.summary}
+        if _AGENTS_AVAILABLE:
+            ar = run_agent(sub, dict(ACTIVE_CONTEXT))
+            return ar.summary, not ar.success, {"message": ar.summary}
+        return f"[-] Can't run: {sub}", True, None
+    canon, cargs = _normalize_tool_call(name, args or {})
+    return _run_and_track(canon, cargs)
+
+
+@app.route("/skill/match", methods=["POST"])
+def skill_match_endpoint():
+    """Find a learned/built-in skill for a command (and fill its params).
+    Response: {matched, skill_id, name, params, ack, ask, done, summary}"""
+    data = request.get_json(silent=True) or {}
+    raw_command = str(data.get("command", "")).strip()
+    command = _normalize_user_command(raw_command)
+    if not command:
+        return jsonify({"matched": False}), 200
+    from core.skills import induce, runner
+
+    # "When I say X, do Y and Z" → learn it right now (raw text: the
+    # autocorrector's rewrites must not leak into the taught steps).
+    if induce.parse_teaching(raw_command):
+        sk = induce.teach(raw_command)
+        if sk:
+            n = len(sk.steps)
+            return jsonify({"matched": True, "done": True, "skill_id": sk.id, "name": sk.name,
+                            "summary": f"Got it. When you say {sk.name}, I'll do those "
+                                       f"{n} thing{'s' if n != 1 else ''}."}), 200
+
+    # "It's spelled DISCORD" / "I meant Discord" → learn the word now and
+    # map the last misheard name to it.  If the command also asks for
+    # something ("open Discord, spell it DISCORD"), carry on with that.
+    note = ""
+    from core import vocabulary
+    taught = vocabulary.parse_teaching(raw_command)
+    if taught:
+        vocabulary.add_term(taught)
+        heard = _LAST_UNRESOLVED.get("name", "")
+        if heard and time.time() - _LAST_UNRESOLVED.get("ts", 0) < 600:
+            vocabulary.add_correction(heard, taught)
+            _LAST_UNRESOLVED.clear()
+        note = f"Got it — {taught}. I'll remember that."
+        command = vocabulary.apply_corrections(command)
+        rest = re.sub(r"(?i)[,;]?\s*(?:and\s+)?(?:please\s+)?(?:spell(?:ed|t)?\b.*|it'?s\s+(?:spelled|spelt|called)\b.*|"
+                      r"i\s+meant\b.*|(?:and\s+)?i\s+want\s+you\s+to\s+remember\b.*|remember\s+(?:it|that|this)\b.*)$",
+                      "", command).strip(" ,.")
+        if len(rest.split()) < 2:     # nothing else asked
+            return jsonify({"matched": True, "done": True, "skill_id": "vocabulary",
+                            "name": "Learn a word", "summary": note, "command": command}), 200
+        command = rest
+
+    m = runner.match(command)
+
+    # Answer to a question we asked for a missing parameter?
+    if m is None and _PENDING_SKILL and time.time() - _PENDING_SKILL.get("ts", 0) < 60:
+        pend = dict(_PENDING_SKILL)
+        _PENDING_SKILL.clear()
+        from core.skills.store import get_store
+        sk = get_store().skills.get(pend["skill_id"])
+        if sk:
+            value = re.sub(r"^(?:it'?s\s+|about\s+|on\s+|for\s+|the\s+topic\s+is\s+)", "",
+                           command, flags=re.I).strip(" .")
+            params = dict(pend["params"])
+            params[pend["missing"][0]] = value
+            missing = [k for k in pend["missing"][1:] if k not in params]
+            m = runner.SkillMatch(sk, 1.0, params, missing)
+    if m is None:
+        # No skill: say where the command should go (chat vs action) so the
+        # daemon never answers an action request with small talk.
+        try:
+            from core.routing import route
+            r = route(command)
+        except Exception:
+            r = ""
+        # What DEMASCAS has read on the web about this (≈1 ms, in memory) —
+        # handed to whichever path answers, so the chat model stops guessing.
+        try:
+            from core.web.store import context_block
+            knowledge = context_block(command, max_chars=800, k=3)
+        except Exception:
+            knowledge = ""
+        return jsonify({"matched": False, "route": r, "command": command, "note": note,
+                        "knowledge": knowledge}), 200
+
+    if m.missing:
+        _PENDING_SKILL.update(skill_id=m.skill.id, params=m.params, missing=m.missing, ts=time.time())
+        spec = m.skill.params[m.missing[0]]
+        ask = spec.get("ask") or f"Sure — {spec.get('description', m.missing[0])}?"
+        return jsonify({"matched": True, "skill_id": m.skill.id, "name": m.skill.name,
+                        "ask": ask, "command": command}), 200
+    ack = runner.say_fmt(m.skill.ack, m.params) if m.skill.ack else ""
+    return jsonify({"matched": True, "skill_id": m.skill.id, "name": m.skill.name,
+                    "score": round(m.score, 3), "params": m.params, "ack": ack,
+                    "command": command}), 200
+
+
+@app.route("/skill/run", methods=["POST"])
+def skill_run_endpoint():
+    data = request.get_json(silent=True) or {}
+    from core.skills import runner
+    from core.skills.store import get_store
+    sk = get_store().skills.get(str(data.get("skill_id", "")))
+    if sk is None:
+        return jsonify({"success": False, "summary": "I don't know that skill."}), 200
+    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+    r = runner.run(sk, params, _skill_dispatch)
+    out = {"success": r.success, "summary": r.summary, "tool_calls": r.tool_calls, "ms": round(r.ms)}
+    if r.pending:
+        out.update(confirm_token=r.pending.get("confirm_token", ""),
+                   confirm_speech=r.pending.get("confirm_speech", ""),
+                   pending_tool=r.pending.get("pending_tool", ""))
+    return jsonify(out), 200
+
+
+@app.route("/feedback", methods=["POST"])
+def feedback_endpoint():
+    """User judged the previous result ("good job" / "that's wrong")."""
+    data = request.get_json(silent=True) or {}
+    positive = bool(data.get("positive"))
+    from core.skills import trajectories, runner
+    t = trajectories.set_feedback(positive)
+    if t and positive and not t.get("skill_id"):
+        # Praise is the strongest signal: learn this run now (skipping the
+        # two-sightings rule), if it's safe skill material.
+        try:
+            from core.skills import induce
+            induce.induce_from_trajectory(t, set(TOOL_MAP), praised=True)
+        except Exception as e:
+            print(f"[LEARN] praise-induction skipped: {e}")
+    if t and t.get("skill_id"):
+        if positive:
+            from core.skills.store import get_store
+            sk = get_store().skills.get(t["skill_id"])
+            if sk:
+                sk.stats["verified_reuses"] = sk.stats.get("verified_reuses", 0) + 1
+                get_store().save(sk)
+        else:
+            runner.penalize(t["skill_id"])
+    return jsonify({"status": "ok", "applied_to": (t or {}).get("command", "")}), 200
 
 
 @app.route("/confirm", methods=["POST"])
@@ -1157,6 +1455,11 @@ def confirm_endpoint():
     if pending is None or time.time() - pending["created"] > _CONFIRM_TTL_SEC:
         return jsonify({"result": "[-] That confirmation has expired.", "success": False}), 200
     if not approve:
+        if pending["tool"] == "deliver_chat_message":
+            # "No" to a chat message: don't leave the typed draft behind.
+            from actuators.messaging import discard_chat_draft
+            r = discard_chat_draft(**{k: pending["args"].get(k, "") for k in ("app", "contact", "text")})
+            return jsonify({"result": r["message"], "success": True}), 200
         return jsonify({"result": "Cancelled.", "success": True}), 200
     result, failed, _ = _run_and_track(pending["tool"], pending["args"], confirmed=True)
     return jsonify({"result": result, "success": not failed}), 200
@@ -1166,6 +1469,20 @@ def confirm_endpoint():
 def get_tool_schemas():
     """Return ALL tool schemas (native + MCP) in Ollama format."""
     return jsonify(_all_tool_schemas())
+
+
+# The tools nearly every command needs — listed in the CACHED part of the
+# daemon's tool prompt.  Fixed order: any change here invalidates the cache.
+CORE_TOOLS = ("open_application", "quit_application", "open_url", "search_web",
+              "press_keyboard_shortcut", "type_text", "find_and_click", "get_active_window_tree",
+              "click_menu_item", "find_file", "open_file", "save_memory", "set_preference",
+              "retrieve_memories", "research_web")
+
+
+@app.route("/tools_core", methods=["GET"])
+def tools_core_endpoint():
+    by_name = {s["function"]["name"]: s for s in _all_tool_schemas() if "function" in s}
+    return jsonify([by_name[n] for n in CORE_TOOLS if n in by_name])
 
 
 @app.route("/tools_for_query", methods=["POST"])
@@ -1485,17 +1802,12 @@ def get_learned_context():
     Query params:
       ?query=open+chrome   — the user's command (URL-encoded)
     """
-    from core.learning import get_context_for_http, get_all_macros_for_rag
+    from core.learning import get_context_for_http
     query = request.args.get("query", "")
     if not query:
         return jsonify({"context_text": "", "profile_summary": ""})
     try:
         ctx = get_context_for_http(query)
-        # Append macro context if available
-        macro_ctx = get_all_macros_for_rag(query)
-        if macro_ctx:
-            existing = ctx.get("context_text", "")
-            ctx["context_text"] = (existing + "\n\n" + macro_ctx).strip() if existing else macro_ctx
         # Append knowledge context (procedures, facts, corrections)
         try:
             from core.knowledge import get_knowledge_context
@@ -1553,7 +1865,35 @@ def _record_learning(data: dict) -> None:
     """Background half of /learn (see _LEARN_EXECUTOR)."""
     ACTIVE_CONTEXT["last_command"] = str(data.get("command", ""))[:300]
     ACTIVE_CONTEXT["last_reply"] = str(data.get("result", ""))[:300]
-    from core.learning import after_command, record_successful_sequence
+    # A world-knowledge question DEMASCAS couldn't answer from what it has
+    # read → researched in the background while you're idle.
+    try:
+        from core.web.crawler import note_question
+        if note_question(str(data.get("command", ""))):
+            print(f"[WEB] Queued for background research: {str(data.get('command', ''))[:60]}")
+    except Exception:
+        pass
+    # Experience → trajectory → (maybe) a new learned skill.
+    try:
+        from core.skills import trajectories, induce
+        turns = data.get("llm_turns") if isinstance(data.get("llm_turns"), list) else []
+        traj = trajectories.finish(
+            command=str(data.get("command", "")), path=str(data.get("path", "")),
+            success=bool(data.get("success", True)), reply=str(data.get("result", "")),
+            llm_turns=turns[-6:], skill_id=str(data.get("skill_id", "")))
+        if traj["success"] and traj["path"] in ("tool", "agent"):
+            induce.induce_from_trajectory(traj, set(TOOL_MAP))
+        # Learned app manuals improve with use: shortcuts / menu items that
+        # were part of a task get verified (or marked as failing).
+        from core.appknowledge import learner
+        apps = set(learner.apps_in_text(traj["command"]))
+        if ACTIVE_CONTEXT.get("active_app"):
+            apps.add(str(ACTIVE_CONTEXT["active_app"]))
+        for a in apps:
+            learner.note_outcome(a, traj["tool_calls"], traj["success"] and traj.get("feedback") != "negative")
+    except Exception as e:
+        print(f"[LEARN] skill learning skipped: {e}")
+    from core.learning import after_command
     try:
         # Keep the model warm while DEMASCAS is in use (Ollama).
         from core.config import LLM
@@ -1573,16 +1913,8 @@ def _record_learning(data: dict) -> None:
             success=success,
         )
 
-        # Record multi-step sequences for macro promotion
-        if success and len(tools_used) >= 2:
-            try:
-                record_successful_sequence(
-                    command=data["command"],
-                    tools_used=tools_used,
-                    result=data.get("result", ""),
-                )
-            except Exception:
-                pass  # non-fatal
+        # (Multi-step successes now become skills — see core/skills/induce.py,
+        #  called above.  The old name-only "macros" couldn't be replayed.)
 
         # Track app opens if present
         for tool in tools_used:
@@ -1663,6 +1995,30 @@ def agent_endpoint():
         }), 500
 
 
+@app.route("/agent/status", methods=["GET"])
+def agent_status_endpoint():
+    """What the running agent is doing (for "what are you doing?")."""
+    try:   # the agents run from the top-level "agents" package (see imports)
+        from agents.base_agent import PROGRESS
+    except Exception:
+        return jsonify({"running": False}), 200
+    p = dict(PROGRESS)
+    p["elapsed"] = round(time.time() - p.get("started", time.time()), 1) if p.get("running") else 0
+    return jsonify(p), 200
+
+
+@app.route("/agent/cancel", methods=["POST"])
+def agent_cancel_endpoint():
+    """Stop the running agent before its next step ("stop" / "cancel")."""
+    for mod in ("server.agents.base_agent", "agents.base_agent"):
+        try:
+            m = __import__(mod, fromlist=["CANCEL_EVENT"])
+            m.CANCEL_EVENT.set()
+        except Exception:
+            continue
+    return jsonify({"status": "cancelling"}), 200
+
+
 @app.route("/agent/route", methods=["POST"])
 def agent_route_debug():
     """
@@ -1709,6 +2065,17 @@ def _warm_up() -> None:
         get_context_for_http("warm up")
         from core.knowledge import get_knowledge_context
         get_knowledge_context("warm up")
+        from core.skills.store import get_store
+        get_store().match("warm up")          # builds the skill intent index
+        from core.routing import route
+        route("warm up")                      # builds the chat/action index
+        from core.web.store import recall, stats
+        recall("warm up")                     # loads the web-knowledge matrix
+        print(f"[✓] Web knowledge: {stats()['chunks']} notes from {stats()['pages']} pages")
+        from core.skills.induce import prune_unsafe_learned
+        pruned = prune_unsafe_learned()
+        if pruned:
+            print(f"[SKILLS] Disabled {len(pruned)} unsafe learned skill(s): {pruned}")
         print(f"[✓] Memory/embedding warm-up done in {time.time() - t0:.1f} s")
     except Exception as e:
         print(f"[!] Warm-up failed (non-fatal): {e}")
@@ -1751,6 +2118,16 @@ def run_server() -> None:
     atexit.register(_flush_learning)
     atexit.register(lambda: _LEARN_EXECUTOR.shutdown(wait=True))
     threading.Thread(target=_warm_up, name="warm-up", daemon=True).start()
+    try:   # learn into the model when idle + plugged in (see core/finetune)
+        from core.finetune.scheduler import start_background
+        start_background()
+    except Exception as e:
+        print(f"[!] Auto fine-tuning unavailable: {e}")
+    try:   # read the web while idle (see core/web/crawler.py)
+        from core.web.crawler import start_background as start_web
+        start_web()
+    except Exception as e:
+        print(f"[!] Background web research unavailable: {e}")
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
     except ValueError:

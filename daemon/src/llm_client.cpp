@@ -37,7 +37,7 @@ namespace demascas {
 namespace cfg = config;
 using json = nlohmann::json;
 
-static constexpr size_t LEARNED_CONTEXT_MAX_CHARS = 1200;
+static constexpr size_t LEARNED_CONTEXT_MAX_CHARS = 700;   // re-read on EVERY command
 
 // ── IST time helpers (UTC+5:30) ─────────────────────────────────────
 
@@ -113,10 +113,29 @@ std::string LLMClient::format_tools_as_text(const json& schemas) const {
 
 // ── System prompts ──────────────────────────────────────────────────
 
+void LLMClient::set_core_tools(const json& schemas) {
+    core_tool_names_.clear();
+    if (!schemas.is_array()) return;
+    for (const auto& s : schemas)
+        if (s.contains("function")) core_tool_names_.insert(s["function"].value("name", ""));
+    core_tools_text_ = format_tools_as_text(schemas);
+}
+
 json LLMClient::build_tool_prompt(const json& tool_schemas,
                                     ToolBridge& bridge,
                                     const std::string& learned_context) const {
-    std::string tools_text = format_tools_as_text(tool_schemas);
+    // Core tools sit in the cached (static) part; only tools this command
+    // needs beyond them go in the per-command part at the bottom.
+    json extras = json::array();
+    if (tool_schemas.is_array())
+        for (const auto& s : tool_schemas)
+            if (!s.contains("function") ||
+                !core_tool_names_.count(s["function"].value("name", "")))
+                extras.push_back(s);
+    std::string tools_text = core_tools_text_.empty() ? format_tools_as_text(tool_schemas)
+                                                      : core_tools_text_;
+    std::string extra_text = core_tools_text_.empty() ? std::string()
+                                                      : format_tools_as_text(extras);
 
     // ── STATIC CONTENT (stable across turns — maximises KV cache reuse) ──
     std::string static_content =
@@ -154,14 +173,22 @@ json LLMClient::build_tool_prompt(const json& tool_schemas,
         "Do NOT guess email addresses.\n"
         "13. EXPLICIT LEARNING: If the user explicitly asks you to remember a rule, preference, "
         "or fact (e.g. 'always use Brave', 'remember I like X'), use set_preference or save_memory. "
-        "DO NOT execute the action they mention unless they also tell you to do it right now.\n\n"
+        "DO NOT execute the action they mention unless they also tell you to do it right now.\n"
+        "14. UNCLEAR REQUESTS: if the request is garbled, a list of unrelated words, or doesn't make "
+        "sense as a request, do NOT act — reply {\"done\":true,\"say\":\"Sorry, I didn't catch that. "
+        "Could you say it again?\"}. Never open websites or delete anything based on a guess.\n"
+        "15. SCREEN: for 'what's on my screen', call get_active_window_tree with NO app_name — "
+        "it reads the app in front.\n\n"
         "OUTPUT FORMAT — reply with EXACTLY ONE JSON object per turn:\n"
         "  To call a tool:    {\"tool\":\"tool_name\",\"args\":{\"key\":\"value\"}}\n"
         "  When finished:     {\"done\":true,\"say\":\"spoken answer here\"}\n\n"
         "AVAILABLE TOOLS:\n" + tools_text;
 
     // ── DYNAMIC CONTENT (changes every turn — placed at the bottom) ──
-    std::string dynamic_content = "\n--- CURRENT CONTEXT ---\n";
+    std::string dynamic_content;
+    if (!extra_text.empty())
+        dynamic_content += "\nMORE TOOLS FOR THIS REQUEST:\n" + extra_text;
+    dynamic_content += "\n--- CURRENT CONTEXT ---\n";
     dynamic_content += "Date: " + ist_date_str() + "\n";
     dynamic_content += "Time: " + ist_time_str() + " IST\n";
 
@@ -198,9 +225,11 @@ json LLMClient::build_simple_prompt(ToolBridge& bridge) const {
         "- Understand context: if someone is introduced to you, acknowledge THEM by name.\n"
         "- The user is Daksh, your creator. Treat anyone they introduce as a friend.\n\n"
         "IMPORTANT: You are on the FAST Q&A path — you have NO tools. "
-        "If the user asks you to compose an email, click something, fill a form, "
-        "open a website, or take any OS action, say 'Let me handle that for you' "
-        "and the system will re-route to the tool path. NEVER pretend to perform actions.\n";
+        "If the user asks you to send or write a message (Discord, WhatsApp, text, email), "
+        "open or use an app, click something, fill a form, open a website, or take any "
+        "other action, reply ONLY with 'Let me handle that for you' and the system will "
+        "re-route it. NEVER say you are sending, opening or doing something, and never "
+        "say 'done' — you cannot act from here.\n";
 
     // ── DYNAMIC CONTENT (changes every turn — placed at the bottom) ──
     std::string dynamic_content = "\n--- CURRENT CONTEXT ---\n";
@@ -269,7 +298,35 @@ struct SSECtx {
     std::string buffer;        // token accumulator for sentence detection
     std::string full_text;     // all generated text
     std::string line_buffer;   // for parsing SSE lines
+    std::chrono::steady_clock::time_point t0, t_first;
+    bool got_first = false;
+    int  n_tokens = 0;
+    bool looped = false;       // generation started repeating itself → cut
+    bool timed_out = false;
+    std::set<std::string> said;   // sentences already spoken in this answer
 };
+
+/// Small models sometimes fall into a loop ("…on your slides. Still working
+/// on your slides. Still working…").  A 32-char tail seen 3+ times = loop.
+static bool is_looping(const std::string& text) {
+    if (text.size() < 160) return false;
+    const std::string tail = text.substr(text.size() - 32);
+    size_t count = 0, pos = 0;
+    while ((pos = text.find(tail, pos)) != std::string::npos) { ++count; pos += 1; }
+    return count >= 3;
+}
+
+/// Deadline: no first word in 20 s, or 45 s in total → give up honestly
+/// instead of leaving the user in silence.
+static int sse_progress_cb(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto* ctx = static_cast<SSECtx*>(userdata);
+    auto el = std::chrono::duration<float>(std::chrono::steady_clock::now() - ctx->t0).count();
+    if ((!ctx->got_first && el > 20.0f) || el > 45.0f) {
+        ctx->timed_out = true;
+        return 1;                                   // abort the transfer
+    }
+    return 0;
+}
 
 /// libcurl write callback for SSE (Server-Sent Events).
 /// MLX format: data: {"choices":[{"delta":{"content":"token"}}]}
@@ -311,13 +368,27 @@ static size_t sse_write_cb(void* ptr, size_t size, size_t nmemb,
                 std::string token = delta.value("content", "");
                 if (token.empty()) continue;
 
+                if (!ctx->got_first) {
+                    ctx->got_first = true;
+                    ctx->t_first = std::chrono::steady_clock::now();
+                }
+                ++ctx->n_tokens;
                 ctx->buffer += token;
                 ctx->full_text += token;
+                if (is_looping(ctx->full_text)) {
+                    ctx->looped = true;
+                    return 0;                       // stop the generation now
+                }
 
                 // Check for sentence boundary
                 auto [sentence, remainder] = split_sentence(ctx->buffer);
                 if (!sentence.empty()) {
-                    ctx->on_sentence(sentence);
+                    std::string key;
+                    for (char c : sentence)
+                        if (std::isalnum(static_cast<unsigned char>(c)))
+                            key += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (ctx->said.insert(key).second)   // never speak a sentence twice
+                        ctx->on_sentence(sentence);
                     ctx->buffer = remainder;
                 }
             }
@@ -337,6 +408,7 @@ std::string LLMClient::call_llm_streaming(const json& messages,
                                            int max_tokens,
                                            float temperature) {
     auto t0 = std::chrono::steady_clock::now();
+    size_t prompt_chars = 0;
 
     json body = {
         {"model",       model_},
@@ -350,6 +422,8 @@ std::string LLMClient::call_llm_streaming(const json& messages,
     SSECtx sctx;
     sctx.on_sentence = on_sentence;
     sctx.cancel = &cancel;
+    sctx.t0 = t0;
+    last_error_.clear();
 
     CURL* curl = curl_easy_init();
     if (curl) {
@@ -365,9 +439,17 @@ std::string LLMClient::call_llm_streaming(const json& messages,
         curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &sctx);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT,        60L);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, sse_progress_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA,   &sctx);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS,     0L);
+        prompt_chars = body_str.size();
 
         CURLcode res = curl_easy_perform(curl);
-        if (res != CURLE_OK && res != CURLE_WRITE_ERROR) {
+        if (sctx.timed_out) {
+            last_error_ = "timeout";
+            std::cerr << "[!] LLM gave up: " << (sctx.got_first ? "answer ran past 45 s"
+                                                                : "no first word after 20 s") << "\n";
+        } else if (res != CURLE_OK && res != CURLE_WRITE_ERROR && res != CURLE_ABORTED_BY_CALLBACK) {
             std::cerr << "[!] MLX curl error: " << curl_easy_strerror(res) << "\n";
         }
 
@@ -393,9 +475,15 @@ std::string LLMClient::call_llm_streaming(const json& messages,
 
     float elapsed = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - t0).count();
-    std::cout << "[MLX streamed in " << elapsed << " s]\n";
+    // Where the time went: a slow FIRST word = the model re-reading a long
+    // prompt (prefix not cached); slow after that = generating too much.
+    float first = sctx.got_first
+        ? std::chrono::duration<float>(sctx.t_first - t0).count() : elapsed;
+    std::cout << "[LLM] prompt ≈" << prompt_chars / 4 << " tok · first word " << first
+              << " s · " << sctx.n_tokens << " tokens · " << elapsed << " s total"
+              << (sctx.looped ? " · repetition loop cut" : "") << "\n";
 
-    if (sctx.full_text.empty()) {
+    if (sctx.full_text.empty() && !cancel.load()) {   // a cancel empties it on purpose
         std::cerr << "[!] MLX returned EMPTY response — check server on port 8081.\n";
     }
 
@@ -527,9 +615,20 @@ LLMAction LLMClient::parse_llm_action(const std::string& raw_text) const {
             auto j = json::parse(obj);
 
             if (j.contains("tool") && j["tool"].is_string()) {
-                action.is_done = false;
                 action.tool = j["tool"].get<std::string>();
                 action.args = j.value("args", json::object());
+                // Small models write the final answer as a "done" TOOL call
+                // ({"tool":"done","args":{}}) — that is a finish, not a tool.
+                static const std::set<std::string> FINISH = {
+                    "done", "finish", "final_answer", "answer", "respond", "reply_to_user", "say"};
+                if (FINISH.count(action.tool)) {
+                    action.is_done = true;
+                    const json& a = action.args.is_object() ? action.args : json::object();
+                    action.say = a.value("say", a.value("text", a.value("message", std::string())));
+                    action.tool.clear();
+                    return action;
+                }
+                action.is_done = false;
                 return action;
             }
 
@@ -744,7 +843,8 @@ void LLMClient::prewarm(ToolBridge& bridge) {
 std::string LLMClient::fast_chat_streaming(const std::string& user_msg,
                                             ToolBridge& bridge,
                                             SentenceCallback on_sentence,
-                                            std::atomic<bool>& cancel) {
+                                            std::atomic<bool>& cancel,
+                                            const std::string& knowledge) {
     trim_history();
     last_tools_.clear();
     last_path_ = "fast";
@@ -764,6 +864,13 @@ std::string LLMClient::fast_chat_streaming(const std::string& user_msg,
     int start = std::max(0, static_cast<int>(history_.size()) - cfg::MAX_HISTORY);
     for (int i = start; i < static_cast<int>(history_.size()); ++i)
         messages.push_back(history_[i]);
+    // What DEMASCAS read on the web about this — for THIS request only (the
+    // stored history keeps the plain question, so notes never pile up).
+    if (!knowledge.empty() && !messages.empty()) {
+        auto& last = messages.back();
+        last["content"] = knowledge + "\n\nUsing those notes where relevant (say so if they "
+                          "don't answer it), reply to: " + user_msg;
+    }
 
     auto text = call_llm_streaming(
         messages, on_sentence, cancel,
@@ -774,8 +881,10 @@ std::string LLMClient::fast_chat_streaming(const std::string& user_msg,
         history_.pop_back();
         last_success_ = false;
         if (!cancel.load()) {
-            text = "Sorry, I couldn't reach my language model. "
-                   "Please check that the MLX server is running.";
+            text = last_error_ == "timeout"
+                ? "Sorry, my model is taking too long right now. Could you ask again?"
+                : "Sorry, I couldn't reach my language model. "
+                  "Please check that the MLX server is running.";
             on_sentence(text);
         }
         return text;
@@ -921,8 +1030,10 @@ std::string LLMClient::chat_with_tools_streaming(
 
         if (cancel.load()) break;
         if (raw_output.empty()) {
-            final_text = "Sorry, I couldn't reach my language model. "
-                         "Please check that the MLX server is running.";
+            final_text = last_error_ == "timeout"
+                ? "Sorry, that's taking my model too long. Could you try again?"
+                : "Sorry, I couldn't reach my language model. "
+                  "Please check that the MLX server is running.";
             last_success_ = false;
             on_sentence(final_text);
             break;
@@ -951,9 +1062,10 @@ std::string LLMClient::chat_with_tools_streaming(
         if (fn == prev_tool && args == prev_args) {
             std::cout << "[!] Duplicate tool call detected (" << fn
                       << ") — breaking ReAct loop.\n";
-            // Only report failure if nothing worked — e.g. a memory that was
-            // saved before the model wandered into a failing extra step.
-            if (prev_failed && !any_success) {
+            // Repeating a call that SUCCEEDED = the model thinks it's done.
+            // Repeating one that FAILED = stuck — say so (it used to say
+            // "Done." if any earlier, unrelated step had worked).
+            if (prev_failed) {
                 final_text = "I couldn't get that to work.";
                 last_success_ = false;
             } else {
@@ -1110,14 +1222,14 @@ std::string LLMClient::chat_with_tools_streaming(
     if (depth >= cfg::MAX_TOOL_DEPTH)
         std::cout << "[!] Hit max tool depth (" << cfg::MAX_TOOL_DEPTH << ").\n";
 
-    // If the loop ended without a final answer, report honestly.
+    // Out of steps without a final answer = the task did NOT finish.
+    // (It used to say "Done." and count as a success if any step had
+    // worked — which also taught DEMASCAS "skills" from failed runs.)
     if (final_text.empty() && !cancel.load()) {
-        if ((prev_failed && !any_success) || last_tools_.empty()) {
-            final_text = "I wasn't able to finish that.";
-            last_success_ = false;
-        } else {
-            final_text = "Done.";
-        }
+        final_text = any_success
+            ? "I couldn't finish that — I got partway. Could you tell me a bit more?"
+            : "I wasn't able to finish that.";
+        last_success_ = false;
         on_sentence(final_text);
     }
 

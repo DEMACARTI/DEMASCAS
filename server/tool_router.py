@@ -7,6 +7,8 @@ This module categorizes tools and matches user intent to select the
 smallest relevant subset.
 """
 
+import re
+
 # ── File search keywords — triggers find_file + open_file inclusion ──
 
 FILE_SEARCH_KEYWORDS = [
@@ -52,6 +54,11 @@ TOOL_CATEGORIES = {
     ],
     "web_browsing": [
         "open_url", "search_web", "read_webpage", "switch_tab",
+        "research_web", "scrape_webpage", "web_knowledge",
+    ],
+    "web_research": [
+        "research_web", "scrape_webpage", "web_knowledge", "watch_topic", "unwatch_topic",
+        "forget_web", "search_web",
     ],
     "browser": [
         "open_url", "open_url_and_wait",
@@ -193,7 +200,13 @@ INTENT_KEYWORDS = {
     "checkbox":    ["browser"],
     "dropdown":    ["browser"],
     "article":     ["web_agent"],
-    "research":    ["web_agent"],
+    "research":    ["web_agent", "web_research"],
+    "look up":     ["web_research"],
+    "find out":    ["web_research"],
+    "scrape":      ["web_research"],
+    "keep an eye": ["web_research"],
+    "keep track":  ["web_research"],
+    "what do you know": ["web_research"],
 
     # Gmail (browser-based)
     "gmail":       ["gmail_browser", "browser"],
@@ -446,6 +459,16 @@ def select_tools_for_query(query: str, all_schemas: list[dict],
                 regular_tools.append(schema_map[name])
 
     result = priority_tools + regular_tools
+
+    # "remember …" means SAVE A MEMORY.  The preferences category used to put
+    # set_humor_level first, and the model picked it ("remember the spelling
+    # Discord" changed the humor level).
+    if re.search(r"\bremember\b", query_lower):
+        keep_humor = re.search(r"humou?r|funny|joke|sarcas", query_lower)
+        result = [s for s in result if keep_humor or s.get("function", {}).get("name") != "set_humor_level"]
+        if "save_memory" in schema_map:
+            result = [schema_map["save_memory"]] + [
+                s for s in result if s.get("function", {}).get("name") != "save_memory"]
 
     # ── Force architect_plan for complex / multi-step commands ───
     complex_triggers = [" and ", " then ", "create", "make", "after",

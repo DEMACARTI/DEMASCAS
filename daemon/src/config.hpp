@@ -38,6 +38,13 @@ inline const std::string TOOL_HEALTH_URL    = "http://127.0.0.1:5001/health";
 constexpr int   SAMPLE_RATE          = 16000;   // whisper.cpp requires 16 kHz mono
 constexpr int   FRAMES_PER_BUFFER    = 512;
 constexpr float VAD_ENERGY_THRESHOLD = 0.008f;  // RMS threshold for "speech" (calibrated: M1 built-in mic baseline ~0.003)
+// Speech detector (Silero VAD) — tells a human voice from fans/typing/music.
+inline const std::string SILERO_VAD_MODEL = "models/silero_vad.onnx";
+constexpr float VAD_SPEECH_THRESHOLD = 0.7f;     // measured: 0 % typing/fan/music, speech kept
+constexpr float VAD_MIN_SPEECH_SEC   = 0.25f;
+constexpr float VAD_MIN_SILENCE_SEC  = 0.10f;
+// Echo cancellation (speexdsp) for barge-in at a normal speaking voice.
+constexpr int   AEC_TAIL_MS          = 200;
 constexpr float BARGE_IN_THRESHOLD   = 0.18f;   // RMS threshold during TTS — must speak OVER the speaker (calibrated for laptop speakers)
 // End-of-utterance: how long you must be silent before DEMASCAS starts
 // working.  This is added to EVERY command's response time — it was 2.0 s.
@@ -129,7 +136,7 @@ inline const std::string WAKE_WORD = "demascas";
 // Giving whisper an initial_prompt with expected vocabulary
 // dramatically reduces hallucinations and improves name recognition.
 inline const std::string WHISPER_PROMPT =
-    "DEMASCAS, Damascus, Daksh, open, close, search, remember, "
+    "DEMASCAS, Daksh, open, close, search, remember, send a message, "
     "screenshot, Safari, Chrome, YouTube, minimize, maximize, "
     "copy, paste, undo, redo, quit, scroll, what, how, why, "
     "my name is, stop, bye, goodbye, thank you";

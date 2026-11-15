@@ -11,11 +11,15 @@
 
 #include <atomic>
 #include <mutex>
+#include <chrono>
+#include <functional>
 #include <vector>
 
 #include <portaudio.h>
 
 namespace demascas {
+
+class SpeechDetector;
 
 class AudioEngine {
 public:
@@ -56,7 +60,19 @@ public:
     /// Wait for speech onset, then record until silence.
     /// Returns an empty vector on timeout (no speech detected).
     std::vector<float> capture_utterance(float timeout_sec,
-                                          float silence_sec = 2.0f);
+                                          float silence_sec = 2.0f,
+                                          const std::vector<float>& already_spoken = {},
+                                          const std::function<bool()>& abort_before_speech = nullptr,
+                                          const std::function<void()>& on_speech_start = nullptr);
+
+    /// Use a speech detector (Silero VAD) instead of loudness to decide when
+    /// the user starts/stops talking — fans, typing and music no longer start
+    /// or prolong a recording.
+    void set_speech_detector(SpeechDetector* vad) { vad_ = vad; }
+
+    /// drain() plus the capture time of the LAST returned sample
+    /// (input latency already subtracted) — for echo cancellation.
+    std::vector<float> drain_timed(std::chrono::steady_clock::time_point& last_sample_time);
 
     /// RMS energy of a buffer segment.
     static float rms(const float* data, size_t n);
@@ -76,6 +92,9 @@ private:
     std::vector<float> ring_;
     mutable std::mutex mu_;
     std::atomic<bool>  active_{false};
+    SpeechDetector* vad_ = nullptr;
+    std::chrono::steady_clock::time_point last_cb_{};
+    double             input_latency_ = 0.0;
 };
 
 }  // namespace demascas

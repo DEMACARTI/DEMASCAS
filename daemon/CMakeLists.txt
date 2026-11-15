@@ -79,6 +79,8 @@ add_executable(demascas_daemon
     src/llm_client.cpp
     src/tool_bridge.cpp
     src/tts.cpp
+    src/vad.cpp
+    src/aec.cpp
 )
 
 target_include_directories(demascas_daemon PRIVATE
@@ -127,3 +129,44 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(demascas_daemon PRIVATE -O3 -DNDEBUG)
 endif()
+
+# ── speexdsp — acoustic echo cancellation (barge-in at a normal voice) ──
+# Use a system copy if pkg-config finds one; otherwise fetch and compile its
+# few C files so DEMASCAS needs no extra install (Mac / Linux / Windows).
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND AND NOT DEMASCAS_VENDOR_SPEEXDSP)
+    pkg_check_modules(SPEEXDSP QUIET speexdsp)
+endif()
+if(SPEEXDSP_FOUND)
+    message(STATUS "speexdsp (system) ${SPEEXDSP_VERSION}")
+    target_include_directories(demascas_daemon PRIVATE ${SPEEXDSP_INCLUDE_DIRS})
+    target_link_directories(demascas_daemon PRIVATE ${SPEEXDSP_LIBRARY_DIRS})
+    target_link_libraries(demascas_daemon PRIVATE ${SPEEXDSP_LIBRARIES})
+else()
+    message(STATUS "speexdsp: fetching source (BSD) for echo cancellation")
+    include(FetchContent)
+    FetchContent_Declare(speexdsp_src
+        GIT_REPOSITORY https://github.com/xiph/speexdsp.git
+        GIT_TAG        SpeexDSP-1.2.1
+        GIT_SHALLOW    TRUE
+        SOURCE_SUBDIR  no-cmake-build)   # sources only — compiled below
+    FetchContent_MakeAvailable(speexdsp_src)
+    file(WRITE ${speexdsp_src_BINARY_DIR}/include/speex/speexdsp_config_types.h
+"#ifndef __SPEEX_TYPES_H__\n#define __SPEEX_TYPES_H__\n#include <stdint.h>\n"
+"typedef int16_t spx_int16_t;\ntypedef uint16_t spx_uint16_t;\n"
+"typedef int32_t spx_int32_t;\ntypedef uint32_t spx_uint32_t;\n#endif\n")
+    set(_SPX ${speexdsp_src_SOURCE_DIR}/libspeexdsp)
+    add_library(speexdsp_vendored STATIC
+        ${_SPX}/mdf.c ${_SPX}/preprocess.c ${_SPX}/filterbank.c ${_SPX}/fftwrap.c
+        ${_SPX}/kiss_fft.c ${_SPX}/kiss_fftr.c ${_SPX}/resample.c ${_SPX}/buffer.c)
+    target_include_directories(speexdsp_vendored PUBLIC
+        ${speexdsp_src_SOURCE_DIR}/include ${speexdsp_src_BINARY_DIR}/include)
+    target_compile_definitions(speexdsp_vendored PRIVATE FLOATING_POINT USE_KISS_FFT EXPORT=)
+    if(NOT MSVC)
+        target_compile_options(speexdsp_vendored PRIVATE -w)
+        target_link_libraries(speexdsp_vendored PRIVATE m)
+    endif()
+    target_link_libraries(demascas_daemon PRIVATE speexdsp_vendored)
+endif()
+target_compile_definitions(demascas_daemon PRIVATE HAS_SPEEXDSP=1)
+

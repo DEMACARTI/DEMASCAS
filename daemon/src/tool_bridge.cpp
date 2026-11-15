@@ -49,7 +49,8 @@ std::string ToolBridge::url_encode(const std::string& s) {
 // ── HTTP helpers ────────────────────────────────────────────────────
 
 std::string ToolBridge::http_post(const std::string& url,
-                                   const std::string& body) {
+                                   const std::string& body,
+                                   long timeout_sec) {
     CURL* curl = curl_easy_init();
     if (!curl) return "";
 
@@ -62,7 +63,7 @@ std::string ToolBridge::http_post(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        timeout_sec);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);
 
     CURLcode res = curl_easy_perform(curl);
@@ -374,6 +375,7 @@ std::string ToolBridge::fetch_active_context() {
 }
 
 std::string ToolBridge::fetch_preferences() {
+    std::lock_guard<std::mutex> lk(prefs_mu_);
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_prefs_fetch_).count();
     
@@ -400,7 +402,8 @@ void ToolBridge::log_interaction(const std::string& command,
                                   const std::string& path,
                                   const std::vector<std::string>& tools_used,
                                   const std::string& result,
-                                  bool success) {
+                                  bool success,
+                                  const std::string& skill_id) {
     json tools_arr = json::array();
     for (auto& t : tools_used) tools_arr.push_back(t);
 
@@ -410,10 +413,107 @@ void ToolBridge::log_interaction(const std::string& command,
         {"tools",   tools_arr},
         {"result",  result.substr(0, 300)},   // truncate for storage
         {"success", success},
+        {"skill_id", skill_id},
     };
 
     // Fire-and-forget — ignore errors
     http_post(cfg::TOOL_SERVER_BASE + "/learn", payload.dump());
+}
+
+// ── Skills: learned procedures (PATH 1.5) ───────────────────────────
+
+ToolBridge::SkillMatch ToolBridge::match_skill(const std::string& command) {
+    SkillMatch out;
+    // Embedding match is ~2 ms; filling parameters is one short LLM call.
+    auto resp = http_post(cfg::TOOL_SERVER_BASE + "/skill/match",
+                          json{{"command", command}}.dump(), 20L);
+    if (resp.empty()) return out;
+    try {
+        auto j = json::parse(resp);
+        out.matched  = j.value("matched", false);
+        out.done     = j.value("done", false);
+        out.skill_id = json_str(j, "skill_id");
+        out.name     = json_str(j, "name");
+        out.ack      = json_str(j, "ack");
+        out.ask      = json_str(j, "ask");
+        out.summary  = json_str(j, "summary");
+        out.route    = json_str(j, "route");
+        out.command  = json_str(j, "command");
+        out.note     = json_str(j, "note");
+        out.knowledge = json_str(j, "knowledge");
+        if (j.contains("params") && j["params"].is_object())
+            out.params_json = j["params"].dump();
+    } catch (...) {
+        out.matched = false;
+    }
+    return out;
+}
+
+ToolBridge::SkillRunResult ToolBridge::run_skill(const std::string& skill_id,
+                                                 const std::string& params_json) {
+    SkillRunResult out;
+    json params = json::object();
+    try { params = json::parse(params_json.empty() ? "{}" : params_json); } catch (...) {}
+    auto resp = http_post(cfg::TOOL_SERVER_BASE + "/skill/run",
+                          json{{"skill_id", skill_id}, {"params", params}}.dump(),
+                          cfg::AGENT_TIMEOUT_SEC);
+    if (resp.empty()) {
+        out.summary = "The skill didn't respond in time.";
+        return out;
+    }
+    try {
+        auto j = json::parse(resp);
+        out.success = j.value("success", false);
+        out.summary = json_str(j, "summary");
+        out.confirm_token  = json_str(j, "confirm_token");
+        out.confirm_speech = json_str(j, "confirm_speech");
+        out.pending_tool   = json_str(j, "pending_tool");
+        if (j.contains("tool_calls") && j["tool_calls"].is_array())
+            for (auto& t : j["tool_calls"])
+                if (t.is_string()) out.tool_calls.push_back(t.get<std::string>());
+    } catch (...) {
+        out.summary = "The skill returned an invalid response.";
+    }
+    return out;
+}
+
+json ToolBridge::fetch_core_tools() {
+    try {
+        auto j = json::parse(http_get(cfg::TOOL_SERVER_BASE + "/tools_core"));
+        return j.is_array() ? j : json::array();
+    } catch (...) {
+        return json::array();
+    }
+}
+
+std::vector<std::string> ToolBridge::fetch_vocabulary() {
+    std::vector<std::string> out;
+    try {
+        auto j = json::parse(http_get(cfg::TOOL_SERVER_BASE + "/vocabulary"));
+        if (j.contains("terms") && j["terms"].is_array())
+            for (auto& t : j["terms"])
+                if (t.is_string()) out.push_back(t.get<std::string>());
+    } catch (...) {}
+    return out;
+}
+
+void ToolBridge::cancel_agent() {
+    http_post(cfg::TOOL_SERVER_BASE + "/agent/cancel", "{}", 3L);
+}
+
+json ToolBridge::agent_status() {
+    auto resp = http_get(cfg::TOOL_SERVER_BASE + "/agent/status");
+    try {
+        auto j = json::parse(resp.empty() ? "{}" : resp);
+        return j.is_object() ? j : json::object();
+    } catch (...) {
+        return json::object();
+    }
+}
+
+void ToolBridge::send_feedback(bool positive) {
+    http_post(cfg::TOOL_SERVER_BASE + "/feedback",
+              json{{"positive", positive}}.dump(), 5L);
 }
 
 // ── Screen context fetch (PATH 4) ───────────────────────────────────

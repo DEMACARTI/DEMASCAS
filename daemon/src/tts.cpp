@@ -12,6 +12,7 @@
  */
 
 #include "tts.hpp"
+#include "aec.hpp"
 #include "config.hpp"
 
 #include <algorithm>
@@ -163,6 +164,7 @@ bool TTS::open_output_stream(int sample_rate, bool test_tone) {
     }
 
     std::cout << "[✓] TTS PortAudio stream open (" << sample_rate << " Hz, float32, mono)\n";
+    out_capacity_ = Pa_GetStreamWriteAvailable(out_stream_);   // empty buffer = full capacity
 
     // Short test tone (440 Hz, 0.15 s) — also proves the device actually
     // consumes audio.  A stalled device used to block here FOREVER (the
@@ -298,9 +300,9 @@ void TTS::worker_loop() {
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait_for(lk, std::chrono::milliseconds(100),
-                         [this]{ return !queue_.empty() || stop_.load(); });
+                         [this]{ return (!queue_.empty() && !held_) || stop_.load(); });
             if (stop_) break;
-            if (queue_.empty()) {
+            if (queue_.empty() || held_) {
                 if (playing_) playing_ = false;
                 if (!warm_queue_.empty()) {
                     lk.unlock();
@@ -476,7 +478,30 @@ bool TTS::write_frames(const float* data, int32_t n, uint64_t gen) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    if (aec_) {
+        // When will these frames be heard?  After what's already queued plus
+        // the device latency.  Stamped 30 ms EARLY on purpose: the echo
+        // canceller can model a reference that leads the echo, never one
+        // that lags it.
+        signed long avail = Pa_GetStreamWriteAvailable(out_stream_);
+        signed long queued = std::max<signed long>(0, out_capacity_ - std::max<signed long>(0, avail));
+        const PaStreamInfo* si = Pa_GetStreamInfo(out_stream_);
+        double ahead = static_cast<double>(queued) / sr + (si ? si->outputLatency : 0.0) - 0.030;
+        auto when = std::chrono::steady_clock::now() +
+                    std::chrono::microseconds(static_cast<long long>(std::max(0.0, ahead) * 1e6));
+        aec_->push_reference(data, static_cast<size_t>(n), sr, when);
+    }
     PaError err = Pa_WriteStream(out_stream_, data, static_cast<unsigned long>(n));
+    {   // playback loudness history (echo reference for barge-in)
+        double s = 0;
+        for (int32_t i = 0; i < n; ++i) s += double(data[i]) * data[i];
+        float level = n > 0 ? static_cast<float>(std::sqrt(s / n)) : 0.0f;
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(lvl_mu_);
+        lvl_.emplace_back(now, level);
+        while (!lvl_.empty() && now - lvl_.front().first > std::chrono::seconds(2))
+            lvl_.pop_front();
+    }
     if (err != paNoError && err != paOutputUnderflowed) {
         if (gen == 0 || gen_.load() == gen)
             std::cerr << "[!] PA write error: " << Pa_GetErrorText(err) << "\n";
@@ -601,7 +626,8 @@ void TTS::enqueue(const std::string& text) {
         for (auto& p : pieces) queue_.push(p);
         // Mark busy immediately so wait_done()/is_playing() called right
         // after enqueue() don't return before the worker picks it up.
-        playing_ = true;
+        // (Not while held: nothing will play until the user finishes.)
+        if (!held_) playing_ = true;
     }
     cv_.notify_one();
 }
@@ -647,6 +673,25 @@ bool TTS::is_playing() const {
     return playing_;
 }
 
+void TTS::hold(bool on) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        held_ = on;
+        if (!on && !queue_.empty()) playing_ = true;
+    }
+    cv_.notify_one();
+}
+
+float TTS::playback_level() const {
+    if (backend_ == Backend::SAY) return playing_ ? -1.0f : 0.0f;
+    auto cutoff = std::chrono::steady_clock::now() - std::chrono::milliseconds(400);
+    std::lock_guard<std::mutex> lk(lvl_mu_);
+    float peak = 0.0f;
+    for (auto& [t, v] : lvl_)
+        if (t >= cutoff && v > peak) peak = v;
+    return peak;
+}
+
 void TTS::wait_done() {
     while (playing_ && !stop_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -656,11 +701,20 @@ void TTS::wait_done() {
 // ── Sound effects ───────────────────────────────────────────────────
 
 void TTS::play_sound(const std::string& name) {
+#ifdef __APPLE__
     std::string path = "/System/Library/Sounds/" + name + ".aiff";
-    std::thread([path]() {
+    const char* player = "afplay";
+#else
+    // Linux (PipeWire / PulseAudio): the freedesktop sound theme's chime.
+    (void)name;
+    std::string path = "/usr/share/sounds/freedesktop/stereo/message.oga";
+    if (access(path.c_str(), R_OK) != 0) return;          // no sound theme installed
+    const char* player = access("/usr/bin/pw-play", X_OK) == 0 ? "pw-play" : "paplay";
+#endif
+    std::thread([path, player]() {
         pid_t pid = fork();
         if (pid == 0) {
-            execlp("afplay", "afplay", path.c_str(), nullptr);
+            execlp(player, player, path.c_str(), nullptr);
             _exit(1);
         } else if (pid > 0) {
             waitpid(pid, nullptr, 0);

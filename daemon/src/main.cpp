@@ -17,6 +17,9 @@
  * the IPC bridge to the Python micro-service.
  */
 
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -34,6 +37,8 @@
 #include "llm_client.hpp"
 #include "tool_bridge.hpp"
 #include "tts.hpp"
+#include "vad.hpp"
+#include "aec.hpp"
 #include "shortcut_map.hpp"
 
 // ── Graceful shutdown via SIGINT / SIGTERM ───────────────────────────
@@ -343,8 +348,90 @@ static bool is_hallucination(const std::string& text) {
 // CRITICAL: NEVER modifies word boundaries of normal words.
 // Only operates on explicit patterns (filler prefix, spelled-out letters/digits).
 
+/// Whisper sometimes loops: "open discord, open, discord, open, discord, …".
+/// A 1–4 word phrase repeated 3+ times in a row is cut to one copy (and a
+/// dangling partial copy after it is dropped).
+static std::string collapse_repeats(const std::string& text) {
+    std::vector<std::string> words, keys;
+    {
+        std::istringstream iss(text);
+        std::string w;
+        while (iss >> w) {
+            words.push_back(w);
+            std::string k;
+            for (char c : w)
+                if (std::isalnum(static_cast<unsigned char>(c)))
+                    k += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            keys.push_back(k);
+        }
+    }
+    bool changed = false;
+    for (size_t n = 1; n <= 4; ++n) {
+        std::vector<std::string> ow, ok;
+        size_t i = 0;
+        while (i < keys.size()) {
+            size_t reps = 1;
+            if (i + n <= keys.size()) {
+                while (i + (reps + 1) * n <= keys.size() &&
+                       std::equal(keys.begin() + i, keys.begin() + i + n,
+                                  keys.begin() + i + reps * n))
+                    ++reps;
+            }
+            if (reps >= 3) {
+                for (size_t j = 0; j < n; ++j) { ow.push_back(words[i + j]); ok.push_back(keys[i + j]); }
+                size_t next = i + reps * n;
+                // drop a trailing partial copy ("…, open discord, open,")
+                size_t p = 0;
+                while (next + p < keys.size() && p < n && keys[next + p] == keys[i + p]) ++p;
+                if (next + p == keys.size()) next = keys.size();
+                i = next;
+                changed = true;
+            } else {
+                ow.push_back(words[i]); ok.push_back(keys[i]);
+                ++i;
+            }
+        }
+        words.swap(ow);
+        keys.swap(ok);
+    }
+    if (!changed) return text;
+    std::string out;
+    for (auto& w : words) { if (!out.empty()) out += ' '; out += w; }
+    while (!out.empty() && (out.back() == ',' || out.back() == ' ')) out.pop_back();
+    return out;
+}
+
+/// "You did nothing" / "it didn't work" — a complaint about the last task.
+static bool is_complaint(const std::string& text) {
+    std::string s = simplify(text);
+    static const char* P[] = {
+        "you did nothing", "you didnt do", "you did not do", "nothing happened",
+        "it didnt work", "that didnt work", "it did not work", "not what i asked",
+        "you didnt send", "you did not send", "you didnt open", "you didnt even",
+        "that is not what i", "thats not what i", "you only", "still not done",
+        "you havent done", "you have not done",
+    };
+    for (auto& p : P)
+        if (has_word(s, p)) return true;
+    return false;
+}
+
+/// A chat reply that CLAIMS an action it cannot perform ("Sending a hi…").
+static bool claims_action(const std::string& reply) {
+    std::string s = simplify(reply);
+    static const char* P[] = {
+        "sending a", "sending your", "sending the", "sending it", "sending that",
+        "ive sent", "i have sent", "message sent", "ill send", "i will send",
+        "im sending", "i am sending", "opening it", "ive opened", "i have opened",
+        "im opening", "i am opening", "i just sent", "i just opened",
+    };
+    for (auto& p : P)
+        if (has_word(s, p)) return true;
+    return false;
+}
+
 static std::string normalize_transcription(const std::string& raw) {
-    std::string s = raw;
+    std::string s = collapse_repeats(raw);
     if (s.empty()) return s;
 
     // ── STEP 1: Strip leading filler words ──────────────────────
@@ -598,9 +685,149 @@ static bool is_dismiss(const std::string& text) {
         "go away", "stand by", "standing by", "no", "nope", "no more",
         "nothing", "nothing else", "see ya", "see you", "later",
         "talk to you later", "thats enough",
+        "stay shut", "stay quiet", "keep quiet", "be silent", "stay silent",
+        "silence", "shush", "hush", "zip it", "quiet please",
     };
     return DISMISS.count(s) > 0;
 }
+
+/// Is the WHOLE utterance feedback on the previous result?
+/// +1 "good job" / "perfect", -1 "that's wrong" / "not what I asked", 0 otherwise.
+/// Whole-utterance only, so "open the wrong folder fix" or "good morning
+/// routine" are still treated as commands.
+static int feedback_polarity(const std::string& text) {
+    static const std::set<std::string> FILLERS = {
+        "demascas", "damascus", "hey", "oh", "um", "uh", "well", "so", "that",
+        "thats", "was", "is", "it", "you", "really", "very", "a", "the", "thank",
+        "thanks", "ok", "okay", "yeah", "wow", "nice", "work",
+    };
+    std::string s = strip_fillers(simplify(text), FILLERS);
+    if (s.empty()) return 0;
+    static const std::set<std::string> POS = {
+        "good job", "great job", "well done", "perfect", "exactly", "correct",
+        "good", "great", "awesome", "excellent", "brilliant", "spot on",
+        "exactly what i wanted", "just what i wanted", "worked", "it worked",
+        "good one", "nailed it", "right",
+    };
+    static const std::set<std::string> NEG = {
+        "wrong", "not right", "not what i asked", "not what i wanted",
+        "not what i meant", "you got wrong", "got wrong", "bad", "incorrect",
+        "didnt", "didnt work", "not working", "you messed up", "messed up",
+        "thats not it", "not it", "wrong one", "terrible", "useless",
+    };
+    if (POS.count(s)) return 1;
+    if (NEG.count(s)) return -1;
+    return 0;
+}
+
+/// "What are you doing?" — asked while a task runs.
+static bool is_status_question(const std::string& text) {
+    std::string s = simplify(text);
+    static const char* P[] = {
+        "what are you doing", "whatre you doing", "what are you working on",
+        "status", "how is it going", "hows it going", "are you done",
+        "are you finished", "how long", "still working", "progress",
+        "whats taking so long", "what is taking so long", "is it done",
+        "are you still", "where are you at",
+    };
+    for (auto& p : P)
+        if (has_word(s, p)) return true;
+    return false;
+}
+
+/// "Stop" / "cancel" — said while a task runs.
+static bool is_cancel_request(const std::string& text) {
+    std::string s = simplify(text);
+    static const char* P[] = {
+        "cancel", "cancel that", "stop that", "stop it", "stop the task",
+        "abort", "never mind", "nevermind", "forget it", "dont do that",
+        "do not do that", "stop working", "stop doing that", "stop",
+    };
+    for (auto& p : P)
+        if (has_word(s, p)) return true;
+    return false;
+}
+
+// ── Background task: DEMASCAS keeps listening while it works ────────
+//    Long work (skills, agents, the tool loop) runs here; the main loop
+//    stays in LISTENING so the user can ask questions, check progress,
+//    queue more work or say "stop" — JARVIS-style.
+
+struct TaskOutcome {
+    std::string command, path, skill_id, reply;
+    std::vector<std::string> tools;
+    bool success = true;
+    std::string confirm_token, confirm_tool, confirm_speech;
+    std::vector<std::pair<std::string, std::string>> file_choices;
+};
+
+class BackgroundTask {
+public:
+    using clk = std::chrono::steady_clock;
+    ~BackgroundTask() { abandon(); }
+
+    template <class Fn>
+    void start(const std::string& command, Fn fn) {
+        if (th_.joinable()) th_.join();
+        cancel_ = false;
+        busy_ = true;
+        ++id_;
+        command_ = command;
+        started_ = clk::now();
+        th_ = std::thread([this, fn, command]() mutable {
+            TaskOutcome o;
+            try {
+                o = fn();
+            } catch (...) {
+                o.success = false;
+                o.reply = "Something went wrong while I was working on that.";
+            }
+            o.command = command;
+            std::lock_guard<std::mutex> lk(mu_);
+            result_ = std::move(o);
+            has_result_ = true;
+            busy_ = false;
+        });
+    }
+    bool busy() const { return busy_; }
+    bool has_result() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return has_result_;
+    }
+    bool take(TaskOutcome& out) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!has_result_) return false;
+        out = std::move(result_);
+        has_result_ = false;
+        return true;
+    }
+    std::atomic<bool>& cancel_flag() { return cancel_; }
+    uint64_t id() const { return id_; }
+    const std::string& command() const { return command_; }
+    int seconds() const {
+        return static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+            clk::now() - started_).count());
+    }
+    /// On shutdown: don't wait up to 100 s for an agent to finish.
+    void abandon() {
+        cancel_ = true;
+        if (th_.joinable()) {
+            if (busy_) th_.detach(); else th_.join();
+        }
+    }
+    std::deque<std::string> queue;          // main thread only
+
+private:
+    std::thread       th_;
+    uint64_t          id_ = 0;
+    std::atomic<bool> busy_{false};
+    std::atomic<bool> cancel_{false};
+    std::mutex        mu_;
+    bool              has_result_ = false;
+    TaskOutcome       result_;
+    std::string       command_;
+    clk::time_point   started_{};
+};
 
 // ── State machine ───────────────────────────────────────────────────
 
@@ -643,6 +870,18 @@ int main() {
         std::cout << "[✓] LLM: " << llm_cfg.model << " via " << llm_cfg.runtime
                   << " (context " << llm_cfg.context_tokens << " tokens)\n";
     }
+    // Second client for background tasks, so the main one stays free to
+    // answer questions while a task runs.  (Only conversation state — no
+    // extra model memory; both talk to the same local runtime.)
+    demascas::LLMClient worker_llm;
+    if (llm_cfg.configured)
+        worker_llm.configure(llm_cfg.chat_url, llm_cfg.model, llm_cfg.context_tokens);
+    {   // core tools live in the cached part of the tool prompt
+        auto core = bridge.fetch_core_tools();
+        llm.set_core_tools(core);
+        worker_llm.set_core_tools(core);
+        std::cout << "[✓] Core tools in the cached prompt: " << core.size() << "\n";
+    }
     llm.prewarm(bridge);   // health check now; KV-cache/Metal warm-up in the background
     llm.load_session();  // restore context from previous session
 
@@ -661,6 +900,30 @@ int main() {
         return 1;
     }
 
+    // ── 6b. Speech detector + echo canceller ────────────────────
+    //    Silero VAD tells a human voice from fans/typing/music; speexdsp
+    //    removes DEMASCAS's own voice from the mic so the user can
+    //    interrupt at a normal speaking volume.
+    demascas::SpeechDetector vad, barge_vad;
+    if (vad.init(cfg::SILERO_VAD_MODEL, cfg::SAMPLE_RATE, cfg::VAD_SPEECH_THRESHOLD,
+                 cfg::VAD_MIN_SPEECH_SEC, cfg::VAD_MIN_SILENCE_SEC)) {
+        barge_vad.init(cfg::SILERO_VAD_MODEL, cfg::SAMPLE_RATE, cfg::VAD_SPEECH_THRESHOLD,
+                       cfg::VAD_MIN_SPEECH_SEC, cfg::VAD_MIN_SILENCE_SEC);
+        audio.set_speech_detector(&vad);
+        std::cout << "[✓] Speech detector: Silero VAD (ignores fans, typing, music)\n";
+    }
+    demascas::EchoCanceller aec(cfg::SAMPLE_RATE, cfg::AEC_TAIL_MS);
+    if (aec.available()) {
+        tts.set_echo_canceller(&aec);
+        std::cout << "[✓] Echo cancellation on — interrupt me at a normal voice\n";
+    }
+    demascas::BargeInDetector barge;
+    BackgroundTask task;
+    std::string last_action_command;   // for "you did nothing" → retry
+    uint64_t announced_task = 0;       // "still working on it" bookkeeping
+    int announce_stage = 0;
+    bool last_task_failed = false;     // don't run the queue behind a failure
+
     // ── 7. Init whisper.cpp (tiny + base models) ────────────────
     demascas::WhisperEngine whisper;
     if (!whisper.init(cfg::WHISPER_TINY_MODEL, cfg::WHISPER_BASE_MODEL)) {
@@ -668,7 +931,22 @@ int main() {
                   << "  ./scripts/build.sh   (downloads models automatically)\n";
         return 1;
     }
-    whisper.set_prompt(cfg::WHISPER_PROMPT);
+    // Recogniser hints = base words + what the user taught / apps DEMASCAS
+    // learned ("Discord" stops being heard as "this cord").  Kept short:
+    // whisper's prompt budget is ~220 tokens.
+    auto refresh_vocabulary = [&]() {
+        std::string prompt = cfg::WHISPER_PROMPT;
+        size_t added = 0;
+        for (auto& t : bridge.fetch_vocabulary()) {
+            if (prompt.find(t) != std::string::npos) continue;
+            if (prompt.size() + t.size() > 700 || added >= 40) break;
+            prompt += ", " + t;
+            ++added;
+        }
+        whisper.set_prompt(prompt);
+        return added;
+    };
+    std::cout << "[✓] Recogniser vocabulary: +" << refresh_vocabulary() << " learned words\n";
     whisper.set_threads(llm_cfg.whisper_threads);
     whisper.warm_up();  // build Metal graphs now, not on the first command
 
@@ -712,7 +990,11 @@ int main() {
     // Filters out raw JSON tool calls and low-level action chatter
     // so the user only hears meaningful responses.
     // Defined here (not inside PROCESSING) so CONFIRMING can reuse it.
-    auto on_sentence = [&tts](const std::string& sentence) {
+    // What DEMASCAS said recently — if the mic hands it back (echo canceller
+    // still learning), it must not be treated as the user talking.
+    std::deque<std::pair<clk::time_point, std::string>> recently_said;
+    std::mutex said_mu;
+    auto on_sentence = [&tts, &recently_said, &said_mu](const std::string& sentence) {
         if (sentence.empty()) return;
 
         // ── Skip raw JSON tool calls that leaked through ────
@@ -770,7 +1052,167 @@ int main() {
         }
 
         std::cout << "[🔊 TTS] " << sentence << "\n";
+        {
+            std::lock_guard<std::mutex> lk(said_mu);
+            recently_said.emplace_back(std::chrono::steady_clock::now(), sentence);
+            while (recently_said.size() > 8) recently_said.pop_front();
+        }
         tts.enqueue(sentence);
+    };
+    // "rest of your day" right after DEMASCAS said "How's the rest of your day going?"
+    auto is_own_echo = [&](const std::string& heard) {
+        std::istringstream iss(simplify(heard));
+        std::vector<std::string> words;
+        for (std::string w; iss >> w;) words.push_back(w);
+        if (words.size() < 2) return false;
+        std::lock_guard<std::mutex> lk(said_mu);
+        auto now = std::chrono::steady_clock::now();
+        for (auto& [t, said] : recently_said) {
+            if (now - t > std::chrono::seconds(20)) continue;
+            std::string s = " " + simplify(said) + " ";
+            size_t hit = 0;
+            for (auto& w : words) hit += s.find(" " + w + " ") != std::string::npos;
+            if (hit * 10 >= words.size() * 7) return true;      // ≥ 70 % of the words
+        }
+        return false;
+    };
+
+    // Speech from a background task — silent once the user cancelled it.
+    auto task_say = [&](const std::string& sentence) {
+        if (!task.cancel_flag()) on_sentence(sentence);
+    };
+
+    // The three kinds of background work.  Each returns what happened;
+    // the main loop logs it and handles confirmations / file choices.
+    auto tool_work = [&](const std::string& cmd) {
+        TaskOutcome o;
+        o.path = "tool";
+        std::string learned_ctx;
+        try { learned_ctx = bridge.fetch_learned_context(cmd); } catch (...) {}
+        o.reply = worker_llm.chat_with_tools_streaming(cmd, bridge, task_say,
+                                                       task.cancel_flag(), learned_ctx);
+        o.tools = worker_llm.last_tools_used();
+        o.success = worker_llm.last_success();
+        if (worker_llm.has_pending_confirmation()) {
+            auto pc = worker_llm.take_pending_confirmation();
+            o.confirm_token = pc.token;
+            o.confirm_tool = pc.tool;
+            o.confirm_speech = pc.speech;
+        } else {
+            o.file_choices = worker_llm.take_file_choices();
+        }
+        return o;
+    };
+    auto agent_work = [&](const std::string& cmd, const std::string& context_json) {
+        auto ar = bridge.execute_agent(cmd, context_json);
+        if (ar.unavailable && ar.summary.empty()) {
+            std::cout << "[AGENT] Unavailable (" << ar.error << ") — using the tool path.\n";
+            return tool_work(cmd);
+        }
+        TaskOutcome o;
+        o.path = "agent";
+        o.success = ar.success;
+        o.tools = ar.tool_calls;
+        if (!ar.confirm_token.empty()) {
+            o.confirm_token = ar.confirm_token;
+            o.confirm_tool = ar.pending_tool;
+            o.confirm_speech = ar.confirm_speech;
+            o.reply = ar.confirm_speech;
+        } else if (!ar.summary.empty()) {
+            o.reply = ar.summary;
+            task_say(ar.summary);
+        } else if (!ar.error.empty()) {
+            o.reply = "I ran into an issue: " + ar.error.substr(0, 80);
+            o.success = false;
+            task_say(o.reply);
+        }
+        if (o.confirm_token.empty() && ar.file_choices.size() > 1)
+            o.file_choices = ar.file_choices;
+        return o;
+    };
+    auto skill_work = [&](const std::string& sid, const std::string& params) {
+        TaskOutcome o;
+        o.path = "skill";
+        o.skill_id = sid;
+        auto t0 = clk::now();
+        auto sr = bridge.run_skill(sid, params);
+        std::cout << "[⏱ SKILL RUN] " << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         clk::now() - t0).count() << " ms\n";
+        o.success = sr.success;
+        o.tools = sr.tool_calls;
+        if (!sr.confirm_token.empty()) {
+            // e.g. a chat message is typed and waiting: CONFIRMING asks.
+            o.confirm_token = sr.confirm_token;
+            o.confirm_tool = sr.pending_tool;
+            o.confirm_speech = sr.confirm_speech;
+            o.reply = sr.confirm_speech;
+            return o;
+        }
+        o.reply = sr.summary.empty() ? (sr.success ? "Done." : "That didn't work.") : sr.summary;
+        task_say(o.reply);
+        return o;
+    };
+
+    auto short_cmd = [](const std::string& c) {
+        // "I want you to open the friends section" → "open the friends section"
+        static const std::regex FILLER(
+            R"(^\s*(?:(?:hey|so|okay|ok|alright|well|please|now)[, ]+)*(?:(?:i want you to|i need you to|i'd like you to|can you|could you|would you|please|you should)\s+)+)",
+            std::regex::icase);
+        std::string s = std::regex_replace(c, FILLER, "");
+        return s.size() <= 60 ? s : s.substr(0, 57) + "...";
+    };
+    auto task_status_line = [&]() {
+        std::string line = "I'm still working on " + short_cmd(task.command()) + ".";
+        try {
+            auto st = bridge.agent_status();
+            if (st.value("running", false)) {
+                int step = st.value("step", 0);
+                std::string tool = st.value("last_tool", std::string());
+                for (auto& ch : tool) if (ch == '_') ch = ' ';
+                if (step > 0) line += " I'm on step " + std::to_string(step);
+                if (!tool.empty()) line += ", I just used " + tool;
+                line += ".";
+            }
+        } catch (...) {}
+        line += " " + std::to_string(task.seconds()) + " seconds so far.";
+        if (!task.queue.empty())
+            line += " After that I'll do " + short_cmd(task.queue.front()) + ".";
+        return line;
+    };
+
+    // Barge-in while DEMASCAS speaks: echo-cancel the mic, run the VAD on
+    // what's left, interrupt on a real human voice.  `spoken` receives the
+    // (cleaned) audio of what the user already said, so no words are lost.
+    auto watch_for_barge_in = [&](std::vector<float>& spoken) -> bool {
+        barge.reset();
+        barge_vad.reset();
+        std::vector<float> recent;
+        const size_t keep = static_cast<size_t>(cfg::SAMPLE_RATE * 0.8);
+        while (tts.is_playing() && g_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(cfg::CAPTURE_POLL_MS));
+            clk::time_point t_end;
+            auto raw = audio.drain_timed(t_end);
+            if (raw.empty()) continue;
+            auto clean = aec.process(raw, t_end);
+            if (clean.empty()) continue;
+            barge_vad.accept(clean.data(), clean.size());
+            recent.insert(recent.end(), clean.begin(), clean.end());
+            if (recent.size() > keep)
+                recent.erase(recent.begin(), recent.begin() + static_cast<long>(recent.size() - keep));
+            float mic_rms = demascas::AudioEngine::rms(raw.data(), raw.size());
+            float clean_rms = demascas::AudioEngine::rms(clean.data(), clean.size());
+            bool speech = barge_vad.speaking();
+            if (barge.update(mic_rms, clean_rms, speech, aec.converged(), speech)) {
+                std::cout << "[!] BARGE-IN (voice " << clean_rms << " after echo removal, "
+                          << (aec.converged() ? "AEC " + std::to_string(int(aec.echo_reduction_db())) + " dB"
+                                              : std::string("AEC still learning"))
+                          << ")\n";
+                tts.interrupt();
+                spoken = recent;
+                return true;
+            }
+        }
+        return false;
     };
 
     while (g_running) {
@@ -882,33 +1324,74 @@ int main() {
         //   interrupt TTS instantly and capture the command.
         // ────────────────────────────────────────────────────────
         case State::LISTENING: {
-            // ── Barge-in monitor: poll mic while TTS is speaking ────
-            //    Your voice at 30 cm ≈ 0.20–0.50 RMS.
-            //    Speaker bleed into mic ≈ 0.05–0.15 RMS.
-            //    BARGE_IN_THRESHOLD (0.15) separates the two.
-            if (tts.is_playing()) {
-                std::cout << "[🟢 LISTENING]  (barge-in armed, threshold="
-                          << cfg::BARGE_IN_THRESHOLD << ")\n";
-                bool barged_in = false;
-                while (tts.is_playing() && g_running) {
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(80));
-                    auto buf = audio.drain();
-                    if (buf.empty()) continue;
-                    float energy = demascas::AudioEngine::rms(
-                        buf.data(), buf.size());
-                    if (energy >= cfg::BARGE_IN_THRESHOLD) {
-                        std::cout << "[!] BARGE-IN detected (energy="
-                                  << energy << ")\n";
-                        tts.interrupt();
-                        barged_in = true;
-                        break;
+            // ── A background task finished → report, then maybe run the next
+            {
+                TaskOutcome done;
+                if (task.take(done)) {
+                    std::cout << "[✅ TASK DONE] " << done.command
+                              << (task.cancel_flag() ? " (cancelled)" : "") << "\n";
+                    last_task_failed = !done.success && !task.cancel_flag();
+                    if (done.path == "skill" || done.path == "agent") refresh_vocabulary();  // new apps learned
+                    if (!done.reply.empty())
+                        std::cout << "[DEMASCAS]: " << done.reply << "\n";
+                    try {
+                        bridge.log_interaction(done.command, done.path, done.tools,
+                                               done.reply.empty() ? "Done." : done.reply,
+                                               done.success && !task.cancel_flag(), done.skill_id);
+                    } catch (...) {}
+                    if (!task.cancel_flag()) {
+                        if (!done.confirm_token.empty()) {
+                            pending_token = done.confirm_token;
+                            pending_tool = done.confirm_tool;
+                            pending_description = done.confirm_speech;
+                            state = State::CONFIRMING;
+                            break;
+                        }
+                        if (done.file_choices.size() > 1) {
+                            pending_file_choices = done.file_choices;   // choices already spoken
+                            state = State::CLARIFYING;
+                            break;
+                        }
                     }
                 }
+                if (last_task_failed && !task.queue.empty()) {
+                    // Don't blindly run what was queued behind a failed task.
+                    std::string skipped = short_cmd(task.queue.front());
+                    task.queue.clear();
+                    last_task_failed = false;
+                    on_sentence("Since that didn't work, I've held off on " + skipped +
+                                ". Say it again if you still want it.");
+                }
+                if (!task.busy() && !task.has_result() && !task.queue.empty()) {
+                    current_command = task.queue.front();
+                    task.queue.pop_front();
+                    std::cout << "[▶ NEXT] " << current_command << "\n";
+                    state = State::PROCESSING;
+                    break;
+                }
+            }
+
+            // ── A long task: say so, instead of going quiet
+            if (task.busy()) {
+                if (task.id() != announced_task) { announced_task = task.id(); announce_stage = 0; }
+                int secs = task.seconds();
+                if (secs >= 15 && announce_stage == 0) {
+                    on_sentence("Still working on " + short_cmd(task.command()) + ".");
+                    announce_stage = 1;
+                } else if (secs >= 45 && announce_stage == 1) {
+                    on_sentence("This is taking a while. Say stop if you'd like me to give up.");
+                    announce_stage = 2;
+                }
+            }
+
+            // ── Barge-in monitor while DEMASCAS speaks (echo-cancelled VAD)
+            std::vector<float> spoken_so_far;
+            if (tts.is_playing()) {
+                bool barged_in = watch_for_barge_in(spoken_so_far);
                 if (!barged_in) {
                     // TTS finished naturally — short cooldown to let
                     // speaker residual ring out, then flush mic buffer.
-                    tts.play_sound("Tink");
+                    if (!task.busy()) tts.play_sound("Tink");
                     last_tts_done = clk::now();
                     std::this_thread::sleep_for(post_tts_guard);
                     audio.drain();
@@ -917,19 +1400,32 @@ int main() {
                 // speaking and we don't want to lose their words.
             }
 
-            std::cout << "[🟢 LISTENING]  (timeout "
-                      << cfg::FOLLOWUP_TIMEOUT << " s)\n";
+            // While a task runs, listen in short slices so finished results
+            // and new speech from DEMASCAS are handled promptly.
+            const bool working = task.busy();
+            static bool announced_working = false;
+            if (working && !announced_working)
+                std::cout << "[🟢 LISTENING] (task running — still listening)\n";
+            else if (!working)
+                std::cout << "[🟢 LISTENING]  (timeout " << cfg::FOLLOWUP_TIMEOUT << " s)\n";
+            announced_working = working;
 
             auto utterance = audio.capture_utterance(
-                cfg::FOLLOWUP_TIMEOUT, cfg::SILENCE_DURATION);
+                working ? 1.0f : cfg::FOLLOWUP_TIMEOUT, cfg::SILENCE_DURATION, spoken_so_far,
+                [&] { return tts.is_playing() || task.has_result(); },
+                [&] { tts.hold(true); });          // don't talk over the user
+            tts.hold(false);
 
             if (utterance.empty()) {
+                if (working || task.busy() || task.has_result() || tts.is_playing())
+                    break;                          // keep listening while working
                 std::cout << "[*] No speech detected — going back to sleep.\n";
                 tts.enqueue("Standing by.");
                 tts.wait_done();
                 last_tts_done = clk::now();
                 audio.drain();  // flush any residual TTS echo
                 llm.reset();
+                worker_llm.reset();
                 consecutive_blank = 0;
                 state = State::SLEEPING;
                 break;
@@ -955,7 +1451,7 @@ int main() {
                     std::cout << "[*] Hallucination filtered: \""
                               << current_command << "\"\n";
                 }
-                ++consecutive_blank;
+                if (!task.busy()) ++consecutive_blank;
                 std::cout << "[*] Blank " << consecutive_blank << "/"
                           << cfg::MAX_CONSECUTIVE_BLANKS << "\n";
                 if (consecutive_blank >= cfg::MAX_CONSECUTIVE_BLANKS) {
@@ -976,6 +1472,32 @@ int main() {
             // If the user (or their friend) says the wake word while
             // we're already listening, acknowledge it instead of
             // processing it as a command.
+            // ── Its own voice coming back through the mic → not a command
+            if (is_own_echo(current_command)) {
+                std::cout << "[*] Ignored own echo: \"" << current_command << "\"\n";
+                break;                                       // stay LISTENING
+            }
+            // ── How sure was the recogniser?  Garbled or background speech
+            //    must never trigger an action ("run to, delete, cloud").
+            {
+                const float conf = whisper.last_confidence();
+                const float unsure = whisper.last_unsure_share();
+                const bool control = is_cancel_request(current_command) ||
+                                     is_status_question(current_command) ||
+                                     is_dismiss(current_command);
+                std::cout << "[🎯 HEARD] confidence " << conf << ", unsure " << unsure << "\n";
+                if (task.busy() && !control && (conf < 0.65f || unsure > 0.2f)) {
+                    // While working, DEMASCAS listens to the room: only clear
+                    // speech (or stop / status) counts — not TV or other people.
+                    std::cout << "[*] Ignored unclear background speech while working\n";
+                    break;
+                }
+                if (!control && (conf < 0.5f || unsure >= 0.35f)) {
+                    on_sentence("Sorry, I didn't catch that. Could you say it again?");
+                    break;
+                }
+            }
+
             if (is_wake_only(current_command)) {
                 std::cout << "[*] Wake word in LISTENING state — acknowledging.\n";
                 tts.enqueue("I'm here. What can I do for you?");
@@ -983,7 +1505,8 @@ int main() {
             }
 
             // ── Dismiss detection (ChatGPT-style) ─────────
-            if (is_dismiss(current_command)) {
+            //    While a task runs, "stop" means stop the TASK (PROCESSING).
+            if (is_dismiss(current_command) && !task.busy()) {
                 std::cout << "[*] Dismiss → \"" << current_command << "\"\n";
                 tts.interrupt();
                 tts.enqueue("Standing by.");
@@ -1009,10 +1532,12 @@ int main() {
         case State::PROCESSING: {
             std::string reply;
             std::string path_taken;
+            std::string skill_id;
             std::vector<std::string> tools_used;
             bool success = true;
             cancel_llm = false;
-            const std::string normalized_command = current_command;
+            std::string normalized_command = current_command;
+            bool force_agent = false;     // retry after a complaint
 
             // ── Continuation: picking one of the files offered last turn
             if (!pending_file_choices.empty()) {
@@ -1040,8 +1565,100 @@ int main() {
 
             bool run_tool_path = false;
 
-            // PATH 1: Shortcut fast-path (< 1 µs, bypasses LLM entirely)
+            // ── Feedback on the previous result ("good job" / "that's wrong")
+            //    → reward signal for skills and future fine-tuning.  Not a task.
+            {
+                int fb = feedback_polarity(current_command);
+                if (fb != 0) {
+                    std::cout << "[👍 FEEDBACK] " << (fb > 0 ? "positive" : "negative") << "\n";
+                    try { bridge.send_feedback(fb > 0); } catch (...) {}
+                    on_sentence(fb > 0 ? "Thanks, I'll remember that worked."
+                                       : "Sorry about that. I'll avoid doing it that way again.");
+                    state = State::LISTENING;
+                    break;
+                }
+            }
+
+            // ── While a background task runs, the user can steer it by voice
+            if (task.busy()) {
+                if (is_cancel_request(current_command) || is_dismiss(current_command)) {
+                    std::cout << "[⏹ CANCEL] " << task.command() << "\n";
+                    task.cancel_flag() = true;                 // tool loop stops streaming
+                    try { bridge.cancel_agent(); } catch (...) {}   // agent stops before its next step
+                    task.queue.clear();
+                    tts.interrupt();
+                    on_sentence("Okay, I've stopped.");
+                    state = State::LISTENING;
+                    break;
+                }
+                if (is_status_question(current_command)) {
+                    on_sentence(task_status_line());
+                    state = State::LISTENING;
+                    break;
+                }
+            }
+            // A new task while one is running waits its turn.
+            auto defer_if_busy = [&]() -> bool {
+                if (!task.busy()) return false;
+                task.queue.push_back(normalized_command);
+                std::cout << "[⏸ QUEUED] " << normalized_command << "\n";
+                on_sentence("Sure, I'll do that right after I finish " +
+                            short_cmd(task.command()) + ".");
+                return true;
+            };
+            bool launched = false;   // work handed to the background task
+
+            // PATH 1.5 (checked right after the shortcut): skills — learned or
+            // built-in procedures run without the step-by-step agent loop.
+            demascas::ToolBridge::SkillMatch skill;
             auto shortcut = shortcuts.match(current_command);
+            if (!shortcut) {
+                auto t_skill = clk::now();
+                try { skill = bridge.match_skill(normalized_command); } catch (...) {}
+                std::cout << "[⏱ SKILL MATCH] "
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 clk::now() - t_skill).count()
+                          << " ms" << (skill.matched ? " → " + skill.name : "")
+                          << (!skill.matched && !skill.route.empty() ? " (route: " + skill.route + ")" : "")
+                          << "\n";
+                if (!skill.note.empty()) {             // "Got it — Discord."
+                    on_sentence(skill.note);
+                    refresh_vocabulary();
+                }
+                // The server fixes names it knows ("cord" → "Discord").
+                if (!skill.command.empty() && skill.command != normalized_command) {
+                    std::cout << "[📝 CORRECTED] \"" << normalized_command << "\" → \""
+                              << skill.command << "\"\n";
+                    normalized_command = skill.command;
+                    current_command = skill.command;
+                }
+            }
+            // The server judged it not a sensible request (fragments of words).
+            if (!shortcut && !skill.matched && skill.route == "unclear") {
+                std::cout << "[*] Unclear request — asking again instead of acting\n";
+                on_sentence("Sorry, I didn't catch that. Could you say it again?");
+                state = State::LISTENING;
+                break;
+            }
+            // A complaint about the last task → reward signal + one honest retry
+            // through the multi-step agent (instead of treating it as a command).
+            if (!shortcut && !skill.matched && is_complaint(current_command)) {
+                try { bridge.send_feedback(false); } catch (...) {}
+                if (!last_action_command.empty()) {
+                    std::cout << "[↩ RETRY] " << last_action_command << "\n";
+                    on_sentence("Sorry about that. Let me try it properly.");
+                    normalized_command = current_command = last_action_command;
+                    force_agent = true;
+                } else {
+                    on_sentence("Sorry about that. Tell me what you'd like me to do and I'll try again.");
+                    state = State::LISTENING;
+                    break;
+                }
+            } else if (!shortcut && skill.route != "chat") {
+                last_action_command = normalized_command;
+            }
+
+            // PATH 1: Shortcut fast-path (< 1 µs, bypasses LLM entirely)
             if (shortcut) {
                 path_taken = "shortcut";
                 std::cout << "[⚡ SHORTCUT] "
@@ -1052,63 +1669,61 @@ int main() {
                 reply = success ? "Done." : "That shortcut didn't work.";
                 on_sentence(reply);
             }
-            // PATH 2.5: Domain Agent (specialized, multi-step, memory-aware)
-            else if (demascas::is_agent_command(normalized_command)) {
-                path_taken = "agent";
-                std::string context_json = "{}";
-                try {
-                    auto ctx = bridge.fetch_active_context();
-                    if (!ctx.empty()) context_json = ctx;
-                } catch (...) {}
-
-                auto ar = bridge.execute_agent(normalized_command, context_json);
-
-                if (ar.unavailable && ar.summary.empty()) {
-                    // Agent system not loaded / unreachable — don't give up,
-                    // the general tool loop can still handle the command.
-                    std::cout << "[AGENT] Unavailable (" << ar.error
-                              << ") — falling back to the tool path.\n";
-                    run_tool_path = true;
+            // PATH 1.5: Skill
+            else if (skill.matched) {
+                path_taken = "skill";
+                skill_id = skill.skill_id;
+                std::cout << "[🧠 SKILL] " << skill.name << "\n";
+                if (skill.done) {
+                    reply = skill.summary;               // e.g. taught a routine / a word
+                    on_sentence(reply);
+                    if (skill.skill_id == "vocabulary") refresh_vocabulary();
+                } else if (!skill.ask.empty()) {
+                    reply = skill.ask;                   // missing parameter
+                    on_sentence(reply);
                 } else {
-                    success = ar.success;
-                    tools_used = ar.tool_calls;
-
-                    if (!ar.confirm_token.empty()) {
-                        // A destructive action is waiting for a yes/no.
-                        pending_token = ar.confirm_token;
-                        pending_tool = ar.pending_tool;
-                        pending_description = ar.confirm_speech;
-                        reply = ar.confirm_speech;
-                        state = State::CONFIRMING;
-                    } else if (!ar.summary.empty()) {
-                        // TTS splits sentences itself (URL/decimal-safe); the
-                        // old per-'.' split read "https://www." aloud.
-                        on_sentence(ar.summary);
-                        reply = ar.summary;
-                    } else if (!ar.error.empty()) {
-                        reply = "I ran into an issue: " + ar.error.substr(0, 80);
-                        on_sentence(reply);
-                        success = false;
-                    }
-
-                    if (state != State::CONFIRMING && ar.file_choices.size() > 1) {
-                        // The agent's summary already listed the files.
-                        pending_file_choices = ar.file_choices;
-                        state = State::CLARIFYING;
+                    launched = true;
+                    if (!defer_if_busy()) {
+                        if (!skill.ack.empty()) on_sentence(skill.ack);   // slow skills
+                        std::string sid = skill.skill_id, params = skill.params_json;
+                        task.start(normalized_command,
+                                   [&skill_work, sid, params] { return skill_work(sid, params); });
                     }
                 }
             }
+            // PATH 2.5: Domain Agent (specialized, multi-step, memory-aware)
+            //   The server's route decides; the local keyword rules only when
+            //   it's unsure (or unreachable).
+            else if (force_agent || skill.route == "agent" ||
+                     (skill.route.empty() && demascas::is_agent_command(normalized_command))) {
+                launched = true;
+                if (!defer_if_busy()) {
+                    std::string context_json = "{}";
+                    try {
+                        auto ctx = bridge.fetch_active_context();
+                        if (!ctx.empty()) context_json = ctx;
+                    } catch (...) {}
+                    std::string cmd = normalized_command;
+                    task.start(cmd, [&agent_work, cmd, context_json] {
+                        return agent_work(cmd, context_json);
+                    });
+                }
+            }
             // PATH 2: Simple question (streaming fast LLM, no tool schemas)
-            else if (shortcuts.is_simple_question(current_command)) {
+            //   Answered right away — even while a task runs.
+            else if (skill.route == "chat" ||
+                     (skill.route.empty() && shortcuts.is_simple_question(current_command))) {
                 path_taken = "fast";
                 std::cout << "[⚡ FAST PATH] Simple question — streaming.\n";
+                if (!skill.knowledge.empty())
+                    std::cout << "[🌐 WEB NOTES] " << skill.knowledge.size() << " chars from saved pages\n";
                 reply = llm.fast_chat_streaming(
-                    current_command, bridge, on_sentence, cancel_llm);
+                    current_command, bridge, on_sentence, cancel_llm, skill.knowledge);
                 success = llm.last_success();
                 // The fast path has no tools.  Its prompt tells the model to
                 // say "Let me handle that for you" when an action is needed —
                 // actually re-route those to the tool path.
-                if (success && contains(reply, "handle that for you")) {
+                if (success && (contains(reply, "handle that for you") || claims_action(reply))) {
                     std::cout << "[⚡ FAST PATH] Model asked for tools — re-routing.\n";
                     run_tool_path = true;
                 }
@@ -1116,36 +1731,20 @@ int main() {
                 run_tool_path = true;
             }
 
-            // PATH 3: Tool ReAct (default fallback for everything else)
+            // PATH 3: Tool ReAct (default fallback) — in the background
             if (run_tool_path) {
-                path_taken = "tool";
-                std::cout << "[🔧 TOOL PATH] Full processing — streaming.\n";
-
-                std::string learned_ctx;
-                try {
-                    learned_ctx = bridge.fetch_learned_context(current_command);
-                } catch (...) {}
-
-                reply = llm.chat_with_tools_streaming(
-                    current_command, bridge, on_sentence, cancel_llm,
-                    learned_ctx);
-                tools_used = llm.last_tools_used();
-                success = llm.last_success();
-
-                if (llm.has_pending_confirmation()) {
-                    auto pc = llm.take_pending_confirmation();
-                    pending_token = pc.token;
-                    pending_tool = pc.tool;
-                    pending_description = pc.speech;
-                    state = State::CONFIRMING;
-                } else {
-                    auto choices = llm.take_file_choices();
-                    if (choices.size() > 1) {
-                        // "I found N files: … Which one?" was already spoken.
-                        pending_file_choices = std::move(choices);
-                        state = State::CLARIFYING;
-                    }
+                launched = true;
+                if (!defer_if_busy()) {
+                    std::cout << "[🔧 TOOL PATH] Full processing — streaming.\n";
+                    std::string cmd = current_command;
+                    task.start(cmd, [&tool_work, cmd] { return tool_work(cmd); });
                 }
+            }
+
+            if (launched) {
+                // Logged when the task finishes (LISTENING picks up the result).
+                state = State::LISTENING;
+                break;
             }
 
             if (!reply.empty()) {
@@ -1156,7 +1755,7 @@ int main() {
             try {
                 bridge.log_interaction(
                     current_command, path_taken, tools_used,
-                    reply.empty() ? "Done." : reply, success);
+                    reply.empty() ? "Done." : reply, success, skill_id);
             } catch (...) {}
 
             // Persist session for crash recovery
@@ -1312,6 +1911,8 @@ int main() {
 
     // ── Cleanup ─────────────────────────────────────────────────
     std::cout << "\n[*] Shutting down DEMASCAS daemon.\n";
+    task.abandon();                 // don't wait for a long agent run
+    tts.set_echo_canceller(nullptr);  // the canceller is destroyed before TTS
     audio.stop();
     whisper.shutdown();
     return 0;

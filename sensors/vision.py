@@ -39,6 +39,31 @@ def get_active_window_tree(app_name: str | None = None) -> str:
         A formatted string containing the app name and its UI tree,
         or an error message if Accessibility permissions are not granted.
     """
+    # Electron apps (Discord, Slack, VS Code…) show nothing to the AppleScript
+    # scan; the in-process reader exposes and reads them in ~0.1–0.6 s.
+    try:
+        from core import axui
+        target = (app_name or "").strip() or axui.frontmost_app()
+        if target and axui.available() and axui.is_electron(target):
+            rows = axui.tree_text(target)
+            if rows:
+                return f"ACTIVE APP: {target}\nUI TREE MAP:\n{rows}"
+    except Exception:
+        pass
+    if app_name:
+        # The model sometimes names an app that isn't running (it asked for
+        # "Browser").  Resolve it; if it isn't open, read the app in front.
+        try:
+            from core.appnames import resolve
+            from core.axui import pid_of
+            hit, conf = resolve(app_name)
+            if hit and conf >= 0.72:
+                app_name = hit
+            if not pid_of(app_name):
+                print(f"[*] '{app_name}' isn't running — reading the app in front instead")
+                app_name = None
+        except Exception:
+            pass
     if app_name:
         # Sanitize
         safe_name = app_name.replace('\\', '').replace('"', '').strip()

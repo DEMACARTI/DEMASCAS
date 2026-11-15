@@ -156,10 +156,22 @@ std::string WhisperEngine::run_once(struct whisper_context* ctx,
 
     std::string result;
     int n_seg = whisper_full_n_segments(ctx);
+    double p_sum = 0.0;
+    int n_tok = 0, n_unsure = 0;
+    const whisper_token eot = whisper_token_eot(ctx);
     for (int i = 0; i < n_seg; ++i) {
         const char* txt = whisper_full_get_segment_text(ctx, i);
         if (txt) result += txt;
+        for (int t = 0; t < whisper_full_n_tokens(ctx, i); ++t) {
+            if (whisper_full_get_token_id(ctx, i, t) >= eot) continue;   // special tokens
+            float p = whisper_full_get_token_p(ctx, i, t);
+            p_sum += p;
+            n_unsure += p < 0.3f;
+            ++n_tok;
+        }
     }
+    last_conf_ = n_tok ? static_cast<float>(p_sum / n_tok) : 0.0f;
+    last_unsure_ = n_tok ? static_cast<float>(n_unsure) / n_tok : 1.0f;
 
     // Trim leading/trailing whitespace
     auto a = result.find_first_not_of(" \t\n\r");

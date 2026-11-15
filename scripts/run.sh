@@ -114,12 +114,19 @@ case "$LLM_STATUS" in
     3)
         MLX_MODEL="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 1p)"
         MLX_PORT="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 2p)"
+        MLX_ADAPTER="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 3p)"
         if lsof -nP -iTCP:"${MLX_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
             echo "❌  Port ${MLX_PORT} is in use by something that isn't answering as an LLM."
             exit 1
         fi
+        MLX_EXTRA=()
+        if [ -n "$MLX_ADAPTER" ]; then
+            # LoRA adapter trained from your own usage (python main.py adapters)
+            echo "[*] Using learned adapter: ${MLX_ADAPTER}"
+            MLX_EXTRA=(--adapter-path "$MLX_ADAPTER")
+        fi
         echo "[*] Starting MLX server: ${MLX_MODEL} on port ${MLX_PORT}..."
-        python -m mlx_lm server --model "$MLX_MODEL" --port "$MLX_PORT" &
+        python -m mlx_lm server --model "$MLX_MODEL" --port "$MLX_PORT" ${MLX_EXTRA[@]+"${MLX_EXTRA[@]}"} &
         TEXT_PID=$!
         PIDS+=($TEXT_PID)
         # First run downloads the model — wait up to MLX_STARTUP_TIMEOUT s.
@@ -221,6 +228,7 @@ echo ""
 cd daemon
 
 # sherpa-onnx shared libraries
-export DYLD_LIBRARY_PATH="${PWD}/models/sherpa-onnx/lib:${DYLD_LIBRARY_PATH:-}"
+export DYLD_LIBRARY_PATH="${PWD}/models/sherpa-onnx/lib:${DYLD_LIBRARY_PATH:-}"   # macOS
+export LD_LIBRARY_PATH="${PWD}/models/sherpa-onnx/lib:${LD_LIBRARY_PATH:-}"       # Linux
 
 ./build/demascas_daemon

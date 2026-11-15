@@ -4,6 +4,7 @@
  */
 
 #include "audio_engine.hpp"
+#include "vad.hpp"
 #include "config.hpp"
 
 #include <algorithm>
@@ -27,6 +28,7 @@ int AudioEngine::pa_callback(const void* in, void* /*out*/,
     {
         std::lock_guard<std::mutex> lk(self->mu_);
         self->ring_.insert(self->ring_.end(), samples, samples + frames);
+        self->last_cb_ = clk::now();
     }
     return paContinue;
 }
@@ -103,6 +105,7 @@ bool AudioEngine::start(int device_index) {
         return false;
     }
 
+    if (const PaStreamInfo* si = Pa_GetStreamInfo(stream_)) input_latency_ = si->inputLatency;
     err = Pa_StartStream(stream_);
     if (err != paNoError) {
         std::cerr << "[!] PortAudio start error: "
@@ -174,6 +177,15 @@ bool AudioEngine::reinit_on_wake(int device_index) {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+std::vector<float> AudioEngine::drain_timed(clk::time_point& last_sample_time) {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<float> out;
+    out.swap(ring_);
+    last_sample_time = last_cb_ - std::chrono::microseconds(
+        static_cast<long long>(input_latency_ * 1e6));
+    return out;
+}
+
 std::vector<float> AudioEngine::drain() {
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<float> out;
@@ -216,32 +228,57 @@ std::vector<float> AudioEngine::collect(float seconds) {
     return drain();
 }
 
-std::vector<float> AudioEngine::capture_utterance(float timeout_sec,
-                                                    float silence_sec) {
+std::vector<float> AudioEngine::capture_utterance(
+        float timeout_sec, float silence_sec, const std::vector<float>& already_spoken,
+        const std::function<bool()>& abort_before_speech,
+        const std::function<void()>& on_speech_start) {
     drain();  // start clean
 
     auto deadline = clk::now()
         + std::chrono::milliseconds(static_cast<int>(timeout_sec * 1000));
 
     std::vector<float> recording;
-    std::vector<float> preroll;   // last quiet buffer — keeps soft word onsets
+    // Rolling pre-roll: a VAD confirms speech ~250 ms after it starts, so
+    // keep the last 0.6 s to not clip the first syllable.
+    std::vector<float> preroll;
+    const size_t preroll_max = static_cast<size_t>(cfg::SAMPLE_RATE * 0.6);
     bool speech_started = false;
     auto last_speech     = clk::now();
+    if (vad_) vad_->reset();
+
+    if (!already_spoken.empty()) {
+        // Barge-in: the user is mid-sentence — keep what they already said.
+        recording = already_spoken;
+        speech_started = true;
+        deadline = std::max(deadline, clk::now() + std::chrono::seconds(15));
+        if (vad_) vad_->accept(already_spoken.data(), already_spoken.size());
+        if (on_speech_start) on_speech_start();
+    }
 
     while (clk::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(cfg::CAPTURE_POLL_MS));
 
+        if (!speech_started && abort_before_speech && abort_before_speech())
+            return {};
+
         auto buf = drain();
         if (buf.empty()) continue;
 
-        float energy = rms(buf.data(), buf.size());
+        bool is_speech;
+        if (vad_) {
+            vad_->accept(buf.data(), buf.size());
+            is_speech = vad_->speaking();
+        } else {
+            is_speech = rms(buf.data(), buf.size()) >= cfg::VAD_ENERGY_THRESHOLD;
+        }
 
-        if (energy >= cfg::VAD_ENERGY_THRESHOLD) {
+        if (is_speech) {
             if (!speech_started) {
                 recording.insert(recording.end(), preroll.begin(), preroll.end());
                 // Speech may continue past the original deadline — give the
                 // user up to 15 s of talking time from when they START.
                 deadline = std::max(deadline, clk::now() + std::chrono::seconds(15));
+                if (on_speech_start) on_speech_start();
             }
             speech_started = true;
             last_speech    = clk::now();
@@ -255,7 +292,10 @@ std::vector<float> AudioEngine::capture_utterance(float timeout_sec,
             if (silence_elapsed >= silence_sec)
                 break;  // silence detected — utterance complete
         } else {
-            preroll.swap(buf);
+            preroll.insert(preroll.end(), buf.begin(), buf.end());
+            if (preroll.size() > preroll_max)
+                preroll.erase(preroll.begin(),
+                              preroll.begin() + static_cast<long>(preroll.size() - preroll_max));
         }
     }
 

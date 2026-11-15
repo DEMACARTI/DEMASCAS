@@ -492,6 +492,19 @@ def open_application(app_name: str) -> str:
     Returns:
         A success/failure message string.
     """
+    # Misheard names ("cord", "discard") → the installed app ("Discord").
+    heard = app_name
+    try:
+        from core.appnames import resolve
+        resolved, conf = resolve(app_name)
+        if resolved and conf >= 0.72 and resolved.lower() != str(app_name).strip().lower():
+            print(f"[*] '{app_name}' → installed app '{resolved}' ({conf:.2f})")
+            app_name = resolved
+            if conf < 1.0:
+                from core.vocabulary import add_correction
+                add_correction(heard, resolved)
+    except Exception:
+        pass
     safe_name = _sanitize_for_applescript(app_name)
     print(f"[*] DEMASCAS is opening: '{safe_name}'...")
 
@@ -1141,6 +1154,18 @@ def find_and_click(search_text: str) -> str:
     """
     safe_text = _sanitize_for_applescript(search_text)
     print(f"[*] DEMASCAS is searching and clicking: '{safe_text}'...")
+
+    # Fast path: in-process accessibility lookup (and the only way to see
+    # inside Electron apps).  Falls back to the AppleScript search below.
+    try:
+        from core import axui
+        if axui.available():
+            app = axui.frontmost_app()
+            item = axui.find(app, search_text, cutoff=0.75) if app else None
+            if item and axui.press(item):
+                return f"Success: Clicked '{item['name']}' in {app}."
+    except Exception as e:
+        print(f"[*] fast click unavailable ({e}); using AppleScript search")
 
     applescript_code = f"""
     tell application "System Events"

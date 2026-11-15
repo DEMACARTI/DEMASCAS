@@ -431,6 +431,9 @@ public:
             "create", "make", "move", "copy", "paste", "drag",
             "launch", "quit", "minimize", "maximize", "switch",
             "screenshot", "activate", "navigate", "browse", "use",
+            // messaging — "send a message to Hatem on Discord" is NOT small talk
+            "send", "message", "text", "dm", "reply", "post", "share", "call",
+            "discord", "whatsapp", "slack", "telegram", "imessage",
         };
         bool has_action = false;
         for (const auto& v : action_verbs) {

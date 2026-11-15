@@ -38,6 +38,13 @@ TOOL_TIMEOUT = 30
 # BEFORE that, otherwise it keeps clicking/typing after the daemon has
 # already told the user it failed and moved on.
 AGENT_TIME_BUDGET = 80
+
+# Live progress + cancellation, so the user can ask "what are you doing?"
+# or say "stop" while an agent works (the daemon keeps listening).
+import threading as _threading
+CANCEL_EVENT = _threading.Event()
+PROGRESS: dict = {"running": False, "goal": "", "agent": "", "step": 0,
+                  "last_tool": "", "started": 0.0}
 TOOL_PREDICT = 256
 LLM_TEMPERATURE = 0.1
 HISTORY_WINDOW = 6
@@ -116,6 +123,8 @@ class AgentBase(ABC):
         """
         self._goal = goal
         self._steps = []
+        self._caps_cache = {}            # per-run app capability blocks
+        self.__dict__.pop("_web_notes", None)
         self._step_count = 0
         self._error_streak = 0
         self._recovery_attempted = False
@@ -145,8 +154,21 @@ class AgentBase(ABC):
 
         logger.info("[🤖 AGENT:%s] goal='%s'", self.domain_name.upper(), goal[:60])
 
+        CANCEL_EVENT.clear()
+        PROGRESS.update(running=True, goal=goal[:200], agent=self.domain_name,
+                        step=0, last_tool="", started=time.time())
+        try:
+            return self._step_loop(goal, tool_calls_made)
+        finally:
+            PROGRESS["running"] = False
+
+    def _step_loop(self, goal: str, tool_calls_made: list) -> "AgentResult":
         for step_num in range(1, MAX_STEPS + 1):
             self._step_count = step_num
+            PROGRESS["step"] = step_num
+            if CANCEL_EVENT.is_set():
+                return AgentResult(False, "Okay, I stopped.", step_num - 1,
+                                   tool_calls_made, error="cancelled")
             if self._time_left() <= 5:
                 return self._abort("Ran out of time before finishing.")
             history_block = self._build_history_block()
@@ -198,6 +220,15 @@ class AgentBase(ABC):
                     return self._abort("Repeated out-of-scope tool calls.")
                 continue
 
+            # Small models often re-issue a one-shot action they believe is
+            # right instead of saying "done".  Repeating an action that
+            # already SUCCEEDED = the task is complete.
+            if tool_name in self._ONE_SHOT_TOOLS and any(
+                    st.tool == tool_name and st.args == tool_args and st.ok for st in self._steps):
+                summary = self._done_summary(tool_name, tool_args)
+                print(f"[DONE] {self.domain_name} step={step_num} (repeat of a successful action) {summary}")
+                return AgentResult(True, summary, step_num - 1, tool_calls_made)
+
             if self._is_duplicate(tool_name, tool_args):
                 self._record_step(step_num, tool_name, tool_args, "Duplicate call blocked.", success=False)
                 self._error_streak += 1
@@ -210,6 +241,7 @@ class AgentBase(ABC):
 
             print(f"[STEP] {self.domain_name} #{step_num} {tool_name}({json.dumps(tool_args)[:120]})")
             logger.info("[🤖 STEP %d] %s(%s)", step_num, tool_name, json.dumps(tool_args)[:80])
+            self._ensure_target_app_frontmost(tool_name)
             result = self._call_tool(tool_name, tool_args)
 
             # A destructive tool asked for the user's spoken approval.  Stop
@@ -232,6 +264,7 @@ class AgentBase(ABC):
             logger.info("[🤖 RESULT] %s %s", status, result[:100].replace("\n", " "))
             tool_calls_made.append(tool_name)
             record = self._record_step(step_num, tool_name, tool_args, result, success=not is_error)
+            PROGRESS["last_tool"] = tool_name
             self._on_step(record)
             self._on_step_complete(record)
 
@@ -316,6 +349,11 @@ class AgentBase(ABC):
                 raw = choices[0].get("message", {}).get("content", "")
             if not raw:
                 return None
+            try:   # experience log → future fine-tuning data
+                from core.skills.trajectories import note_llm_turn
+                note_llm_turn(payload["messages"], raw)
+            except Exception:
+                pass
             return self._parse_action(raw)
         except Exception as e:
             logger.exception("Agent LLM exception: %s", e)
@@ -489,6 +527,15 @@ class AgentBase(ABC):
         last_result = str(ctx.get("last_result", ""))[:300]
         prev = str(ctx.get("last_command", ""))[:200]
         prev_reply = str(ctx.get("last_reply", ""))[:200]
+        caps = self._app_capabilities(active_app)
+        web = self.__dict__.get("_web_notes")
+        if web is None:                    # once per run (cache-friendly prompt)
+            try:
+                from core.web.store import context_block
+                web = context_block(self._goal, max_chars=600, k=2)
+            except Exception:
+                web = ""
+            self.__dict__["_web_notes"] = web
         return (
             # Lets follow-ups like "show that on another site" resolve "that".
             f"previous_request: {prev or '(none)'}\n"
@@ -497,7 +544,88 @@ class AgentBase(ABC):
             f"active_url: {active_url or '(unknown)'}\n"
             f"active_file: {active_file or '(unknown)'}\n"
             f"last_tool_result: {last_result or '(none)'}"
+            + (f"\n{caps}" if caps else "")
+            + (f"\n{web}" if web else "")
         )
+
+    _ONE_SHOT_TOOLS = {"press_keyboard_shortcut", "click_menu_item", "open_url",
+                       "open_application", "activate_application", "run_app_script"}
+
+    def _done_summary(self, tool_name: str, tool_args: dict) -> str:
+        """'Done — show pinned messages.' using what the learned manual says
+        that shortcut / menu item does."""
+        try:
+            from core.appknowledge import learner
+            for app in learner.apps_in_text(self._goal):
+                for e in learner.load_manual(app)["entries"]:
+                    if (tool_name == "press_keyboard_shortcut" and e.get("keys")
+                            and e["keys"] == str(tool_args.get("keys", "")).replace(" ", "").lower()) or \
+                            (tool_name == "click_menu_item" and e.get("menu")
+                             and e["menu"].lower() == str(tool_args.get("menu_path", "")).lower()):
+                        return f"Done — {e['task'].lower()} in {app}."
+        except Exception:
+            pass
+        return "Done."
+
+    # Keys go to whatever app is in front.  A shortcut learned for Discord
+    # pressed while the user is in Mail would act on Mail — so the agent
+    # itself (not the model) brings the target app forward first.
+    _APP_INPUT_TOOLS = {"press_keyboard_shortcut", "type_text", "type_and_submit"}
+
+    def _ensure_target_app_frontmost(self, tool_name: str) -> None:
+        if tool_name not in self._APP_INPUT_TOOLS:
+            return
+        try:
+            from core.appknowledge import learner
+            targets = learner.apps_in_text(self._goal)
+        except Exception:
+            return
+        if len(targets) != 1:
+            return                      # no learned app named (or ambiguous): leave focus alone
+        app = targets[0]
+        if self.__dict__.get("_focused_app") == app and \
+                self._steps and self._steps[-1].tool not in ("open_application", "open_url"):
+            return                      # already brought forward this run
+        res = self._call_tool("activate_application", {"app_name": app})
+        if not self._is_tool_error(res):
+            self.__dict__["_focused_app"] = app
+            time.sleep(0.3)             # let the window take focus before keys arrive
+
+    def _app_capabilities(self, app: str) -> str:
+        """What the app being used can do — from its scripting dictionary and
+        the manual DEMASCAS learned (menus, shortcuts, help pages).  Covers the
+        active app AND any learned app the goal names ("…in Discord").
+        Computed once per run so the prompt stays cache-friendly."""
+        cache = self.__dict__.setdefault("_caps_cache", {})
+        try:
+            from core.appknowledge import learner
+            apps = list(dict.fromkeys(([app] if app else []) + learner.apps_in_text(self._goal)))
+        except Exception:
+            apps = [app] if app else []
+        blocks = []
+        for a in apps:
+            if a not in cache:
+                parts = []
+                try:
+                    from core.appknowledge.dictionary import capabilities
+                    caps = capabilities(a, self._goal or a, k=5, max_chars=600)
+                    if caps:
+                        parts.append(f"{a} scripting (run_app_script):\n{caps}")
+                except Exception:
+                    pass
+                try:
+                    from core.appknowledge import learner
+                    hint = learner.hints(a, self._goal or a, k=6, max_chars=600)
+                    if hint:
+                        parts.append(f"You already learned {a} — do NOT call learn_app. "
+                                     f"What you know (✓ = worked before):\n{hint}")
+                    learner.refresh_menus_async(a)
+                except Exception:
+                    pass
+                cache[a] = "\n".join(parts)
+            if cache[a]:
+                blocks.append(cache[a])
+        return "\n".join(blocks)
 
     def _is_duplicate(self, tool: str, args: dict) -> bool:
         """

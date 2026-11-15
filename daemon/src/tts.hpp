@@ -31,6 +31,8 @@
 
 namespace demascas {
 
+class EchoCanceller;
+
 class TTS {
 public:
     /// Which synthesis engine is active.
@@ -66,6 +68,20 @@ public:
 
     /// True if audio is currently being spoken or queued.
     bool is_playing() const;
+
+    /// Loudness (RMS) of what was sent to the speakers in the last ~0.4 s —
+    /// the reference for telling the user's voice from our own echo.
+    /// Returns -1 when unknown (macOS `say` fallback).
+    float playback_level() const;
+
+    /// Hold: queue new sentences but don't START speaking them (the user is
+    /// talking).  Releasing resumes the queue.  A sentence already playing
+    /// is not cut — interrupt() does that.
+    void hold(bool on);
+
+    /// Every frame sent to the speakers is also given to the echo canceller
+    /// (stamped with when it will be heard) so the mic can subtract it.
+    void set_echo_canceller(EchoCanceller* aec) { aec_ = aec; }
 
     /// Block until all queued sentences are spoken (or interrupted).
     void wait_done();
@@ -140,6 +156,11 @@ private:
     std::deque<std::string>     warm_queue_;
     bool                        pa_held_     = false;  // TTS holds a Pa_Initialize reference
     std::atomic<bool>           playing_{false};
+    std::atomic<bool>           held_{false};
+    EchoCanceller*        aec_ = nullptr;
+    signed long                 out_capacity_ = 0;   // output buffer size (frames), measured when empty
+    mutable std::mutex          lvl_mu_;
+    std::deque<std::pair<std::chrono::steady_clock::time_point, float>> lvl_;
     std::atomic<bool>           stop_{false};
     std::thread                 worker_;
 };

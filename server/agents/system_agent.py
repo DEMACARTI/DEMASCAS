@@ -2,6 +2,7 @@
 system_agent.py - App control, UI automation, keyboard shortcuts, screen reading.
 """
 
+import json
 import re
 from .base_agent import AgentBase, AgentResult, StepRecord
 
@@ -29,6 +30,9 @@ class SystemAgent(AgentBase):
         "get_active_window_tree", "list_open_windows",
         "get_clipboard", "set_clipboard",
         "vision_execute",
+        "run_app_script", "click_menu_item", "learn_app",
+        "create_presentation", "edit_presentation",
+        "create_document", "create_spreadsheet",
     ]
 
     @property
@@ -43,13 +47,21 @@ class SystemAgent(AgentBase):
             "5. For typing into a field, use type_text_into_element.\n"
             "6. For volume/brightness, prefer press_keyboard_shortcut (F1/F2 and F10/F11/F12).\n"
             "7. If element lookup fails, fallback to find_and_click or vision_execute.\n"
-            "8. Keyboard shortcut format examples: cmd+c, cmd+shift+4, f11, volume_up."
+            "8. Keyboard shortcut format examples: cmd+c, cmd+shift+4, f11, volume_up.\n"
+            "9. If the context lists what you learned about an app (shortcuts, menu "
+            "items, scripting commands), use those: activate the app, then "
+            "press_keyboard_shortcut / click_menu_item / run_app_script — before "
+            "searching the screen.  Call learn_app ONLY for an app the context says nothing "
+            "about — never for one you already learned."
         )
 
     def run(self, goal, context):
         goal_lower = (goal or "").lower().strip()
 
         if self._looks_like_new_powerpoint_task(goal_lower):
+            topic = self._presentation_topic(goal)
+            if topic:
+                return self._build_presentation_flow(topic)
             return self._new_powerpoint_presentation_flow()
 
         app = self._parse_app_open(goal_lower)
@@ -75,9 +87,33 @@ class SystemAgent(AgentBase):
             k in goal_lower
             for k in ["powerpoint", "power point", "microsoft powerpoint", "point app", "ppt"]
         )
-        has_create = any(k in goal_lower for k in ["create", "new", "blank"])
+        has_create = any(k in goal_lower for k in ["create", "new", "blank", "make", "build", "prepare"])
         has_doc = any(k in goal_lower for k in ["presentation", "slides", "ppt"])
         return has_powerpoint and has_create and has_doc
+
+    @staticmethod
+    def _presentation_topic(goal: str) -> str:
+        m = re.search(r"\b(?:about|on|regarding|covering|for my|for the|for)\s+(.+)$", goal or "", re.I)
+        if not m:
+            return ""
+        topic = re.sub(r"\s+(?:with|in)\s+\d+\s+slides?\b.*$", "", m.group(1), flags=re.I)
+        topic = re.sub(r"^(?:a|an|the)\s+", "", topic.strip(" .?!"), flags=re.I)
+        return "" if topic.lower() in ("it", "this", "that", "me", "") else topic
+
+    def _build_presentation_flow(self, topic: str) -> AgentResult:
+        """Write the deck as a file (fast, reliable) and open it — instead of
+        clicking through PowerPoint's UI."""
+        res = self._call_tool("create_presentation", {"topic": topic})
+        if self._is_tool_error(res):
+            return AgentResult(False, f"I couldn't build the presentation about {topic}.",
+                               1, ["create_presentation"], error=res)
+        self._active_context["active_app"] = "Microsoft PowerPoint"
+        try:
+            msg = json.loads(res).get("message") or ""
+        except (ValueError, AttributeError):
+            msg = ""
+        return AgentResult(True, msg or f"Your presentation about {topic} is ready.",
+                           1, ["create_presentation"])
 
     def _new_powerpoint_presentation_flow(self) -> AgentResult:
         tools: list[str] = []

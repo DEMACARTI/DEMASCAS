@@ -22,6 +22,7 @@ daemon/build/
 daemon/models/kokoro-en-v0_19/
 daemon/models/sherpa-onnx/
 daemon/models/piper/
+daemon/models/silero_vad.onnx
 
 # Shell config (personal)
 .zshrc

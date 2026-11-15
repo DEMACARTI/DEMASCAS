@@ -33,7 +33,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
-LLM_COMMANDS = {"setup", "doctor", "detect", "llm-check"}
+LLM_COMMANDS = {"setup", "doctor", "detect", "llm-check",
+                "learn", "adapters", "rollback", "skills", "web"}
 
 
 def main() -> None:

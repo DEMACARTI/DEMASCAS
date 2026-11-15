@@ -51,6 +51,7 @@ class LLMConfig:
     context_tokens: int = 4096
     keep_loaded_minutes: int = 15      # Ollama: keep weights in RAM this long after last use
     autostart: bool = False            # run.sh may start the runtime (MLX has no background service)
+    adapter_path: str = ""             # LoRA adapter DEMASCAS trained from your usage (MLX)
     vision: VisionConfig = field(default_factory=VisionConfig)
     source: str = "none"               # env | config | none   (not persisted)
 
@@ -105,6 +106,7 @@ def load() -> LLMConfig:
                                            raw.get("context_tokens")
                                            or DEFAULT_CONTEXT.get(cfg.runtime, 4096)))
         cfg.keep_loaded_minutes = int(raw.get("keep_loaded_minutes", 15))
+        cfg.adapter_path = os.getenv("DEMASCAS_LLM_ADAPTER", raw.get("adapter_path", ""))
     elif raw.get("chat_url") and raw.get("model"):
         rt = raw.get("runtime", "openai")
         cfg = LLMConfig(
@@ -112,6 +114,7 @@ def load() -> LLMConfig:
             context_tokens=int(raw.get("context_tokens") or DEFAULT_CONTEXT.get(rt, 4096)),
             keep_loaded_minutes=int(raw.get("keep_loaded_minutes", 15)),
             autostart=bool(raw.get("autostart", False)),
+            adapter_path=str(raw.get("adapter_path", "")),
             source="config",
         )
     else:
@@ -138,6 +141,8 @@ def save(cfg: LLMConfig) -> str:
         "keep_loaded_minutes": int(cfg.keep_loaded_minutes),
         "autostart": bool(cfg.autostart),
     }
+    if cfg.adapter_path:
+        llm["adapter_path"] = cfg.adapter_path
     if cfg.vision.chat_url and cfg.vision.model:
         llm["vision"] = {"chat_url": _normalize_chat_url(cfg.vision.chat_url),
                          "model": cfg.vision.model}

@@ -2082,4 +2082,229 @@ TOOLS = [
                         'description': 'Play the first video in the current YouTube search results '
                                        '(use after web_youtube_search).',
                         'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
+    # ── Documents ──
+    {   'type': 'function',
+        'function': {   'name': 'create_presentation',
+                        'description': 'Create a PowerPoint presentation about a topic (content '
+                                       'written and fact-checked with a web search) and open it.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'topic': {   'type': 'string',
+                                                                         'description': 'What the '
+                                                                                        'presentation '
+                                                                                        'is about.'},
+                                                            'num_slides': {   'type': 'integer',
+                                                                              'description': 'Number '
+                                                                                             'of '
+                                                                                             'content '
+                                                                                             'slides '
+                                                                                             '(default '
+                                                                                             '5).'}},
+                                          'required': ['topic']}}},
+    {   'type': 'function',
+        'function': {   'name': 'edit_presentation',
+                        'description': 'Edit the presentation DEMASCAS made: change a slide title, '
+                                       'add/delete/rewrite slides.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'instruction': {   'type': 'string',
+                                                                               'description': 'The '
+                                                                                              'edit, '
+                                                                                              'e.g. '
+                                                                                              "'change "
+                                                                                              'the '
+                                                                                              'title '
+                                                                                              'of '
+                                                                                              'slide 3 '
+                                                                                              'to '
+                                                                                              'Early '
+                                                                                              "Life'."}},
+                                          'required': ['instruction']}}},
+    {   'type': 'function',
+        'function': {   'name': 'create_document',
+                        'description': 'Write a Word document (report, letter, essay, notes) about a '
+                                       'topic and open it.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'topic': {   'type': 'string',
+                                                                         'description': 'What the '
+                                                                                        'document is '
+                                                                                        'about.'},
+                                                            'kind': {   'type': 'string',
+                                                                        'description': 'report, '
+                                                                                       'letter, essay, '
+                                                                                       'notes...'}},
+                                          'required': ['topic']}}},
+    {   'type': 'function',
+        'function': {   'name': 'create_spreadsheet',
+                        'description': 'Create an Excel spreadsheet from a description and open it.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'description': {   'type': 'string',
+                                                                               'description': 'What '
+                                                                                              'the '
+                                                                                              'spreadsheet '
+                                                                                              'should '
+                                                                                              'contain.'}},
+                                          'required': ['description']}}},
+    {   'type': 'function',
+        'function': {   'name': 'run_app_script',
+                        'description': 'Control a scriptable Mac app (PowerPoint, Keynote, Word, '
+                                       'Excel, Music, Mail...) with AppleScript statements; they run '
+                                       "inside tell application. Use commands from the app's scripting "
+                                       'dictionary.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'app_name': {   'type': 'string',
+                                                                            'description': 'Exact app '
+                                                                                           'name, e.g. '
+                                                                                           "'Microsoft "
+                                                                                           "PowerPoint'."},
+                                                            'script': {   'type': 'string',
+                                                                          'description': 'AppleScript '
+                                                                                         'statements '
+                                                                                         "(no 'tell "
+                                                                                         "application' "
+                                                                                         'line), e.g. '
+                                                                                         "'return name "
+                                                                                         'of active '
+                                                                                         "presentation'."}},
+                                          'required': ['app_name', 'script']}}},
+    {   'type': 'function',
+        'function': {   'name': 'click_menu_item',
+                        'description': "Click a command in an app's menu bar (works for most Mac "
+                                       "apps). Use paths from the app's learned manual, e.g. 'View > "
+                                       "Zoom In'.",
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'app_name': {   'type': 'string',
+                                                                            'description': 'App name, '
+                                                                                           'e.g. '
+                                                                                           "'Discord'."},
+                                                            'menu_path': {   'type': 'string',
+                                                                             'description': 'Menu > '
+                                                                                            'Item (or '
+                                                                                            'Menu > '
+                                                                                            'Submenu > '
+                                                                                            'Item).'}},
+                                          'required': ['app_name', 'menu_path']}}},
+    {   'type': 'function',
+        'function': {   'name': 'learn_app',
+                        'description': "Study an app DEMASCAS hasn't used before: read its menus, "
+                                       'shortcuts, scripting commands and official help, and remember '
+                                       'them.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'app_name': {   'type': 'string',
+                                                                            'description': 'The app to '
+                                                                                           'learn, '
+                                                                                           'e.g. '
+                                                                                           "'Discord'."},
+                                                            'force': {'type': 'boolean',
+                                                                      'description': 'Relearn even if already learned.'}},
+                                          'required': ['app_name']}}},
+    {   'type': 'function',
+        'function': {   'name': 'guide_app',
+                        'description': 'Open an app and explain how to use it for a goal (e.g. Discord '
+                                       'for studying), using what DEMASCAS learned about the app.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'app_name': {   'type': 'string',
+                                                                            'description': 'The app, '
+                                                                                           'e.g. '
+                                                                                           "'Discord'."},
+                                                            'goal': {   'type': 'string',
+                                                                        'description': 'What the user '
+                                                                                       'wants to do '
+                                                                                       'with it.'}},
+                                          'required': ['app_name']}}},
+    {   'type': 'function',
+        'function': {   'name': 'send_chat_message',
+                        'description': 'Send a chat message to a person in a chat app (Discord, Slack, '
+                                       'WhatsApp, Messages…). Opens and verifies the conversation, '
+                                       'types the exact text, and asks the user before sending.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'app': {   'type': 'string',
+                                                                       'description': 'Chat app, e.g. '
+                                                                                      "'Discord'."},
+                                                            'contact': {   'type': 'string',
+                                                                           'description': 'Person or '
+                                                                                          'group to '
+                                                                                          'message.'},
+                                                            'text': {   'type': 'string',
+                                                                        'description': 'The exact '
+                                                                                       'message '
+                                                                                       'text.'}},
+                                          'required': ['contact', 'text']}}},
+    {   'type': 'function',
+        'function': {   'name': 'message_contact',
+                        'description': "Understand a spoken messaging request (e.g. 'send hi to Hatem "
+                                       "on Discord') and send it via send_chat_message.",
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'request': {   'type': 'string',
+                                                                           'description': "The user's "
+                                                                                          'full '
+                                                                                          'request.'}},
+                                          'required': ['request']}}},
+    {   'type': 'function',
+        'function': {   'name': 'deliver_chat_message',
+                        'description': 'Internal: press Enter on a prepared chat message (requires the '
+                                       "user's spoken yes).",
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'app': {'type': 'string'},
+                                                            'contact': {'type': 'string'},
+                                                            'text': {'type': 'string'}},
+                                          'required': ['app', 'contact', 'text']}}},
+    {   'type': 'function',
+        'function': {   'name': 'research_web',
+                        'description': 'Research a topic on the web: search, read the best pages, '
+                                       'remember them for later tasks, and answer from what was read. '
+                                       "Uses saved knowledge when it's fresh.",
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'topic': {   'type': 'string',
+                                                                         'description': 'What to '
+                                                                                        'research, '
+                                                                                        "e.g. 'how "
+                                                                                        'transformers '
+                                                                                        "work'."}},
+                                          'required': ['topic']}}},
+    {   'type': 'function',
+        'function': {   'name': 'scrape_webpage',
+                        'description': 'Read one web page, remember its content for later tasks, and '
+                                       'return its main text.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'url': {   'type': 'string',
+                                                                       'description': 'The page URL.'}},
+                                          'required': ['url']}}},
+    {   'type': 'function',
+        'function': {   'name': 'watch_topic',
+                        'description': 'Keep a topic up to date: DEMASCAS re-reads it in the '
+                                       'background on a schedule.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'topic': {   'type': 'string',
+                                                                         'description': 'Topic to '
+                                                                                        'follow.'},
+                                                            'every_hours': {   'type': 'number',
+                                                                               'description': 'Refresh '
+                                                                                              'interval '
+                                                                                              '(default '
+                                                                                              '12).'}},
+                                          'required': ['topic']}}},
+    {   'type': 'function',
+        'function': {   'name': 'unwatch_topic',
+                        'description': 'Stop following a topic.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'topic': {   'type': 'string',
+                                                                         'description': 'Topic.'}},
+                                          'required': ['topic']}}},
+    {   'type': 'function',
+        'function': {   'name': 'web_knowledge',
+                        'description': 'What DEMASCAS already learned from the web about something (no '
+                                       'internet needed).',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'query': {   'type': 'string',
+                                                                         'description': 'What to '
+                                                                                        'recall.'}},
+                                          'required': ['query']}}},
+    {   'type': 'function',
+        'function': {   'name': 'forget_web',
+                        'description': 'Forget saved web notes from a site, topic or URL.',
+                        'parameters': {   'type': 'object',
+                                          'properties': {   'match': {   'type': 'string',
+                                                                         'description': 'Site, topic '
+                                                                                        'or URL to '
+                                                                                        'forget.'}},
+                                          'required': ['match']}}},
 ]

@@ -45,7 +45,46 @@ public:
                          const std::string& path,
                          const std::vector<std::string>& tools_used,
                          const std::string& result,
-                         bool success = true);
+                         bool success = true,
+                         const std::string& skill_id = "");
+
+    // ── Skills (PATH 1.5): learned / built-in procedures ───────────
+    struct SkillMatch {
+        bool        matched = false;
+        bool        done    = false;     // handled already (e.g. a taught routine was saved)
+        std::string skill_id, name, ack, ask, summary;
+        std::string params_json = "{}";
+        std::string route;        // no skill: "chat" | "agent" | "tool" | "" (daemon decides)
+        std::string command;      // command after the server's corrections ("cord" → "Discord")
+        std::string note;         // e.g. "Got it — Discord. I'll remember that." (spoken first)
+        std::string knowledge;    // web notes DEMASCAS gathered about this command
+    };
+    /// POST /skill/match — find a skill and fill its parameters.
+    SkillMatch match_skill(const std::string& command);
+
+    struct SkillRunResult {
+        bool        success = false;
+        std::string summary;
+        std::vector<std::string> tool_calls;
+        // A step needs the user's yes/no (e.g. "Send 'hi' to Hatim Tai on Discord?")
+        std::string confirm_token, confirm_speech, pending_tool;
+    };
+    /// POST /skill/run — execute a matched skill.
+    SkillRunResult run_skill(const std::string& skill_id, const std::string& params_json);
+
+    /// POST /feedback — "good job" / "that's wrong" about the last result.
+    void send_feedback(bool positive);
+
+    /// GET /tools_core — the stable core tool list (cached part of the tool prompt).
+    nlohmann::json fetch_core_tools();
+
+    /// GET /vocabulary — words the recogniser should expect (taught words, learned apps).
+    std::vector<std::string> fetch_vocabulary();
+
+    /// POST /agent/cancel — stop the running agent before its next step.
+    void cancel_agent();
+    /// GET /agent/status — {"running", "goal", "step", "last_tool", "elapsed"}.
+    nlohmann::json agent_status();
 
     // ── Tool filtering ──────────────────────────────────────────
 
@@ -150,10 +189,12 @@ public:
 
     // ── Static HTTP helpers (used by LLMClient too) ──────────
     static std::string http_post(const std::string& url,
-                                  const std::string& body);
+                                 const std::string& body,
+                                 long timeout_sec = 30L);
     static std::string http_get(const std::string& url);
     /// Last known user preferences block
     std::string last_preferences_;
+    std::mutex  prefs_mu_;          // the task worker and the main loop both ask
     std::chrono::steady_clock::time_point last_prefs_fetch_;
 
 };
