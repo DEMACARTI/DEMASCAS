@@ -97,7 +97,7 @@ std::string LLMClient::format_tools_as_text(const json& schemas) const {
                 break;
             }
         }
-        if (short_desc.size() > MAX_DESC) short_desc = short_desc.substr(0, MAX_DESC - 1) + "…";
+        if (short_desc.size() > MAX_DESC) short_desc = utf8_cut(short_desc, MAX_DESC - 1) + "…";
 
         out += "- " + name + "(";
         for (size_t i = 0; i < params.size(); ++i) {
@@ -195,7 +195,7 @@ json LLMClient::build_tool_prompt(const json& tool_schemas,
     if (!learned_context.empty()) {
         std::string trimmed = learned_context;
         if (trimmed.size() > LEARNED_CONTEXT_MAX_CHARS) {
-            trimmed = trimmed.substr(0, LEARNED_CONTEXT_MAX_CHARS);
+            trimmed = utf8_cut(trimmed, LEARNED_CONTEXT_MAX_CHARS);
             trimmed += "\n... [context truncated]";
         }
         dynamic_content += "\n[CONTEXT]\n" + trimmed;
@@ -430,7 +430,7 @@ std::string LLMClient::call_llm_streaming(const json& messages,
         struct curl_slist* hdrs = nullptr;
         hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
         hdrs = curl_slist_append(hdrs, "Accept: text/event-stream");
-        std::string body_str = body.dump();
+        std::string body_str = body.dump(-1, ' ', false, json::error_handler_t::replace);
 
         curl_easy_setopt(curl, CURLOPT_URL,           chat_url_.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     hdrs);
@@ -503,7 +503,7 @@ std::string LLMClient::call_llm_blocking(const json& messages,
         {"stop",        json::array({"<|endoftext|>", "<|im_end|>"})}
     };
 
-    std::string resp = ToolBridge::http_post(chat_url_, body.dump());
+    std::string resp = ToolBridge::http_post(chat_url_, body.dump(-1, ' ', false, json::error_handler_t::replace));
 
     float elapsed = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - t0).count();
@@ -659,6 +659,10 @@ void LLMClient::trim_history() {
 
 void LLMClient::reset() { history_.clear(); }
 
+void LLMClient::drop_last_exchange() {
+    for (int i = 0; i < 2 && !history_.empty(); ++i) history_.pop_back();
+}
+
 void LLMClient::fit_history_to_context(const json& sys) {
     // ~3 characters per token is conservative for English + JSON, so the
     // estimate errs on the side of trimming rather than overflowing.
@@ -696,9 +700,9 @@ void LLMClient::fit_history_to_context(const json& sys) {
         auto nl = res.find('\n');
         std::string body = nl == std::string::npos ? res : res.substr(nl + 1);
         bool failed = is_tool_error(body);
-        std::string line = "\n- " + call.substr(0, 200) + " → " +
+        std::string line = "\n- " + utf8_cut(call, 200) + " → " +
                            (failed ? "FAILED: " : "ok: ") +
-                           body.substr(0, 80);
+                           utf8_cut(body, 80);
         std::replace(line.begin() + 1, line.end(), '\n', ' ');
         std::string first = content(history_[0]);
         if (first.find(EARLIER) == std::string::npos) first += EARLIER;
@@ -831,7 +835,7 @@ void LLMClient::prewarm(ToolBridge& bridge) {
                 {"model", model}, {"messages", msgs},
                 {"stream", false}, {"max_tokens", 1}, {"temperature", 0.0},
             };
-            ToolBridge::http_post(url, body.dump());
+            ToolBridge::http_post(url, body.dump(-1, ' ', false, json::error_handler_t::replace));
         }
         float w = std::chrono::duration<float>(std::chrono::steady_clock::now() - t1).count();
         std::cout << "[✓] LLM warm-up done (" << w << " s) — prompt cache primed.\n";
@@ -1171,7 +1175,7 @@ std::string LLMClient::chat_with_tools_streaming(
         constexpr size_t MAX_RESULT_CHARS = 2000;
         std::string result_text = tr.result;
         if (result_text.size() > MAX_RESULT_CHARS)
-            result_text = result_text.substr(0, MAX_RESULT_CHARS) + "\n…[" +
+            result_text = utf8_cut(result_text, MAX_RESULT_CHARS) + "\n…[" +
                           std::to_string(tr.result.size() - MAX_RESULT_CHARS) + " more chars]";
         std::string feedback = "[TOOL RESULT: " + fn + "]\n" + result_text;
 
@@ -1210,7 +1214,7 @@ std::string LLMClient::chat_with_tools_streaming(
             std::string screen = tr.screen_state;
             // Every extra prompt token costs prefill time on the next step.
             if (screen.size() > 1500)
-                screen = screen.substr(0, 1500) + "... (truncated)";
+                screen = utf8_cut(screen, 1500) + "... (truncated)";
             feedback += "\n\n[SCREEN STATE AFTER ACTION]\n" + screen;
             std::cout << "[SCREEN] Injected " << screen.size()
                       << " chars of screen state.\n";
@@ -1234,588 +1238,6 @@ std::string LLMClient::chat_with_tools_streaming(
     }
 
     return final_text;
-}
-
-// ── Planner: detect multi-step commands ─────────────────────────────
-
-bool LLMClient::is_multi_step_command(const std::string& command) const {
-    std::string cmd = command;
-    std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
-
-    static const char* MULTI_STEP_KEYWORDS[] = {
-        " and then ", " after that ", " then ",
-        " next ", " also ", " followed by ",
-        "step 1", "step 2", "first ", "second ",
-        "search for", "look up", "find and ",
-        "go to", "navigate to",
-    };
-
-    for (auto& kw : MULTI_STEP_KEYWORDS) {
-        if (cmd.find(kw) != std::string::npos)
-            return true;
-    }
-
-    static const char* ACTION_VERBS[] = {
-        "open", "click", "type", "search", "scroll",
-        "close", "save", "download", "copy", "paste",
-    };
-    int verb_count = 0;
-    for (auto& v : ACTION_VERBS) {
-        if (cmd.find(v) != std::string::npos)
-            ++verb_count;
-    }
-    return verb_count >= 2;
-}
-
-bool LLMClient::is_structured_task(const std::string& command) const {
-    std::string cmd = command;
-    std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
-
-    // ── Task-oriented phrases that always need structured execution ──
-    static const char* TASK_PHRASES[] = {
-        "write an email", "write a mail", "write email", "write mail",
-        "send an email", "send a mail", "send email", "send mail",
-        "compose email", "compose mail", "compose a", "draft email",
-        "reply to", "respond to", "forward email", "forward mail",
-        "search on youtube", "search youtube", "play on youtube",
-        "search on google", "google for", "search google",
-        "log into", "log in to", "sign into", "sign in to",
-        "open gmail and", "open youtube and", "open google and",
-        "go to gmail", "go to youtube",
-        "download from", "upload to",
-        "fill out", "fill in the", "submit the form",
-        "book a", "order a", "purchase",
-    };
-
-    for (auto& phrase : TASK_PHRASES) {
-        if (cmd.find(phrase) != std::string::npos)
-            return true;
-    }
-
-    // ── Also catch everything is_multi_step_command catches ──
-    return is_multi_step_command(command);
-}
-
-std::vector<std::string> LLMClient::plan_steps(
-    const std::string& command,
-    ToolBridge& bridge,
-    std::atomic<bool>& cancel) {
-
-    std::cout << "[PLANNER] Decomposing: \"" << command << "\"\n";
-
-    json plan_messages;
-    plan_messages.push_back({
-        {"role", "system"},
-        {"content",
-            "You are a macOS automation planner. Break the user's request into 2-4 sequential steps.\n\n"
-            "CRITICAL RULES:\n"
-            "1. You may ONLY use steps that map to these real tools:\n"
-            "   - open_application(app_name) — launch a macOS app by its EXACT name\n"
-            "   - open_url(url) — open a website URL in Safari\n"
-            "   - find_file(folder, partial_name, extension) — search for a file by partial name\n"
-            "   - open_file(file_path) — open a file at an absolute path\n"
-            "   - click_ui_element(element_name) — click a named UI element\n"
-            "   - type_text(text) — type text into the focused field\n"
-            "   - press_keyboard_shortcut(keys) — only use shortcuts from the approved list below\n"
-            "   - search_web(query) — search the web via DuckDuckGo\n"
-            "   - read_webpage(url) — fetch and extract text from a URL\n"
-            "   - get_active_window_tree() — read current UI elements on screen\n"
-            "   - activate_application(app_name) — bring an app to the foreground\n\n"
-            "2. NEVER invent keyboard shortcuts. The ONLY approved shortcuts are:\n"
-            "   cmd+w, cmd+q, cmd+t, cmd+n, cmd+c, cmd+v, cmd+z, cmd+a, cmd+space,\n"
-            "   cmd+option+l (Downloads), cmd+shift+o (Documents), cmd+shift+d (Desktop),\n"
-            "   cmd+shift+3 (screenshot), cmd+shift+4 (screenshot selection)\n\n"
-            "3. To find and open a file: ALWAYS use find_file first, then open_file with {result_of_step_1}.\n"
-            "   NEVER use open_application to open a file. NEVER type a filename into an app.\n\n"
-            "4. To open a website: ALWAYS use open_url. NEVER use open_application + type_text.\n\n"
-            "5. Output ONLY a JSON array. No explanation. No markdown. Example:\n"
-            "   [{\"tool\": \"find_file\", \"args\": {\"folder\": \"~/Downloads\", \"partial_name\": \"SIH\", \"extension\": \"pdf\"}},\n"
-            "    {\"tool\": \"open_file\", \"args\": {\"file_path\": \"{result_of_step_1}\"}}]\n\n"
-            "6. If the request needs only 1 step, output an array with 1 item.\n"
-            "7. Maximum 4 steps. If it needs more, output the first 4 steps only.\n"
-            "8. If the user says 'open a/the/my [extension]' with NO specific filename,\n"
-            "   use find_file with partial_name=\"\" to list all files of that type.\n"
-            "   Then speak the list to the user and wait for them to specify which one.\n"
-            "   NEVER use \"FILE\", \"file\", or the extension word itself as the partial_name.\n"
-            "9. ALWAYS use folder='~/Downloads' or '~/Documents' or '~/Desktop' — NEVER construct\n"
-            "   paths with a username. Use tilde (~) only."
-        }
-    });
-    plan_messages.push_back({
-        {"role", "user"},
-        {"content", command}
-    });
-
-    auto plan_text = call_llm_blocking(plan_messages, cfg::TOOL_PREDICT + 100);
-
-    std::cout << "[PLANNER] Raw output: " << plan_text << "\n";
-
-    // ── Try to parse JSON array format first ────────────────────
-    std::vector<std::string> steps;
-    {
-        // Find the JSON array in the output
-        auto arr_start = plan_text.find('[');
-        auto arr_end = plan_text.rfind(']');
-        if (arr_start != std::string::npos && arr_end != std::string::npos && arr_end > arr_start) {
-            std::string json_str = plan_text.substr(arr_start, arr_end - arr_start + 1);
-            try {
-                auto arr = json::parse(json_str);
-                if (arr.is_array()) {
-                    // Known valid tool names
-                    static const std::set<std::string> VALID_TOOLS = {
-                        "open_application", "open_url", "find_file", "open_file",
-                        "click_ui_element", "type_text", "press_keyboard_shortcut",
-                        "search_web", "read_webpage", "get_active_window_tree",
-                        "activate_application", "find_and_click", "type_and_submit",
-                        "type_text_into_element", "quit_application",
-                        "list_files_in_folder", "wait_for_element",
-                        "scroll_direction", "vision_execute",
-                        "browser_click_text", "browser_type",
-                        "gmail_compose_draft",
-                    };
-
-                    // Store parsed step data for result substitution
-                    std::vector<json> parsed_steps;
-                    for (auto& item : arr) {
-                        if (!item.is_object()) continue;
-                        std::string tool = item.value("tool", "");
-                        if (tool.empty() || VALID_TOOLS.find(tool) == VALID_TOOLS.end()) {
-                            std::cout << "[PLANNER] Skipping invalid tool: " << tool << "\n";
-                            continue;
-                        }
-                        parsed_steps.push_back(item);
-                    }
-
-                    // Convert to step strings that the tool path understands
-                    for (size_t i = 0; i < parsed_steps.size() && i < 4; ++i) {
-                        auto& item = parsed_steps[i];
-                        std::string tool = item.value("tool", "");
-                        auto args = item.value("args", json::object());
-
-                        // Substitute {result_of_step_N} references
-                        // For now, these are placeholders — the actual result
-                        // substitution happens at execution time.  Convert to
-                        // a natural language instruction the tool path can handle.
-                        std::string step;
-                        if (tool == "find_file") {
-                            step = "Search for files named '" +
-                                   args.value("partial_name", "") + "' in " +
-                                   args.value("folder", "~/Downloads");
-                            if (args.contains("extension"))
-                                step += " with extension " + args.value("extension", "");
-                        } else if (tool == "open_file") {
-                            step = "Open the file that was found in the previous step";
-                        } else if (tool == "open_url") {
-                            step = "Open " + args.value("url", "") + " in the browser";
-                        } else if (tool == "open_application") {
-                            step = "Open " + args.value("app_name", "");
-                        } else if (tool == "type_text") {
-                            step = "Type '" + args.value("text", "") + "'";
-                        } else if (tool == "press_keyboard_shortcut") {
-                            step = "Press keyboard shortcut " + args.value("keys", "");
-                        } else if (tool == "click_ui_element") {
-                            step = "Click on '" + args.value("element_name", "") + "'";
-                        } else if (tool == "search_web") {
-                            step = "Search the web for '" + args.value("query", "") + "'";
-                        } else {
-                            step = "Use " + tool;
-                            if (!args.empty()) step += " with " + args.dump();
-                        }
-                        if (!step.empty())
-                            steps.push_back(step);
-                    }
-                }
-            } catch (const json::parse_error&) {
-                std::cout << "[PLANNER] JSON parse failed — falling back to numbered list.\n";
-            }
-        }
-    }
-
-    // ── Fallback: parse numbered steps from plain text ──────────
-    if (steps.empty()) {
-        std::istringstream iss(plan_text);
-        std::string line;
-        while (std::getline(iss, line)) {
-            while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front())))
-                line.erase(line.begin());
-            while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
-                line.pop_back();
-
-            if (line.size() > 2 && std::isdigit(static_cast<unsigned char>(line[0]))) {
-                auto dot_pos = line.find('.');
-                if (dot_pos != std::string::npos && dot_pos < 4) {
-                    std::string step = line.substr(dot_pos + 1);
-                    while (!step.empty() && step.front() == ' ')
-                        step.erase(step.begin());
-                    if (!step.empty())
-                        steps.push_back(step);
-                }
-            }
-        }
-    }
-
-    // Cap at 4 steps
-    if (steps.size() > 4) steps.resize(4);
-
-    std::cout << "[PLANNER] Decomposed into " << steps.size() << " steps:\n";
-    for (size_t i = 0; i < steps.size(); ++i)
-        std::cout << "  " << (i + 1) << ". " << steps[i] << "\n";
-
-    return steps;
-}
-
-// ── Planner structured: returns JSON steps for direct execution ─────
-
-std::vector<json> LLMClient::plan_steps_structured(
-    const std::string& command,
-    ToolBridge& bridge,
-    std::atomic<bool>& cancel) {
-
-    std::cout << "[PLANNER-S] Decomposing: \"" << command << "\"\n";
-
-    // Reuse the same planner prompt
-    json plan_messages;
-    plan_messages.push_back({
-        {"role", "system"},
-        {"content",
-            "You are a macOS automation planner. Break the user's request into 2-4 sequential steps.\n\n"
-            "CRITICAL RULES:\n"
-            "1. You may ONLY use steps that map to these real tools:\n"
-            "   - open_application(app_name) — launch a macOS app by its EXACT name\n"
-            "   - open_url(url) — open a website URL in Safari\n"
-            "   - find_file(folder, partial_name, extension) — search for a file by partial name\n"
-            "   - open_file(file_path) — open a file at an absolute path\n"
-            "   - click_ui_element(element_name) — click a named UI element\n"
-            "   - type_text(text) — type text into the focused field\n"
-            "   - press_keyboard_shortcut(keys) — only use shortcuts from the approved list below\n"
-            "   - search_web(query) — search the web via DuckDuckGo\n"
-            "   - read_webpage(url) — fetch and extract text from a URL\n"
-            "   - get_active_window_tree() — read current UI elements on screen\n"
-            "   - activate_application(app_name) — bring an app to the foreground\n\n"
-            "2. NEVER invent keyboard shortcuts. The ONLY approved shortcuts are:\n"
-            "   cmd+w, cmd+q, cmd+t, cmd+n, cmd+c, cmd+v, cmd+z, cmd+a, cmd+space,\n"
-            "   cmd+option+l (Downloads), cmd+shift+o (Documents), cmd+shift+d (Desktop),\n"
-            "   cmd+shift+3 (screenshot), cmd+shift+4 (screenshot selection)\n\n"
-            "3. To find and open a file: ALWAYS use find_file first, then open_file.\n"
-            "   For open_file, use {result_of_step_1} as the file_path — it will be replaced\n"
-            "   with the actual path from find_file's result.\n"
-            "   NEVER use open_application to open a file.\n\n"
-            "4. To open a website: ALWAYS use open_url. NEVER use open_application + type_text.\n\n"
-            "5. Output ONLY a JSON array. No explanation. No markdown.\n"
-            "   [{\"tool\": \"find_file\", \"args\": {\"folder\": \"~/Downloads\", \"partial_name\": \"SIH\", \"extension\": \"pdf\"}},\n"
-            "    {\"tool\": \"open_file\", \"args\": {\"file_path\": \"{result_of_step_1}\"}}]\n\n"
-            "6. Maximum 4 steps.\n"
-            "7. If the user says 'open a/the/my [extension]' with NO specific filename,\n"
-            "   use find_file with partial_name=\"\" to list all files of that type.\n"
-            "   NEVER use \"FILE\" or the extension word as the partial_name.\n"
-            "8. ALWAYS use folder='~/Downloads' or '~/Documents' or '~/Desktop'.\n"
-            "   NEVER use a path with a username like /Users/name/. Use ~ instead."
-        }
-    });
-    plan_messages.push_back({
-        {"role", "user"},
-        {"content", command}
-    });
-
-    auto plan_text = call_llm_blocking(plan_messages, cfg::TOOL_PREDICT + 100);
-    std::cout << "[PLANNER-S] Raw output: " << plan_text << "\n";
-
-    std::vector<json> structured_steps;
-
-    // Try to parse JSON array
-    auto arr_start = plan_text.find('[');
-    auto arr_end = plan_text.rfind(']');
-    if (arr_start != std::string::npos && arr_end != std::string::npos && arr_end > arr_start) {
-        std::string json_str = plan_text.substr(arr_start, arr_end - arr_start + 1);
-        try {
-            auto arr = json::parse(json_str);
-            if (arr.is_array()) {
-                static const std::set<std::string> VALID_TOOLS = {
-                    "open_application", "open_url", "find_file", "open_file",
-                    "click_ui_element", "type_text", "press_keyboard_shortcut",
-                    "search_web", "read_webpage", "get_active_window_tree",
-                    "activate_application", "find_and_click", "type_and_submit",
-                    "type_text_into_element", "quit_application",
-                    "list_files_in_folder", "wait_for_element",
-                    "scroll_direction", "vision_execute",
-                    "browser_click_text", "browser_type",
-                    "gmail_compose_draft",
-                };
-
-                for (auto& item : arr) {
-                    if (!item.is_object()) continue;
-                    std::string tool = item.value("tool", "");
-                    if (tool.empty() || VALID_TOOLS.find(tool) == VALID_TOOLS.end()) {
-                        std::cout << "[PLANNER-S] Skipping invalid tool: " << tool << "\n";
-                        continue;
-                    }
-
-                    // Sanitize find_file args — block generic partial_name values
-                    if (tool == "find_file" && item.contains("args")) {
-                        auto& args = item["args"];
-                        std::string pn = args.value("partial_name", "");
-                        std::string pn_lower = pn;
-                        std::transform(pn_lower.begin(), pn_lower.end(), pn_lower.begin(), ::tolower);
-                        static const std::set<std::string> BLOCKLIST = {
-                            "file", "a", "the", "my", "this", "that", "it",
-                            "pdf", "ppt", "doc", "docx", "pptx", "xls", "xlsx",
-                            "mp4", "mp3", "zip", "txt", "jpg", "png", "csv",
-                        };
-                        if (pn.empty() || BLOCKLIST.count(pn_lower)) {
-                            args["partial_name"] = "";
-                            std::cout << "[PLANNER-S] Cleared generic partial_name: '" << pn << "'\n";
-                        }
-
-                        // Ensure folder uses ~ not hardcoded username
-                        std::string folder = args.value("folder", "~/Downloads");
-                        if (folder.find("/Users/") == 0) {
-                            // Replace /Users/<anything>/<rest> with ~/<rest>
-                            auto parts_start = folder.find('/', 7); // skip "/Users/"
-                            if (parts_start != std::string::npos) {
-                                folder = "~" + folder.substr(parts_start);
-                            } else {
-                                folder = "~/Downloads";
-                            }
-                            args["folder"] = folder;
-                            std::cout << "[PLANNER-S] Fixed folder path to: " << folder << "\n";
-                        }
-                    }
-
-                    structured_steps.push_back(item);
-                    if (structured_steps.size() >= 4) break;
-                }
-            }
-        } catch (const json::parse_error& e) {
-            std::cout << "[PLANNER-S] JSON parse failed: " << e.what() << "\n";
-        }
-    }
-
-    // If JSON parsing failed, fall back to plan_steps (text-based) and wrap in JSON
-    if (structured_steps.empty()) {
-        auto text_steps = plan_steps(command, bridge, cancel);
-        // Can't convert text to structured JSON reliably — return empty
-        // so caller falls back to chat_with_tools_streaming
-        std::cout << "[PLANNER-S] Could not produce structured steps, returning empty.\n";
-    }
-
-    std::cout << "[PLANNER-S] " << structured_steps.size() << " structured steps:\n";
-    for (size_t i = 0; i < structured_steps.size(); ++i) {
-        std::cout << "  " << (i + 1) << ". " << structured_steps[i].value("tool", "?")
-                  << "(" << structured_steps[i].value("args", json::object()).dump() << ")\n";
-    }
-
-    return structured_steps;
-}
-
-// ── PATH 4: Deep Intent — makes 3B think like 70B ──────────────────
-
-bool LLMClient::is_deep_intent_command(const std::string& command) const {
-    std::string cmd = command;
-    std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
-
-    // Commands that should go to PATH 3 (tool ReAct) NOT deep intent:
-    // "compose an email", "draft an email", "click the X" → these need tools,
-    // not multi-phase reasoning.  Deep intent is for ambiguous/complex tasks.
-    static const char* TOOL_PATH_KEYWORDS[] = {
-        "compose", "draft", "click the", "click on", "tap the",
-        "fill in", "fill out", "type into", "navigate to",
-    };
-    for (auto& kw : TOOL_PATH_KEYWORDS) {
-        if (cmd.find(kw) != std::string::npos)
-            return false;
-    }
-
-    // Communication tasks — benefit most from deep intent
-    static const char* DEEP_KEYWORDS[] = {
-        "reply to", "respond to", "write a reply", "smart reply",
-        "research and", "find out", "summarize",
-        "tell me about", "give me a report",
-        "schedule", "remind me", "set up a meeting",
-        "extract contact", "get contact",
-        "message", "send a message",
-    };
-
-    for (auto& kw : DEEP_KEYWORDS) {
-        if (cmd.find(kw) != std::string::npos)
-            return true;
-    }
-
-    return false;
-}
-
-LLMClient::DeepIntentAction LLMClient::parse_deep_intent(
-    const std::string& raw_text) const {
-
-    DeepIntentAction action;
-
-    auto objs = extract_json_objects(raw_text);
-    for (const auto& obj : objs) {
-        try {
-            auto j = json::parse(obj);
-
-            // Check if it's a done response
-            if (j.contains("done") && j.value("done", false)) {
-                action.is_done = true;
-                action.say = j.value("say", "");
-                action.intent = j.value("intent", "");
-                action.task_type = j.value("task_type", "conversation");
-                return action;
-            }
-
-            // Check for deep intent structure
-            if (j.contains("intent")) {
-                action.intent = j.value("intent", "");
-                action.task_type = j.value("task_type", "general");
-                action.needs_confirm = j.value("needs_confirm", false);
-
-                // Extract plan
-                if (j.contains("plan") && j["plan"].is_array()) {
-                    for (auto& step : j["plan"]) {
-                        if (step.is_string())
-                            action.plan.push_back(step.get<std::string>());
-                    }
-                }
-
-                // Extract first action
-                if (j.contains("first_action") && j["first_action"].is_object()) {
-                    auto& fa = j["first_action"];
-                    action.first_tool = fa.value("tool", "");
-                    action.first_args = fa.value("args", json::object());
-                }
-
-                return action;
-            }
-
-            // Fallback: regular tool call format
-            if (j.contains("tool") && j["tool"].is_string()) {
-                action.first_tool = j["tool"].get<std::string>();
-                action.first_args = j.value("args", json::object());
-                action.intent = "direct action";
-                return action;
-            }
-
-        } catch (...) {}
-    }
-
-    // No parseable action — treat as spoken text
-    action.is_done = true;
-    action.say = raw_text;
-    return action;
-}
-
-std::string LLMClient::deep_intent_streaming(
-    const std::string& user_msg,
-    ToolBridge& bridge,
-    SentenceCallback on_sentence,
-    std::atomic<bool>& cancel) {
-
-    history_.clear();
-    last_tools_.clear();
-    last_path_ = "deep_intent";
-
-    std::cout << "[🧠 DEEP INTENT] Phase 1: Understanding...\n";
-
-    // ── Fetch deep intent context from Python server ────────────
-    auto di = bridge.fetch_deep_intent(user_msg);
-    std::cout << "[🧠 DEEP INTENT] Task type: " << di.task_type << "\n";
-
-    // ── Phase 1: Understand + Plan ──────────────────────────────
-    // Use the deep intent prompt for structured understanding
-    std::string system_content = di.deep_intent_prompt;
-    if (system_content.empty()) {
-        // Fallback — basic deep intent prompt
-        system_content =
-            "You are DEMASCAS. Analyze the user's command and respond with JSON:\n"
-            "{\"intent\":\"<summary>\",\"task_type\":\"<type>\","
-            "\"plan\":[\"step1\",\"step2\"],\"needs_confirm\":false,"
-            "\"first_action\":{\"tool\":\"<tool>\",\"args\":{...}}}\n"
-            "Or if you can answer directly: {\"done\":true,\"say\":\"<response>\"}";
-    }
-
-    json phase1_messages;
-    phase1_messages.push_back({{"role", "system"}, {"content", system_content}});
-    phase1_messages.push_back({{"role", "user"}, {"content", user_msg}});
-
-    auto silent_cb = [](const std::string&) {};
-    auto phase1_raw = call_llm_streaming(
-        phase1_messages, silent_cb, cancel,
-        cfg::TOOL_PREDICT + 100, cfg::LLM_TEMPERATURE);
-
-    if (phase1_raw.empty() || cancel.load()) {
-        std::string fallback = "I couldn't understand that. Could you rephrase?";
-        on_sentence(fallback);
-        return fallback;
-    }
-
-    auto intent = parse_deep_intent(phase1_raw);
-    std::cout << "[🧠 DEEP INTENT] Intent: " << intent.intent << "\n";
-    std::cout << "[🧠 DEEP INTENT] Plan: " << intent.plan.size() << " steps\n";
-
-    // ── Direct answer — no tools needed ─────────────────────────
-    if (intent.is_done) {
-        std::string answer = intent.say.empty() ? phase1_raw : intent.say;
-        on_sentence(answer);
-        return answer;
-    }
-
-    // ── Phase 2: Execute plan steps ─────────────────────────────
-    std::cout << "[🧠 DEEP INTENT] Phase 2: Executing plan...\n";
-
-    // If there's a direct first_action, execute it
-    if (!intent.first_tool.empty()) {
-        std::cout << "[🧠 DEEP INTENT] First action: " << intent.first_tool
-                  << "(" << intent.first_args.dump() << ")\n";
-
-        last_tools_.push_back(intent.first_tool);
-        auto tr = bridge.execute_with_screen(intent.first_tool, intent.first_args);
-        std::cout << "[TOOL RESULT] " << tr.result << "\n";
-
-        // If the tool returned a confirmation request, handle it
-        try {
-            auto result_json = json::parse(tr.result);
-            if (result_json.contains("status") &&
-                result_json.value("status", "") == "pending_confirmation") {
-                std::string confirm_speech = result_json.value("confirm_speech", "Should I proceed?");
-                on_sentence(confirm_speech);
-                return confirm_speech;
-            }
-            // If compose_email returned a draft, speak the confirmation
-            if (result_json.contains("confirm")) {
-                std::string confirm = result_json.value("confirm", "Done.");
-                on_sentence(confirm);
-                return confirm;
-            }
-        } catch (...) {
-            // Not JSON — continue normally
-        }
-    }
-
-    // Execute remaining plan steps through the regular tool path
-    if (intent.plan.size() > 1) {
-        std::string learned_ctx;
-        try {
-            learned_ctx = bridge.fetch_learned_context(user_msg);
-        } catch (...) {}
-
-        // Skip first step if we already executed first_action
-        size_t start_step = intent.first_tool.empty() ? 0 : 1;
-
-        std::string step_reply;
-        for (size_t i = start_step; i < intent.plan.size() && !cancel.load(); ++i) {
-            std::cout << "[🧠 DEEP INTENT STEP " << (i + 1) << "/"
-                      << intent.plan.size() << "] " << intent.plan[i] << "\n";
-
-            step_reply = chat_with_tools_streaming(
-                intent.plan[i], bridge, on_sentence, cancel,
-                learned_ctx);
-        }
-        return step_reply.empty() ? "Done." : step_reply;
-    }
-
-    // Single-step action already executed
-    std::string confirm = "Done.";
-    on_sentence(confirm);
-    return confirm;
 }
 
 }  // namespace demascas

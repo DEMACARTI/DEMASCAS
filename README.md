@@ -518,7 +518,7 @@ Every command is routed by the C++ daemon in this order:
 
 Paths 2 and 4 can hand off to two follow-up states: **CONFIRMING** (a destructive action is waiting for a spoken yes/no) and **CLARIFYING** (several files matched — pick one).
 
-> The planner (`plan_steps*`), deep-intent (`deep_intent_streaming`) and structured-task-executor (`/plan_and_execute`) code still exists but is **not wired into the daemon's routing**.
+> The old planner, deep-intent and structured-task-executor paths (`plan_steps*`, `deep_intent_streaming`, `/deep_intent`, `/plan_and_execute`) were never wired into routing and have been removed.
 
 ---
 
@@ -605,7 +605,6 @@ User speaks → PortAudio → whisper.cpp (Metal GPU)
 │  /context         → learning context (episodes + profile)      │
 │  /learn           → log interaction for learning               │
 │  /screen_context  → VLM + a11y screen digest                   │
-│  /deep_intent     → task classification + prompt + people       │
 │  /session         → cross-turn active context (ACTIVE_CONTEXT)  │
 │  /agent           → domain agents (email, files, web, ...)     │
 │  /confirm         → approve/deny a pending destructive action  │

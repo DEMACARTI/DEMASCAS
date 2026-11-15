@@ -56,9 +56,10 @@ def get_active_window_tree(app_name: str | None = None) -> str:
         try:
             from core.appnames import resolve
             from core.axui import pid_of
-            hit, conf = resolve(app_name)
-            if hit and conf >= 0.72:
-                app_name = hit
+            if not pid_of(app_name):              # exact running name first
+                hit, conf = resolve(app_name)
+                if hit and conf >= 0.8:
+                    app_name = hit
             if not pid_of(app_name):
                 print(f"[*] '{app_name}' isn't running — reading the app in front instead")
                 app_name = None

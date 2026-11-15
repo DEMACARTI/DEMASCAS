@@ -688,7 +688,17 @@ static bool is_dismiss(const std::string& text) {
         "stay shut", "stay quiet", "keep quiet", "be silent", "stay silent",
         "silence", "shush", "hush", "zip it", "quiet please",
     };
-    return DISMISS.count(s) > 0;
+    if (DISMISS.count(s) > 0) return true;
+    // Clear "I'm done" sentences ("that's enough for the day, I want to stop now").
+    static const char* DONE[] = {
+        "enough for the day", "enough for today", "done for the day", "done for today",
+        "i want to stop", "stop for now", "stop for today", "thats all for now",
+        "thats all for today", "good night", "goodnight", "talk to you tomorrow",
+    };
+    const std::string full = simplify(text);
+    for (auto& p : DONE)
+        if (has_word(full, p)) return true;
+    return false;
 }
 
 /// Is the WHOLE utterance feedback on the previous result?
@@ -920,6 +930,10 @@ int main() {
     demascas::BargeInDetector barge;
     BackgroundTask task;
     std::string last_action_command;   // for "you did nothing" → retry
+    std::string held_command;          // queued work held back after a failure
+    std::chrono::steady_clock::time_point held_at{};
+    bool first_after_wake = false;     // first request after the wake word
+    float last_heard_conf = 1.0f;      // recogniser confidence of the last request
     uint64_t announced_task = 0;       // "still working on it" bookkeeping
     int announce_stage = 0;
     bool last_task_failed = false;     // don't run the queue behind a failure
@@ -1069,9 +1083,19 @@ int main() {
         auto now = std::chrono::steady_clock::now();
         for (auto& [t, said] : recently_said) {
             if (now - t > std::chrono::seconds(20)) continue;
-            std::string s = " " + simplify(said) + " ";
+            std::istringstream sis(simplify(said));
+            std::vector<std::string> said_words;
+            for (std::string w; sis >> w;) said_words.push_back(w);
             size_t hit = 0;
-            for (auto& w : words) hit += s.find(" " + w + " ") != std::string::npos;
+            for (auto& w : words) {
+                // same word, or the same stem ("success" ~ "successfully")
+                bool found = false;
+                for (auto& sw : said_words) {
+                    const size_t n = std::min(w.size(), sw.size());
+                    if (w == sw || (n >= 4 && w.compare(0, n, sw, 0, n) == 0)) { found = true; break; }
+                }
+                hit += found;
+            }
             if (hit * 10 >= words.size() * 7) return true;      // ≥ 70 % of the words
         }
         return false;
@@ -1122,7 +1146,7 @@ int main() {
             o.reply = ar.summary;
             task_say(ar.summary);
         } else if (!ar.error.empty()) {
-            o.reply = "I ran into an issue: " + ar.error.substr(0, 80);
+            o.reply = "I ran into an issue: " + demascas::utf8_cut(ar.error, 80);
             o.success = false;
             task_say(o.reply);
         }
@@ -1159,7 +1183,7 @@ int main() {
             R"(^\s*(?:(?:hey|so|okay|ok|alright|well|please|now)[, ]+)*(?:(?:i want you to|i need you to|i'd like you to|can you|could you|would you|please|you should)\s+)+)",
             std::regex::icase);
         std::string s = std::regex_replace(c, FILLER, "");
-        return s.size() <= 60 ? s : s.substr(0, 57) + "...";
+        return s.size() <= 60 ? s : demascas::utf8_cut(s, 57) + "...";
     };
     auto task_status_line = [&]() {
         std::string line = "I'm still working on " + short_cmd(task.command()) + ".";
@@ -1311,6 +1335,7 @@ int main() {
                 last_tts_done = clk::now();
                 std::this_thread::sleep_for(post_tts_guard);
                 audio.drain();
+                first_after_wake = true;
                 state = State::LISTENING;
             }
             break;
@@ -1357,6 +1382,8 @@ int main() {
                 if (last_task_failed && !task.queue.empty()) {
                     // Don't blindly run what was queued behind a failed task.
                     std::string skipped = short_cmd(task.queue.front());
+                    held_command = task.queue.front();
+                    held_at = clk::now();
                     task.queue.clear();
                     last_task_failed = false;
                     on_sentence("Since that didn't work, I've held off on " + skipped +
@@ -1486,6 +1513,7 @@ int main() {
                                      is_status_question(current_command) ||
                                      is_dismiss(current_command);
                 std::cout << "[🎯 HEARD] confidence " << conf << ", unsure " << unsure << "\n";
+                last_heard_conf = conf;
                 if (task.busy() && !control && (conf < 0.65f || unsure > 0.2f)) {
                     // While working, DEMASCAS listens to the room: only clear
                     // speech (or stop / status) counts — not TV or other people.
@@ -1552,7 +1580,7 @@ int main() {
                     on_sentence(ok ? "Opening " + chosen_name + "."
                                    : "I couldn't open " + chosen_name + ".");
                     bridge.log_interaction(current_command, "clarify", {"open_file"},
-                                           result.substr(0, 200), ok);
+                                           demascas::utf8_cut(result, 200), ok);
                     pending_file_choices.clear();
                     clarifying_goal.clear();
                     state = State::LISTENING;
@@ -1587,6 +1615,21 @@ int main() {
                     try { bridge.cancel_agent(); } catch (...) {}   // agent stops before its next step
                     task.queue.clear();
                     tts.interrupt();
+                    const std::string s = simplify(current_command);
+                    const bool done_for_now = has_word(s, "for the day") || has_word(s, "for today") ||
+                        has_word(s, "goodbye") || has_word(s, "good night") || has_word(s, "go to sleep") ||
+                        has_word(s, "stop now") || has_word(s, "thats enough") || is_dismiss(current_command);
+                    if (done_for_now) {
+                        // "that's enough for the day" = stop the task AND stand by
+                        tts.enqueue("Okay, stopping. Standing by.");
+                        tts.wait_done();
+                        last_tts_done = clk::now();
+                        audio.drain();
+                        llm.reset();
+                        worker_llm.reset();
+                        state = State::SLEEPING;
+                        break;
+                    }
                     on_sentence("Okay, I've stopped.");
                     state = State::LISTENING;
                     break;
@@ -1633,10 +1676,48 @@ int main() {
                     current_command = skill.command;
                 }
             }
+            // "Yes, I still want it" → run what was held back after a failure.
+            if (!held_command.empty() && clk::now() - held_at < std::chrono::seconds(60)) {
+                const std::string s = simplify(current_command);
+                if (has_word(s, "still want") || has_word(s, "still wanted") || has_word(s, "yes") ||
+                    has_word(s, "do it") || has_word(s, "go ahead") || has_word(s, "please do")) {
+                    std::cout << "[↩ HELD] running: " << held_command << "\n";
+                    current_command = held_command;
+                    held_command.clear();
+                    state = State::PROCESSING;
+                    break;
+                }
+                held_command.clear();
+            }
+            // Follow-up side talk: after the first exchange, chat-like speech
+            // counts only if it's addressed to DEMASCAS (it asked a question,
+            // or you said its name).  Commands still work without the name.
+            if (!shortcut && !skill.matched && !first_after_wake &&
+                (skill.route == "chat" ||
+                 (skill.route.empty() && shortcuts.is_simple_question(current_command)))) {
+                std::string last_said;
+                {
+                    std::lock_guard<std::mutex> lk(said_mu);
+                    if (!recently_said.empty()) last_said = recently_said.back().second;
+                }
+                const bool it_asked = !last_said.empty() &&
+                    last_said.find_last_not_of(" ") != std::string::npos &&
+                    last_said[last_said.find_last_not_of(" ")] == '?';
+                const std::string s = simplify(current_command);
+                const bool named = has_word(s, "demascas") || has_word(s, "damascus");
+                if (!it_asked && !named) {
+                    std::cout << "[*] Side talk ignored (not addressed to DEMASCAS)\n";
+                    state = State::LISTENING;
+                    break;
+                }
+            }
+            first_after_wake = false;
+
             // The server judged it not a sensible request (fragments of words).
             if (!shortcut && !skill.matched && skill.route == "unclear") {
-                std::cout << "[*] Unclear request — asking again instead of acting\n";
-                on_sentence("Sorry, I didn't catch that. Could you say it again?");
+                std::cout << "[*] Unclear request — asking instead of acting\n";
+                on_sentence(skill.ask.empty() ? "Sorry, I didn't catch that. Could you say it again?"
+                                              : skill.ask);       // "Open what?"
                 state = State::LISTENING;
                 break;
             }
@@ -1719,6 +1800,7 @@ int main() {
                     std::cout << "[🌐 WEB NOTES] " << skill.knowledge.size() << " chars from saved pages\n";
                 reply = llm.fast_chat_streaming(
                     current_command, bridge, on_sentence, cancel_llm, skill.knowledge);
+                if (last_heard_conf < 0.7f) llm.drop_last_exchange();   // don't let a mishearing steer later replies
                 success = llm.last_success();
                 // The fast path has no tools.  Its prompt tells the model to
                 // say "Let me handle that for you" when an action is needed —
@@ -1812,16 +1894,37 @@ int main() {
                 if (!failed) {
                     on_sentence("Done.");
                 } else {
-                    on_sentence("There was an issue. " + result.substr(0, 100));
+                    on_sentence("There was an issue. " + demascas::utf8_cut(result, 100));
                 }
                 bridge.log_interaction("confirm " + pending_tool, "confirm",
-                                       {pending_tool}, result.substr(0, 200), !failed);
+                                       {pending_tool}, demascas::utf8_cut(result, 200), !failed);
             } else {
                 bridge.confirm(pending_token, false);
                 std::cout << "[⚠️ CONFIRMING] Not approved — cancelling.\n";
-                tts.enqueue(answer == Answer::NO
-                                ? "Okay, cancelled."
-                                : "I didn't hear a clear yes, so I cancelled it.");
+                // Not a yes/no but a new request ("open the finder app") →
+                // drop the pending action AND do what was just asked.
+                std::string redirect;
+                if (answer == Answer::UNCLEAR && !confirmation.empty() &&
+                    !is_hallucination(confirmation)) {
+                    std::istringstream iss(simplify(confirmation));
+                    int words = 0;
+                    for (std::string w; iss >> w;) ++words;
+                    if (words >= 2) redirect = normalize_transcription(confirmation);
+                }
+                tts.enqueue(answer == Answer::NO ? "Okay, cancelled."
+                            : !redirect.empty() ? "Okay, I won't do that."
+                                                : "I didn't hear a clear yes, so I cancelled it.");
+                if (!redirect.empty()) {
+                    tts.wait_done();
+                    last_tts_done = clk::now();
+                    pending_tool.clear();
+                    pending_token.clear();
+                    pending_description.clear();
+                    current_command = redirect;
+                    std::cout << "[⚠️ CONFIRMING] New request instead: \"" << redirect << "\"\n";
+                    state = State::PROCESSING;
+                    break;
+                }
             }
 
             tts.wait_done();

@@ -69,6 +69,7 @@ private:
     double              mic_e_ = 0.0, out_e_ = 0.0;   // smoothed energies on echo-only-ish frames
     float               erle_db_ = 0.0f;
     bool                converged_ = false;
+    int64_t             weak_samples_ = 0;       // live samples with < 6 dB reduction
     std::vector<float>  pending_;              // mic samples not yet a full frame
     int64_t             pending_start_ = 0;    // absolute index of pending_[0]
 };

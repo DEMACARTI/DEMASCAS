@@ -12,6 +12,18 @@
 #pragma once
 #include <string>
 
+namespace demascas {
+/// Cut a UTF-8 string to at most `max` bytes WITHOUT splitting a character.
+/// (Byte cuts like substr(0, 700) produced invalid UTF-8 mid-"✓", and the
+/// JSON library threw while serialising the LLM request — a task crash.)
+inline std::string utf8_cut(const std::string& s, size_t max) {
+    if (s.size() <= max) return s;
+    size_t n = max;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+}  // namespace demascas
+
 namespace demascas::config {
 
 // ─── Whisper.cpp model paths (relative to daemon/ working dir) ──
@@ -55,7 +67,7 @@ constexpr float WAKE_LISTEN_WINDOW   = 2.0f;    // seconds of audio in the slidi
 constexpr float WAKE_HOP_SEC         = 0.75f;   // re-check the window every hop (was a fixed 2 s chunk)
 constexpr int   POST_TTS_GUARD_MS    = 250;     // ignore mic this long after DEMASCAS stops talking (echo tail)
 constexpr float COMMAND_TIMEOUT      = 10.0f;   // max seconds to wait for first command
-constexpr float FOLLOWUP_TIMEOUT     = 15.0f;   // max seconds between follow-ups
+constexpr float FOLLOWUP_TIMEOUT     = 8.0f;    // follow-up window after DEMASCAS speaks (was 15 s: it answered side conversations)
 
 // ─── Screen stability ──────────────────────────────────────────
 constexpr float SCREEN_STABLE_THRESHOLD = 0.025f;  // fraction of pixels changed to consider "unstable"
@@ -63,7 +75,6 @@ constexpr float SCREEN_STABLE_THRESHOLD = 0.025f;  // fraction of pixels changed
 // ─── Tool execution limits ─────────────────────────────────────
 constexpr int   TOOL_TIMEOUT_MS      = 8000;    // max ms for a single tool call
 constexpr int   REACT_MAX_ERRORS     = 3;       // consecutive tool errors before hard stop
-constexpr long  TASK_EXEC_TIMEOUT_SEC = 60L;    // max seconds for STE /plan_and_execute (longer due to multi-step waits)
 // Max seconds to wait for POST /agent.  Must be LONGER than the agent's own
 // wall-clock budget (AGENT_TIME_BUDGET = 80 s in server/agents/base_agent.py)
 // so the agent always finishes/aborts before the daemon gives up on it.

@@ -114,6 +114,7 @@ from actuators.web_agent import (
     web_ecommerce_search,
 )
 from core.screen_context import get_screen_context_block, get_screen_digest
+from actuators.system_control import is_risky_shortcut
 from actuators.app_script import (
     run_app_script, is_destructive as _script_is_destructive, click_menu_item, is_risky_menu,
 )
@@ -403,6 +404,10 @@ def _describe_action(tool: str, args: dict) -> str:
         return f"Move {os.path.basename(path.rstrip('/')) or path} to the Trash?"
     if tool == "deliver_chat_message":
         return f"Send '{args.get('text', '')}' to {args.get('contact', 'them')} on {args.get('app', 'the app')}?"
+    if tool == "press_keyboard_shortcut":
+        if is_risky_shortcut(str(args.get("keys", ""))):
+            return f"Press {args.get('keys')}? That can close, quit or delete something."
+        return f"Press {args.get('keys')}? That would send what's typed."
     if tool == "click_menu_item":
         return f"In {args.get('app_name', 'the app')}, click {args.get('menu_path', 'that menu item')}?"
     if tool == "run_app_script":
@@ -482,15 +487,18 @@ def _get_tool_args(func, raw_args: dict) -> dict:
 def _would_send_in_chat_app(name: str, args: dict) -> bool:
     """Enter / submit while a chat app is in front sends a message to real
     people — outside the read-back flow it needs a spoken yes."""
+    keys = str(args.get("keys", "")).lower().replace(" ", "")
     sends = name == "type_and_submit" or (
         name == "press_keyboard_shortcut"
-        and re.fullmatch(r"\s*(return|enter)\s*", str(args.get("keys", "")), re.I))
+        and (re.search(r"(^|\+|,)(return|enter)$", keys) or keys in ("cmd+shift+d", "command+shift+d")))
     if not sends:
         return False
     try:
         from core.axui import frontmost_app
         from actuators.messaging import is_chat_app
-        return is_chat_app(frontmost_app())
+        app = frontmost_app()
+        # Mail apps too: ⌘↩ / ⌘⇧D send an email (a live session pressed ⌘↩ in Mail).
+        return is_chat_app(app) or app in ("Mail", "Microsoft Outlook", "Outlook", "Spark", "Airmail")
     except Exception:
         return False
 
@@ -548,6 +556,7 @@ def _dispatch_native(name: str, args: dict, *, confirmed: bool = False) -> tuple
         return msg, True, None
 
     needs_yes = name in CONFIRM_REQUIRED_TOOLS or _would_send_in_chat_app(name, args) or (
+        name == "press_keyboard_shortcut" and is_risky_shortcut(str(args.get("keys", "")))) or (
         name == "run_app_script" and _script_is_destructive(str(args.get("script", "")))) or (
         name == "click_menu_item" and is_risky_menu(str(args.get("menu_path", "")))) or (
         name in ("find_and_click", "click_ui_element")
@@ -1383,8 +1392,12 @@ def skill_match_endpoint():
             knowledge = context_block(command, max_chars=800, k=3)
         except Exception:
             knowledge = ""
+        ask = ""
+        if r == "unclear":
+            from core.routing import clarify
+            ask = clarify(command) or "Sorry, I didn't catch that. Could you say it again?"
         return jsonify({"matched": False, "route": r, "command": command, "note": note,
-                        "knowledge": knowledge}), 200
+                        "knowledge": knowledge, "ask": ask}), 200
 
     if m.missing:
         _PENDING_SKILL.update(skill_id=m.skill.id, params=m.params, missing=m.missing, ts=time.time())
@@ -1583,198 +1596,6 @@ def screen_context_endpoint():
         })
     except Exception as e:
         return jsonify({"context_block": "", "error": str(e)})
-
-
-@app.route("/deep_intent", methods=["POST"])
-def deep_intent_endpoint():
-    """
-    PATH 4 — Deep Intent Analysis endpoint.
-    Takes user command + screen context and returns a structured intent plan.
-
-    Body: {"command": "reply to that email", "screen_context": "...", "user_profile": "..."}
-    Returns: task classification, prompt template, people context.
-    """
-    from core.prompt_templates import classify_task, get_template_for_task, get_deep_intent_system_prompt
-    from core.learning import get_people_context, get_profile_summary
-
-    data = request.get_json(silent=True)
-    if not data or "command" not in data:
-        return jsonify({"error": "Missing 'command'"}), 400
-
-    command = _normalize_user_command(data["command"])
-    screen_ctx = data.get("screen_context", "")
-    user_profile = data.get("user_profile", "")
-
-    # Auto-fetch screen context if not provided
-    if not screen_ctx:
-        try:
-            screen_ctx = get_screen_context_block(force=True)
-        except Exception:
-            screen_ctx = ""
-
-    # Auto-fetch user profile if not provided
-    if not user_profile:
-        try:
-            user_profile = get_profile_summary()
-        except Exception:
-            user_profile = ""
-
-    # People context
-    people_ctx = ""
-    try:
-        people_ctx = get_people_context(command)
-    except Exception:
-        pass
-
-    # Classify task
-    task_type = classify_task(command)
-
-    # Get task-specific template
-    task_prompt = get_template_for_task(
-        task_type,
-        screen_context=screen_ctx,
-        user_profile=user_profile,
-        contact_info=people_ctx,
-        topic=command,
-    )
-
-    # Get deep intent system prompt (with real tool names)
-    # Fetch filtered tools for this command so deep intent only references real tools
-    all_schemas = _all_tool_schemas()
-    filtered_schemas = select_tools_for_query(command, all_schemas, max_tools=12)
-    tool_names = [s["function"]["name"] for s in filtered_schemas if "function" in s]
-
-    deep_prompt = get_deep_intent_system_prompt(
-        user_command=command,
-        screen_context=screen_ctx,
-        user_profile=user_profile,
-        people_context=people_ctx,
-        tool_names=tool_names,
-    )
-
-    return jsonify({
-        "task_type": task_type,
-        "task_prompt": task_prompt or "",
-        "deep_intent_prompt": deep_prompt,
-        "screen_context": screen_ctx,
-        "user_profile": user_profile,
-        "people_context": people_ctx,
-    })
-
-
-# ── Structured Task Executor (STE) — plan, execute, verify ──────────
-
-@app.route("/plan_and_execute", methods=["POST"])
-def plan_and_execute_endpoint():
-    """
-    Structured Task Executor — plan, execute, verify, replan.
-
-    Body: {"command": "write an email to Aman"}
-    Returns: {
-        "status": "ok"|"partial"|"failed"|"clarifying",
-        "result": "Done.",
-        "steps_completed": 3,
-        "total_steps": 3,
-        "spoken_updates": ["Opening Gmail.", "Opening compose window.", "Done."],
-        "pending_file_choices": null
-    }
-    """
-    from core.task_executor import plan_task, execute_task
-    from core.learning import get_learned_context
-
-    data = request.get_json(silent=True)
-    if not data or "command" not in data:
-        return jsonify({"status": "failed", "result": "Missing 'command'",
-                        "steps_completed": 0, "total_steps": 0,
-                        "spoken_updates": [], "pending_file_choices": None}), 200
-
-    command = _normalize_user_command(data["command"])
-    print(f"\n[STE] ━━━ Structured Task: \"{command}\" ━━━")
-
-    # ── Gather context ───────────────────────────────────────
-    screen_ctx = ""
-    try:
-        screen_ctx = get_screen_context_block(force=True)
-    except Exception:
-        pass
-
-    learned_ctx = ""
-    try:
-        learned_ctx = get_learned_context(command)
-    except Exception:
-        pass
-
-    # ── Get filtered tools for this command ───────────────────
-    all_schemas = _all_tool_schemas()
-    filtered_schemas = select_tools_for_query(
-        command, all_schemas, max_tools=12,
-        active_app=ACTIVE_CONTEXT.get("active_app"),
-        active_url=ACTIVE_CONTEXT.get("active_url"),
-    )
-
-    # ── Plan ─────────────────────────────────────────────────
-    plan = plan_task(
-        command=command,
-        screen_context=screen_ctx or "No screen context available.",
-        tool_schemas=filtered_schemas if filtered_schemas else all_schemas,
-        learned_context=learned_ctx,
-    )
-
-    if plan is None or not plan.steps:
-        print("[STE] Planning failed — returning empty result.")
-        return jsonify({
-            "status": "failed",
-            "result": "I couldn't plan how to do that. Let me try a different approach.",
-            "steps_completed": 0, "total_steps": 0,
-            "spoken_updates": ["I couldn't plan the steps for that task."],
-            "pending_file_choices": None,
-        }), 200
-
-    # ── Execute ──────────────────────────────────────────────
-    def tool_dispatch(name: str, args: dict) -> str:
-        """Dispatch a tool call through the normal TOOL_MAP pipeline."""
-        canon_name, canon_args = _normalize_tool_call(name, args or {})
-        result, _failed, _raw = _run_and_track(canon_name, canon_args)
-        return result
-
-    def screen_capture() -> str:
-        """Capture current screen state."""
-        try:
-            return get_active_window_tree() or ""
-        except Exception:
-            return ""
-
-    task_result = execute_task(
-        plan=plan,
-        tool_dispatch_fn=tool_dispatch,
-        screen_capture_fn=screen_capture,
-    )
-
-    print(f"[STE] ━━━ Result: {task_result.status} "
-          f"({task_result.steps_completed}/{task_result.total_steps} steps) ━━━\n")
-
-    # ── Log interaction for learning ─────────────────────────
-    try:
-        from core.learning import after_command
-        tools_used = [sr.tool for sr in task_result.step_results]
-        after_command(
-            command=command,
-            path_taken="structured_task",
-            tools_used=tools_used,
-            result=task_result.result,
-            success=(task_result.status == "ok"),
-        )
-    except Exception:
-        pass
-
-    return jsonify({
-        "status": task_result.status,
-        "result": task_result.result,
-        "steps_completed": task_result.steps_completed,
-        "total_steps": task_result.total_steps,
-        "spoken_updates": task_result.spoken_updates,
-        "pending_file_choices": task_result.pending_file_choices,
-    }), 200
 
 
 @app.route("/mcp/status", methods=["GET"])
@@ -2145,8 +1966,6 @@ def run_server() -> None:
     print(f"      GET  http://{_server_host()}:{_server_port()}/health")
     print(f"      GET  http://{_server_host()}:{_server_port()}/session")
     print(f"      GET  http://{_server_host()}:{_server_port()}/screen_context")
-    print(f"      POST http://{_server_host()}:{_server_port()}/deep_intent")
-    print(f"      POST http://{_server_host()}:{_server_port()}/plan_and_execute")
     print(f"      GET  http://{_server_host()}:{_server_port()}/mcp/status")
     print(f"      GET  http://{_server_host()}:{_server_port()}/context?query=...")
     print(f"      POST http://{_server_host()}:{_server_port()}/learn")

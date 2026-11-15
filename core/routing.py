@@ -102,9 +102,40 @@ def unclear(command: str) -> bool:
     return len(short) == len(parts) and not re.search(r"\b(and|or|then)\b", command, re.I)
 
 
+_FILLER = re.compile(r"^(?:(?:anyways?|anyway|so|okay|ok|alright|well|um+|uh+|hey|and|then|now|"
+                     r"please|just|like)[\s,.!]+)+", re.I)
+_BARE_VERBS = {"open", "close", "launch", "start", "play", "send", "type", "search", "find", "delete",
+               "remove", "show", "write", "message", "text", "email", "call", "go", "make", "create",
+               "click", "press", "run", "quit", "move", "copy", "save", "read", "tell"}
+_CHAT_ONE_WORD = {"hi", "hello", "hey", "thanks", "thank", "yes", "no", "yeah", "nope", "okay", "ok",
+                  "why", "what", "how", "who", "when", "where", "sure", "cool", "nice", "great",
+                  "good", "bye", "goodbye", "sorry", "please", "maybe", "wow", "help"}
+
+
+def clarify(command: str) -> str:
+    """A question to ask instead of guessing, or '' if the request is complete.
+    'anyways, open,' → 'Open what?'; 'button' → 'What should I do with "button"?'
+    (both were acted on in a live session — Mail got "Hello, World!" typed)."""
+    text = _FILLER.sub("", (command or "").strip()).strip(" ,.!?")
+    words = re.findall(r"[a-z']+", text.lower())
+    if not words:
+        return ""
+    if len(words) == 1:
+        w = words[0]
+        if w in _BARE_VERBS:
+            return f"{w.capitalize()} what?"
+        if w in _CHAT_ONE_WORD:
+            return ""
+        return f"What should I do with \"{text}\"?"
+    # "open the" / "send a" — verb + article only
+    if len(words) == 2 and words[0] in _BARE_VERBS and words[1] in ("the", "a", "an", "my", "this", "that", "it"):
+        return f"{words[0].capitalize()} what?"
+    return ""
+
+
 def route(command: str) -> str:
     """'chat' | 'agent' | 'tool' | 'unclear' | '' (daemon decides)."""
-    if unclear(command):
+    if unclear(command) or clarify(command):
         return "unclear"
     kind, _ = intent(command)
     if kind == "chat":

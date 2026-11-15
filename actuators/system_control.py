@@ -152,6 +152,10 @@ def _build_key_command(keys: str) -> str:
         'power': 127, 'volumeup': 72, 'volumedown': 73, 'mute': 74,
     }
 
+    canon = [modifier_map.get(m, m) for m in modifiers]
+    if len(canon) != len(set(canon)) or len(set(canon)) > 3:
+        # e.g. "cmd+shift+option+command+space" (pressed in a live session)
+        raise ValueError(f"'{keys}' isn't a real shortcut (repeated or too many modifiers)")
     unknown = [m for m in modifiers if m not in modifier_map]
     if unknown:
         # Previously unknown parts were silently dropped, so
@@ -550,6 +554,20 @@ def open_url(url: str, browser: str = "") -> str:
     if not target_browser:
         prefs = get_all_preferences()
         target_browser = prefs.get("default_browser", "")
+    if target_browser:
+        # The model names browsers that aren't installed ("Chrome", "Google").
+        try:
+            from core.appnames import resolve
+            hit, conf = resolve(target_browser)
+        except Exception:
+            hit, conf = "", 0.0
+        browsers = {"safari", "brave browser", "google chrome", "firefox", "arc", "microsoft edge",
+                    "opera", "vivaldi", "chromium", "orion", "zen browser", "duckduckgo"}
+        if hit and conf >= 0.8 and hit.lower() in browsers:
+            target_browser = hit
+        else:
+            print(f"[*] Browser '{target_browser}' isn't installed — using the default browser")
+            target_browser = ""
 
     # Sanitize URL — strip shell-dangerous chars but keep :// and standard URL chars
     safe_url = url.replace('"', '').replace('\\', '').replace('`', '').strip()
@@ -627,6 +645,29 @@ def open_url_and_wait(url: str, browser: str = "", wait_seconds: float = 3.0) ->
     )
 
     return f"{result} {stable_result}"
+
+
+# Shortcuts that close, quit, delete, log out or lock — need a spoken yes.
+_RISKY_SHORTCUTS = {
+    "cmd+q", "cmd+w", "cmd+option+w", "cmd+delete", "cmd+backspace", "cmd+option+delete",
+    "cmd+shift+q", "cmd+shift+option+q", "ctrl+cmd+q", "cmd+option+escape", "cmd+option+esc",
+    "cmd+shift+delete", "cmd+shift+backspace", "ctrl+option+cmd+power", "ctrl+cmd+power",
+    "cmd+option+power",
+}
+
+
+def _norm_combo(combo: str) -> str:
+    alias = {"command": "cmd", "control": "ctrl", "alt": "option", "esc": "escape",
+             "backspace": "delete"}
+    parts = [alias.get(p.strip().lower(), p.strip().lower()) for p in combo.split("+") if p.strip()]
+    return "+".join(sorted(parts[:-1]) + parts[-1:])
+
+
+_RISKY_NORM = {_norm_combo(r) for r in _RISKY_SHORTCUTS}
+
+
+def is_risky_shortcut(keys: str) -> bool:
+    return any(_norm_combo(c) in _RISKY_NORM for c in _split_key_sequence(keys or ""))
 
 
 def press_keyboard_shortcut(keys: str) -> str:
@@ -1040,6 +1081,10 @@ def wait_for_element(element_name: str, timeout: int = 10) -> str:
     return f"[-] Timeout: Element '{safe_name}' not found after {timeout}s."
 
 
+_WINDOWLESS_OK = {"finder", "dock", "systemuiserver", "control center", "notification center",
+                  "spotlight", "siri", "music", "mail", "messages", "discord", "slack"}
+
+
 def wait_for_app_ready(app_name: str, timeout: int = 10) -> str:
     """
     Waits for an application to be running and have at least one window.
@@ -1072,6 +1117,7 @@ def wait_for_app_ready(app_name: str, timeout: int = 10) -> str:
     """
 
     deadline = time.time() + timeout
+    last_status = ""
     while time.time() < deadline:
         try:
             result = subprocess.run(
@@ -1079,12 +1125,20 @@ def wait_for_app_ready(app_name: str, timeout: int = 10) -> str:
                 capture_output=True, text=True, check=True,
                 timeout=5,
             )
-            if "ready" in result.stdout.strip().lower():
+            status = result.stdout.strip().lower()
+            last_status = status
+            if status == "ready":
                 return f"Success: '{safe_name}' is running with windows open."
+            # Finder, Dock and menu-bar apps are fully ready with no window
+            # (Finder used to "time out" after 10 s).
+            if status == "no_window" and safe_name.lower() in _WINDOWLESS_OK:
+                return f"Success: '{safe_name}' is running (no window open)."
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
             pass
         time.sleep(0.5)
 
+    if last_status == "no_window":
+        return f"Success: '{safe_name}' is running but has no window open."
     return f"[-] Timeout: '{safe_name}' not ready after {timeout}s."
 
 

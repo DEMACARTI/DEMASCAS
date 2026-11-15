@@ -76,6 +76,10 @@ public:
     /// Clear conversation history (between independent interactions).
     void reset();
 
+    /// Forget the last user/assistant exchange (garbled or side-talk turns
+    /// must not steer later answers — "Keep it up, good mother!" ×3).
+    void drop_last_exchange();
+
     /// Save conversation history to disk for session persistence.
     void save_session() const;
 
@@ -108,57 +112,6 @@ public:
     std::vector<std::pair<std::string, std::string>> take_file_choices() {
         auto c = std::move(file_choices_); file_choices_.clear(); return c;
     }
-
-    // ── Planner — decompose multi-step commands ─────────────────
-
-    /// Check if a command requires multiple steps (heuristic).
-    bool is_multi_step_command(const std::string& command) const;
-
-    /// Check if a command should use the Structured Task Executor.
-    /// Subsumes is_multi_step_command + detects task-oriented commands
-    /// like "write email", "compose", "search on youtube", etc.
-    bool is_structured_task(const std::string& command) const;
-
-    /// Use the LLM to decompose a complex command into ordered steps.
-    /// Returns a vector of step descriptions (natural language).
-    std::vector<std::string> plan_steps(const std::string& command,
-                                         ToolBridge& bridge,
-                                         std::atomic<bool>& cancel);
-
-    /// Use the LLM to decompose a complex command into structured JSON steps.
-    /// Returns a vector of JSON objects: [{"tool": "...", "args": {...}}, ...]
-    /// Supports inter-step result passing via {result_of_step_N} tokens.
-    std::vector<nlohmann::json> plan_steps_structured(const std::string& command,
-                                                       ToolBridge& bridge,
-                                                       std::atomic<bool>& cancel);
-
-    // ── PATH 4: Deep Intent ─────────────────────────────────────
-
-    /// Check if a command requires deep intent analysis (PATH 4).
-    /// High-complexity commands that benefit from Understand→Plan→Execute.
-    bool is_deep_intent_command(const std::string& command) const;
-
-    /// Deep intent path: 3-phase (Understand → Plan → Execute).
-    /// Returns the final spoken response.
-    std::string deep_intent_streaming(
-        const std::string& user_msg,
-        ToolBridge& bridge,
-        SentenceCallback on_sentence,
-        std::atomic<bool>& cancel);
-
-    /// Parsed deep intent from the LLM's structured output.
-    struct DeepIntentAction {
-        std::string intent;         // 1-sentence intent summary
-        std::string task_type;      // email, message, research, etc.
-        std::vector<std::string> plan;  // ordered steps
-        bool needs_confirm = false;
-        bool is_done = false;
-        std::string say;            // spoken text (if done)
-        std::string first_tool;     // first tool to call
-        nlohmann::json first_args;  // first tool arguments
-    };
-
-    DeepIntentAction parse_deep_intent(const std::string& raw_text) const;
 
     /// The ~14 most-used tools, listed in the CACHED part of the tool prompt
     /// (per-command tools used to change the prompt's middle, so the model

@@ -138,7 +138,7 @@ json ToolBridge::fetch_tool_schemas() {
 std::string ToolBridge::execute(const std::string& name,
                                  const json& args) {
     json payload = {{"name", name}, {"arguments", args}};
-    auto resp = http_post(cfg::TOOL_EXEC_URL, payload.dump());
+    auto resp = http_post(cfg::TOOL_EXEC_URL, payload.dump(-1, ' ', false, json::error_handler_t::replace));
 
     if (resp.empty())
         return "[-] Tool server did not respond.";
@@ -160,7 +160,7 @@ ToolBridge::ToolResult ToolBridge::execute_with_screen(
 
     json payload = {{"name", name}, {"arguments", args},
                     {"include_screen", include_screen}};
-    auto resp = http_post(cfg::TOOL_EXEC_URL, payload.dump());
+    auto resp = http_post(cfg::TOOL_EXEC_URL, payload.dump(-1, ' ', false, json::error_handler_t::replace));
 
     ToolResult tr;
     if (resp.empty()) {
@@ -196,7 +196,7 @@ json ToolBridge::fetch_filtered_tools(const std::string& query,
                                        int max_tools) {
     json payload = {{"query", query}, {"max_tools", max_tools}};
     auto resp = http_post(cfg::TOOL_SERVER_BASE + "/tools_for_query",
-                          payload.dump());
+                          payload.dump(-1, ' ', false, json::error_handler_t::replace));
     if (resp.empty()) return json::array();
     try {
         auto j = json::parse(resp);
@@ -249,7 +249,7 @@ ToolBridge::AgentResult ToolBridge::execute_agent(
     }
 
     std::string url = cfg::TOOL_SERVER_BASE + "/agent";
-    std::string body = payload.dump();
+    std::string body = payload.dump(-1, ' ', false, json::error_handler_t::replace);
     std::string response;
 
     struct curl_slist* hdrs = nullptr;
@@ -345,7 +345,7 @@ ToolBridge::LLMRuntimeConfig ToolBridge::fetch_llm_config() {
 
 std::string ToolBridge::confirm(const std::string& token, bool approve) {
     json payload = {{"token", token}, {"approve", approve}};
-    auto resp = http_post(cfg::TOOL_SERVER_BASE + "/confirm", payload.dump());
+    auto resp = http_post(cfg::TOOL_SERVER_BASE + "/confirm", payload.dump(-1, ' ', false, json::error_handler_t::replace));
     if (resp.empty()) return "[-] Tool server did not respond.";
     try {
         auto j = json::parse(resp);
@@ -411,13 +411,13 @@ void ToolBridge::log_interaction(const std::string& command,
         {"command", command},
         {"path",    path},
         {"tools",   tools_arr},
-        {"result",  result.substr(0, 300)},   // truncate for storage
+        {"result",  utf8_cut(result, 300)},   // truncate for storage
         {"success", success},
         {"skill_id", skill_id},
     };
 
     // Fire-and-forget — ignore errors
-    http_post(cfg::TOOL_SERVER_BASE + "/learn", payload.dump());
+    http_post(cfg::TOOL_SERVER_BASE + "/learn", payload.dump(-1, ' ', false, json::error_handler_t::replace));
 }
 
 // ── Skills: learned procedures (PATH 1.5) ───────────────────────────
@@ -426,7 +426,7 @@ ToolBridge::SkillMatch ToolBridge::match_skill(const std::string& command) {
     SkillMatch out;
     // Embedding match is ~2 ms; filling parameters is one short LLM call.
     auto resp = http_post(cfg::TOOL_SERVER_BASE + "/skill/match",
-                          json{{"command", command}}.dump(), 20L);
+                          json{{"command", command}}.dump(-1, ' ', false, json::error_handler_t::replace), 20L);
     if (resp.empty()) return out;
     try {
         auto j = json::parse(resp);
@@ -455,7 +455,7 @@ ToolBridge::SkillRunResult ToolBridge::run_skill(const std::string& skill_id,
     json params = json::object();
     try { params = json::parse(params_json.empty() ? "{}" : params_json); } catch (...) {}
     auto resp = http_post(cfg::TOOL_SERVER_BASE + "/skill/run",
-                          json{{"skill_id", skill_id}, {"params", params}}.dump(),
+                          json{{"skill_id", skill_id}, {"params", params}}.dump(-1, ' ', false, json::error_handler_t::replace),
                           cfg::AGENT_TIMEOUT_SEC);
     if (resp.empty()) {
         out.summary = "The skill didn't respond in time.";
@@ -513,7 +513,7 @@ json ToolBridge::agent_status() {
 
 void ToolBridge::send_feedback(bool positive) {
     http_post(cfg::TOOL_SERVER_BASE + "/feedback",
-              json{{"positive", positive}}.dump(), 5L);
+              json{{"positive", positive}}.dump(-1, ' ', false, json::error_handler_t::replace), 5L);
 }
 
 // ── Screen context fetch (PATH 4) ───────────────────────────────────
@@ -533,107 +533,5 @@ std::string ToolBridge::fetch_screen_context(bool force) {
     }
 }
 
-// ── Deep intent analysis (PATH 4) ───────────────────────────────────
-
-ToolBridge::DeepIntentResult ToolBridge::fetch_deep_intent(
-    const std::string& command) {
-
-    DeepIntentResult result;
-    json payload = {{"command", command}};
-    auto resp = http_post(cfg::TOOL_SERVER_BASE + "/deep_intent",
-                          payload.dump());
-
-    if (resp.empty()) return result;
-
-    try {
-        auto j = json::parse(resp);
-        result.task_type          = json_str(j, "task_type", "general");
-        result.task_prompt        = json_str(j, "task_prompt");
-        result.deep_intent_prompt = json_str(j, "deep_intent_prompt");
-        result.screen_context     = json_str(j, "screen_context");
-        result.user_profile       = json_str(j, "user_profile");
-        result.people_context     = json_str(j, "people_context");
-    } catch (...) {}
-
-    return result;
-}
-
-// ── Structured Task Executor (STE) ──────────────────────────────────
-
-ToolBridge::TaskExecResult ToolBridge::execute_task(
-    const std::string& command) {
-
-    TaskExecResult result;
-    json payload = {{"command", command}};
-
-    // Use a longer timeout — tasks can take 30-60s with waits
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        result.status = "failed";
-        result.result = "[-] HTTP client init failed.";
-        return result;
-    }
-
-    std::string url = cfg::TOOL_SERVER_BASE + "/plan_and_execute";
-    std::string body = payload.dump();
-    std::string response;
-
-    struct curl_slist* hdrs = nullptr;
-    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-
-    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     hdrs);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        cfg::TASK_EXEC_TIMEOUT_SEC);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);
-
-    CURLcode res = curl_easy_perform(curl);
-    curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) {
-        result.status = "failed";
-        result.result = std::string("[-] HTTP error: ") + curl_easy_strerror(res);
-        return result;
-    }
-
-    if (response.empty()) {
-        result.status = "failed";
-        result.result = "[-] Empty response from task executor.";
-        return result;
-    }
-
-    try {
-        auto j = json::parse(response);
-        result.status          = json_str(j, "status", "failed");
-        result.result          = json_str(j, "result");
-        result.steps_completed = j.value("steps_completed", 0);
-        result.total_steps     = j.value("total_steps", 0);
-
-        // Parse spoken updates
-        if (j.contains("spoken_updates") && j["spoken_updates"].is_array()) {
-            for (auto& s : j["spoken_updates"])
-                if (s.is_string()) result.spoken.push_back(s.get<std::string>());
-        }
-
-        // Parse file choices for CLARIFYING state
-        if (j.contains("pending_file_choices") &&
-            j["pending_file_choices"].is_array()) {
-            for (auto& fc : j["pending_file_choices"]) {
-                result.file_choices.push_back({
-                    json_str(fc, "name", "?"),
-                    json_str(fc, "path", "?"),
-                });
-            }
-        }
-    } catch (const std::exception& e) {
-        result.status = "failed";
-        result.result = "[-] JSON parse error: " + std::string(e.what());
-    }
-
-    return result;
-}
 
 }  // namespace demascas

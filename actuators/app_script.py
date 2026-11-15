@@ -69,8 +69,10 @@ _RISKY_MENU = re.compile(
 )
 
 
-def is_risky_menu(menu_path: str) -> bool:
-    return bool(_RISKY_MENU.search(menu_path or ""))
+def is_risky_menu(menu_path) -> bool:
+    if isinstance(menu_path, (list, tuple)):
+        menu_path = " > ".join(str(p) for p in menu_path)
+    return bool(_RISKY_MENU.search(str(menu_path or "")))
 
 
 def _as_str(s: str) -> str:
@@ -82,7 +84,10 @@ def click_menu_item(app_name: str, menu_path: str, timeout: int = 10) -> dict:
     (submenus: "File > Export > PDF").  The app is brought to the front first."""
     if sys.platform != "darwin":
         return {"success": False, "message": "[-] Menu control is only available on macOS so far."}
-    parts = [p.strip() for p in re.split(r"\s*(?:>|→|/)\s*", menu_path or "") if p.strip()]
+    if isinstance(menu_path, (list, tuple)):        # ["File", "Close"]
+        menu_path = " > ".join(str(p) for p in menu_path)
+    menu_path = str(menu_path or "").replace("&", "")   # Windows accelerators ("&File")
+    parts = [p.strip() for p in re.split(r"\s*(?:>|→|/)\s*", menu_path) if p.strip()]
     if len(parts) < 2 or len(parts) > 3 or not app_name:
         return {"success": False, "message": "[-] Give the menu path like 'View > Zoom In'."}
     top = parts[0]

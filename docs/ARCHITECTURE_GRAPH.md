@@ -12,12 +12,12 @@ flowchart TD
     M -->|PATH 2 Fast Q&A| L[daemon/src/llm_client.cpp]
     M -->|PATH 3 Tool ReAct| L
     M -->|PATH 3.5 Agent| TB[daemon/src/tool_bridge.cpp]
-    M -->|PATH 4 Structured Task| TB
+    M -->|PATH 1.5 Skill| TB
 
     L -->|HTTP /v1/chat/completions| TXT[MLX Text Server :8081]
     TB -->|HTTP /tool,/tools,/tools_for_query| TS[server/tool_server.py]
     TB -->|HTTP /agent| TS
-    TB -->|HTTP /plan_and_execute| TS
+    TB -->|HTTP /skill/match,/skill/run| TS
     TB -->|HTTP /context,/learn| TS
 
     TS --> R[server/tool_router.py]
@@ -48,4 +48,4 @@ flowchart TD
 - Text LLM endpoint: http://127.0.0.1:8081/v1/chat/completions
 - Tool server endpoint: http://127.0.0.1:5001
 - Agent orchestration: server/agents/* via /agent
-- Structured task engine: core/task_executor.py via /plan_and_execute
+- Skills (learned + built-in procedures): core/skills/* via /skill/match and /skill/run

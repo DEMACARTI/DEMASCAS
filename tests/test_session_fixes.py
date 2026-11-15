@@ -68,6 +68,45 @@ class SessionTwo(unittest.TestCase):
             self.assertFalse(note_question(q), q)
 
 
+class SessionThree(unittest.TestCase):
+    """Live session 2026-11-16 (second log): acting on fragments, runaway tools."""
+
+    def test_incomplete_requests_get_a_question(self):
+        from core.routing import clarify, route
+        self.assertEqual(clarify("anyways, open,"), "Open what?")
+        self.assertEqual(clarify("open the"), "Open what?")
+        self.assertIn("button", clarify("button"))
+        for fine in ("hello", "thanks", "open Discord", "what time is it"):
+            self.assertEqual(clarify(fine), "", fine)
+        self.assertEqual(route("anyways, open,"), "unclear")
+
+    def test_find_file_never_scans_the_whole_disk(self):
+        from actuators.file_system import find_file
+        r = find_file("/", "", ".*")
+        self.assertFalse(r["success"])
+        self.assertEqual(r["error_type"], "too_broad")
+
+    def test_shortcut_validation(self):
+        from actuators.system_control import _build_key_command, is_risky_shortcut
+        with self.assertRaises(ValueError):
+            _build_key_command("cmd+shift+option+command+space")
+        self.assertTrue(is_risky_shortcut("command+Q"))
+        self.assertTrue(is_risky_shortcut("cmd+option+esc"))
+        self.assertFalse(is_risky_shortcut("cmd+c"))
+
+    def test_menu_path_lists_and_accelerators(self):
+        from actuators.app_script import is_risky_menu
+        self.assertTrue(is_risky_menu(["&File", "&Close"]))
+        self.assertFalse(is_risky_menu(["View", "Zoom In"]))
+
+    @unittest.skipUnless(MAC, "needs macOS app list")
+    def test_app_names_dont_cross_wires(self):
+        from core.appnames import resolve
+        self.assertEqual(resolve("Dock")[0], "Dock")          # running process, not "Docker"
+        self.assertNotEqual(resolve("Chrome")[0], "Home")      # 0.8 similar, different app
+        self.assertEqual(resolve("Google")[0], "")
+
+
 class Vocabulary(unittest.TestCase):
     """#4/#5 + the Damascus decision."""
 

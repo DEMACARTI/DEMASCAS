@@ -143,8 +143,21 @@ std::vector<float> EchoCanceller::process(const std::vector<float>& mic,
             mic_e_ = 0.98 * mic_e_ + 0.02 * me;          // ~0.5 s smoothing
             out_e_ = 0.98 * out_e_ + 0.02 * oe;
             erle_db_ = static_cast<float>(10.0 * std::log10((mic_e_ + 1.0) / (out_e_ + 1.0)));
-            if (!converged_ && adapted_samples_ >= 2 * sr_ && erle_db_ >= 12.0f)
+            if (!converged_ && adapted_samples_ >= 2 * sr_ && erle_db_ >= 12.0f) {
                 converged_ = true;
+                weak_samples_ = 0;
+            } else if (converged_) {
+                // On real speakers the cancellation can collapse (live log:
+                // "AEC 0 dB") — then DEMASCAS interrupted itself.  Two
+                // seconds of weak cancellation = not converged any more:
+                // barge-in falls back to the loud-voice rule until it
+                // relearns.
+                weak_samples_ = erle_db_ < 6.0f ? weak_samples_ + frame_ : 0;
+                if (weak_samples_ >= 2 * sr_) {
+                    converged_ = false;
+                    weak_samples_ = 0;
+                }
+            }
         }
         pos += frame_;
     }

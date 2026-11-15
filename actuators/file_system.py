@@ -363,11 +363,30 @@ def find_file(folder: str, partial_name: str, extension: str = None) -> dict:
         partial_lower = "" if is_generic else clean_name.lower()
         ext_lower = extension.lower().lstrip(".") if extension else None
 
+        # A search of "/" (or the whole home folder) with no name walked the
+        # entire disk and froze the tool server.  Refuse the unbounded case,
+        # and cap every search in time and size.
+        home = os.path.expanduser("~")
+        if is_generic and os.path.realpath(expanded) in ("/", os.path.realpath(home)):
+            return {
+                "success": False, "found": False, "matches": [], "count": 0,
+                "error_type": "too_broad",
+                "message": "That would search the whole disk. Give part of the file name or a folder "
+                           "like ~/Downloads or ~/Documents.",
+            }
+        deadline = time.time() + 5.0
+        scanned = 0
+        truncated = False
+
         matches = []
         for root, _dirs, files in os.walk(expanded):
             # Skip hidden directories
             if any(part.startswith(".") for part in root.split(os.sep) if part):
                 continue
+            scanned += len(files)
+            if scanned > 20000 or time.time() > deadline:
+                truncated = True
+                break
             for fname in files:
                 if fname.startswith("."):
                     continue
@@ -428,6 +447,8 @@ def find_file(folder: str, partial_name: str, extension: str = None) -> dict:
             else:
                 msg = f"No files matching '{partial_name}' found in {folder}."
 
+        if truncated:
+            msg += " (Search stopped early — the folder is very large; give a narrower folder.)"
         return {
             "success": True,
             "found": len(top) > 0,
@@ -435,6 +456,7 @@ def find_file(folder: str, partial_name: str, extension: str = None) -> dict:
             "count": len(matches),
             "first_match_path": first_path,
             "message": msg,
+            "truncated": truncated,
         }
     except Exception as e:
         return {

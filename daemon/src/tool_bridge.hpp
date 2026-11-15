@@ -138,18 +138,6 @@ public:
     /// Fetch user preferences and rules from the Python server
     std::string fetch_preferences();
 
-    /// POST /deep_intent — fetch deep intent analysis for a command.
-    /// Returns task_type, task-specific prompt, people context, screen context.
-    struct DeepIntentResult {
-        std::string task_type;          // "compose_email", "smart_reply", etc.
-        std::string task_prompt;        // task-specific system prompt
-        std::string deep_intent_prompt; // deep intent system prompt
-        std::string screen_context;
-        std::string user_profile;
-        std::string people_context;
-    };
-    DeepIntentResult fetch_deep_intent(const std::string& command);
-
     // ── Screen state extraction ─────────────────────────────────
 
     /// Execute a tool and return both result and screen_state (if present).
@@ -164,21 +152,6 @@ public:
     ToolResult execute_with_screen(const std::string& name,
                                     const nlohmann::json& args,
                                     bool include_screen = true);
-
-    // ── Structured Task Executor (STE) ──────────────────────────
-
-    /// POST /plan_and_execute — plan and execute a multi-step task.
-    /// Returns structured result with spoken progress updates.
-    struct TaskExecResult {
-        std::string status;              // "ok" | "partial" | "failed" | "clarifying"
-        std::string result;              // final result text
-        int steps_completed = 0;         // how many steps successfully ran
-        int total_steps = 0;             // total planned steps
-        std::vector<std::string> spoken; // progress messages for TTS
-        // For CLARIFYING state (find_file multi-match)
-        std::vector<std::pair<std::string, std::string>> file_choices; // {name, path}
-    };
-    TaskExecResult execute_task(const std::string& command);
 
     /// Read a string field, tolerating missing / null / non-string values.
     static std::string json_str(const nlohmann::json& j, const char* key,
