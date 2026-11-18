@@ -814,10 +814,8 @@ def list_running_applications() -> str:
     # The Mac's own list (no AppleScript, no Automation permission, ~1 ms) —
     # the System Events route failed with no permission in the app (18 Nov)
     try:
-        from AppKit import NSWorkspace
-        names = [str(a.localizedName()) for a in NSWorkspace.sharedWorkspace().runningApplications()
-                 if a.activationPolicy() == 0 and a.localizedName()]
-        names = [n for n in dict.fromkeys(names) if n not in ("DEMASCAS",)]
+        from core import axui
+        names = [n for n in dict.fromkeys(n for n, _ in axui.running_apps()) if n not in ("DEMASCAS",)]
         if names:
             return f"You have {len(names)} apps open: {', '.join(names)}."
     except Exception:
@@ -1247,11 +1245,19 @@ def find_and_click(search_text: str) -> str:
     # inside Electron apps).  Falls back to the AppleScript search below.
     try:
         from core import axui
-        if axui.available():
+        if axui.available() and axui.AS_trusted():
             app = axui.frontmost_app()
             item = axui.find(app, search_text, cutoff=0.75) if app else None
-            if item and axui.press(item):
-                return f"Success: Clicked '{item['name']}' in {app}."
+            if item:
+                from core.screen.risk import extra_risk
+                risky = extra_risk(search_text, item["name"])
+                if risky:      # belt and braces: never press a riskier button than asked
+                    return f"[-] The closest match was '{item['name']}' ({risky}) — not what you asked, so I didn't click it."
+                if axui.press(item):
+                    return f"Success: Clicked '{item['name']}' in {app}."
+            # the accessibility tree is the safe path: no blind "contains" click
+            # when it simply found nothing that matches
+            return f"Failed: I don't see '{search_text}' in {app or 'the front app'}."
     except Exception as e:
         print(f"[*] fast click unavailable ({e}); using AppleScript search")
 

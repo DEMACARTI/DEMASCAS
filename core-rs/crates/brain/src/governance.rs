@@ -31,12 +31,12 @@ const OUTWARD: &[&str] = &[
     "browser_submit_form", "web_execute_goal", "smart_reply",
 ];
 /// Can lose data or change the system.
-const DESTRUCTIVE: &[&str] = &["delete_file", "run_shell_command", "run_app_script", "forget_web", "remove_preference", "set_default_browser"];
+const DESTRUCTIVE: &[&str] = &["empty_trash", "delete_file", "run_shell_command", "run_app_script", "forget_web", "remove_preference", "set_default_browser"];
 /// Not gated by the tool server, so the brain asks itself.
 const ASK_HERE: &[&str] = &["run_shell_command", "browser_submit_form", "web_execute_goal", "forget_web", "set_default_browser"];
 /// Can never be pre-approved by a standing rule.
 const NEVER_STANDING: &[&str] = &[
-    "call_contact", "delete_file", "deliver_chat_message", "message_contact", "send_chat_message", "type_and_submit",
+    "empty_trash", "call_contact", "delete_file", "deliver_chat_message", "message_contact", "send_chat_message", "type_and_submit",
     "run_shell_command", "run_app_script", "browser_submit_form", "web_execute_goal",
 ];
 

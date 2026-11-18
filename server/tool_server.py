@@ -378,7 +378,8 @@ def _parse_result(obj):
 # type_and_submit presses Enter/Send wherever it is (a browser Gmail tab sent an
 # email in testing) — it ALWAYS needs a spoken yes.
 # call_contact rings a real person — always asked, never pre-approved.
-CONFIRM_REQUIRED_TOOLS = frozenset({"delete_file", "deliver_chat_message", "add_event", "type_and_submit", "call_contact"})
+CONFIRM_REQUIRED_TOOLS = frozenset({"delete_file", "deliver_chat_message", "add_event", "type_and_submit", "call_contact",
+                                    "empty_trash"})
 _CONFIRM_TTL_SEC = 120
 _LAST_VERIFIED: dict[int, object] = {}   # thread → verification of its last tool call
 _PENDING: dict[str, dict] = {}
@@ -590,6 +591,12 @@ def _describe_action(tool: str, args: dict) -> str:
         return f"Move {os.path.basename(path.rstrip('/')) or path} to the Trash?"
     if tool == "deliver_chat_message":
         return f"Send '{args.get('text', '')}' to {args.get('contact', 'them')} on {args.get('app', 'the app')}?"
+    if tool == "add_event":
+        return f"Add “{args.get('title', 'that')}” to your calendar for {args.get('when', 'that time')}?"
+    if tool == "type_and_submit":
+        return f"Type “{str(args.get('text', ''))[:60]}” in {_front_app_fast() or 'the front app'} and press Enter?"
+    if tool == "empty_trash":
+        return "Empty the Trash? Everything in it is deleted for good."
     if tool == "call_contact":
         how = {"facetime": " on FaceTime video", "facetime_audio": " on FaceTime audio"}.get(str(args.get("via", "")), "")
         return f"Call {args.get('name') or args.get('number')} on {args.get('spoken_number') or args.get('number')}{how}?"
@@ -597,6 +604,9 @@ def _describe_action(tool: str, args: dict) -> str:
         if is_risky_shortcut(str(args.get("keys", ""))):
             return f"Press {args.get('keys')}? That can close, quit or delete something."
         return f"Press {args.get('keys')}? That would send what's typed."
+    if tool in ("find_and_click", "click_ui_element", "browser_click_text", "web_smart_click"):
+        label = args.get("search_text") or args.get("element_name") or args.get("text") or args.get("element_description") or "that"
+        return f"Click “{label}” in {_front_app_fast() or 'the front app'}?"
     if tool == "click_menu_item":
         return f"In {args.get('app_name', 'the app')}, click {args.get('menu_path', 'that menu item')}?"
     if tool == "run_app_script":
@@ -718,12 +728,50 @@ def _send_chat_message_tool(app: str = "", contact: str = "", text: str = "") ->
 
 def _message_contact_tool(request: str) -> dict:
     """Skill entry point: understand "send hi to Hatem on Discord" and run
-    the read-back-then-send flow."""
+    the read-back-then-send flow.  "reply to him" / "message him back" means
+    the last chat DEMASCAS opened or told you about."""
     from actuators.messaging import parse_request
     p = parse_request(request)
+    last = ACTIVE_CONTEXT.get("last_chat") or {}
+    pronoun = re.search(r"\b(him|her|them|back|this chat|that chat|the chat)\b", request or "", re.I)
+    if not p["contact"] and last.get("contact") and (pronoun or re.search(r"\breply\b", request or "", re.I)):
+        p["contact"], p["app"] = last["contact"], p["app"] or last.get("app", "")
     if not p["contact"]:
-        return {"success": False, "message": "Who should I message?"}
+        return {"success": True, "asked": True, "message": "Who should I message, and what should I say?"}
+    if not p["app"] and last.get("app") and last.get("contact", "").lower().startswith(p["contact"].lower()[:4]):
+        p["app"] = last["app"]
+    if not (p["text"] or "").strip():
+        # live 18 Nov: "reply to Shafi" looped on "Who should I message?"
+        app = p["app"] or last.get("app") or "WhatsApp"
+        return {"success": True, "asked": True, "message": f"What should I say to {p['contact']} on {app}?"}
     return _send_chat_message_tool(p["app"], p["contact"], p["text"])
+
+
+def _open_chat_tool(app: str = "", contact: str = "") -> dict:
+    """Open one conversation and check it's really that person's — nothing is typed."""
+    from actuators.messaging import open_chat, CHAT_APPS
+    last = ACTIVE_CONTEXT.get("last_chat") or {}
+    contact = (contact or "").strip() or last.get("contact", "")
+    app = (app or "").strip() or last.get("app", "") or next((a for a in CHAT_APPS if _app_running(a)), "")
+    if not contact:
+        return {"success": True, "asked": True, "message": "Whose chat should I open?"}
+    if not app:
+        return {"success": True, "asked": True, "message": f"Which app is your chat with {contact} in?"}
+    r = open_chat(app, contact)
+    if r.get("success"):
+        ACTIVE_CONTEXT["last_chat"] = {"app": app, "contact": r.get("contact", contact)}
+        return {"success": True, "app": app, "contact": r.get("contact", contact),
+                "message": f"Opened your chat with {r.get('contact', contact)} on {app}."}
+    return r
+
+
+TOOL_MAP["open_chat"] = _open_chat_tool
+
+# Everyday tools: sound, display, battery, disk, network, media, windows,
+# files, time zones, units, dictionary, notifications (actuators/everyday.py)
+from actuators import everyday as _everyday  # noqa: E402
+for _f in _everyday.TOOLS:
+    TOOL_MAP.setdefault(_f.__name__, _f)
 
 
 def _app_running(app: str) -> bool:
@@ -742,7 +790,19 @@ def _read_chat_messages_tool(app: str = "", contact: str = "", count: int = 15) 
         active = str(ACTIVE_CONTEXT.get("active_app", ""))
         running = [a for a in CHAT_APPS if _app_running(a)]
         app = active if is_chat_app(active) else (running[0] if len(running) == 1 else "")
-    return read_chat_messages(app, contact, count)
+    r = read_chat_messages(app, contact, count)
+    if isinstance(r, dict) and r.get("success"):
+        if r.get("contact"):
+            ACTIVE_CONTEXT["last_chat"] = {"app": app, "contact": r["contact"]}
+        elif r.get("overview") and r.get("messages"):
+            # "open it" / "reply to him" after a chat-list read → the top (unread first) chat
+            rows = r["messages"]
+            top = next((x for x in rows if re.search(r"\bunread\b", x, re.I)), rows[0])
+            name = top.split(",")[0].strip()
+            if name:
+                ACTIVE_CONTEXT["last_chat"] = {"app": app, "contact": name}
+                r["top_chat"] = name
+    return r
 
 
 TOOL_MAP["read_chat_messages"] = _read_chat_messages_tool
@@ -2292,6 +2352,15 @@ def _warm_up() -> None:
         if pruned:
             print(f"[SKILLS] Disabled {len(pruned)} unsafe learned skill(s): {pruned}")
         print(f"[✓] Memory/embedding warm-up done in {time.time() - t0:.1f} s")
+        # the calendar store's first query costs ~20 s after a restart (tool check,
+        # 18 Nov) — pay it here, only when access is ALREADY granted (no prompt)
+        if sys.platform == "darwin":
+            import EventKit
+            if EventKit.EKEventStore.authorizationStatusForEntityType_(0) == 3:
+                t1 = time.time()
+                from actuators.apple import list_agenda
+                list_agenda("today")
+                print(f"[✓] Calendar ready in {time.time() - t1:.1f} s")
     except Exception as e:
         print(f"[!] Warm-up failed (non-fatal): {e}")
 

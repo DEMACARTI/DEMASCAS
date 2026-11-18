@@ -131,8 +131,15 @@ pub fn is_own_echo(heard: &str, said: &VecDeque<(Instant, String)>) -> bool {
     if words.len() < 2 {
         return false;
     }
+    // a command whose verb DEMASCAS didn't say is the user's, even if it repeats
+    // a name DEMASCAS just said ("open the chat Junior Code Tech AIS" — live 18 Nov)
+    let verb = words.first().cloned().unwrap_or_default();
+    let commanding = brain::router::is_imperative(heard);
     said.iter().filter(|(t, _)| t.elapsed() < Duration::from_secs(20)).any(|(_, s)| {
         let sw: Vec<String> = simplify(s).split_whitespace().map(str::to_string).collect();
+        if commanding && !sw.contains(&verb) {
+            return false;
+        }
         let hit = words.iter().filter(|w| sw.iter().any(|x| {
             let n = w.len().min(x.len());
             *w == x || (n >= 4 && w.as_bytes()[..n] == x.as_bytes()[..n])
@@ -888,10 +895,19 @@ impl<E: Ears, M: Mouth + 'static> Session<E, M> {
                 // "Who should I call?" / "Which one: …?" after a call → call that name
                 let call_q = question.starts_with("Who should I call") || (question.starts_with("Which one:") && simplify(&original).contains("call"))
                     || question.contains("Who should I call?");
+                // "What should I say to Shafi Advaita on WhatsApp?" → the answer IS the message
+                let say_to = question.strip_prefix("What should I say to ").and_then(|r| r.strip_suffix('?')).map(str::to_string);
                 let decision = match file {
                     Some(action) => {
                         let name = answer_value(text);
                         Decision::Reflex(brain::reflex::Reflex::File { action, name, folder: None })
+                    }
+                    None if say_to.is_some() => {
+                        let target = say_to.clone().unwrap_or_default();
+                        let (who, app) = target.rsplit_once(" on ").map(|(w, a)| (w.to_string(), a.to_string())).unwrap_or((target.clone(), String::new()));
+                        let msg = text.trim().trim_end_matches('.').to_string();
+                        let req = if app.is_empty() { format!("send {msg} to {who}") } else { format!("send {msg} to {who} on {app}") };
+                        Decision::Reflex(brain::reflex::Reflex::Tool { name: "message_contact", args: serde_json::json!({"request": req}), say: String::new() })
                     }
                     None if call_q => {
                         let via = if simplify(&original).contains("facetime") { "facetime_audio" } else { "phone" };
@@ -905,7 +921,7 @@ impl<E: Ears, M: Mouth + 'static> Session<E, M> {
                 };
                 let combined = match file {
                     Some(_) => original.clone(),
-                    None if call_q => original.clone(),
+                    None if call_q || say_to.is_some() => original.clone(),
                     None => format!("{original}\n(I asked: \"{question}\" — the answer: \"{text}\")"),
                 };
                 if matches!(decision, Decision::Act) {

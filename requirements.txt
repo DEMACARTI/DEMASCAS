@@ -59,3 +59,4 @@ pyobjc-framework-ApplicationServices>=10; sys_platform == "darwin"
 pyobjc-framework-EventKit>=10; sys_platform == "darwin"     # Calendar + Reminders (on-device)
 pyobjc-framework-Contacts>=10; sys_platform == "darwin"     # Contacts (who "mom" is)
 pyobjc-framework-Vision>=10; sys_platform == "darwin"       # on-device screen text, QR codes, image labels (Neural Engine)
+pyobjc-framework-CoreServices>=10; sys_platform == "darwin"  # the macOS dictionary (define_word)

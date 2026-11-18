@@ -144,7 +144,9 @@ def fetch(url: str, timeout: float = 10.0) -> Page:
     root = max(cands, key=lambda x: len(x.get_text()), default=None) or soup.body
     if root is not None:
         page.text = re.sub(r"\n\s*\n+", "\n", root.get_text("\n"))[:60000]
-    page.ok = len(page.text) > 200 or bool(page.tables)
+    # short real pages count too (example.com is ~180 characters — the old 200 cut-off
+    # called it "no readable content"); a few real words, not just a heading
+    page.ok = (len(page.text.strip()) > 60 and len(page.text.split()) >= 8) or bool(page.tables)
     if not page.ok:
         page.error = "no readable content"
     return page

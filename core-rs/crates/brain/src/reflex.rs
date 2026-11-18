@@ -230,7 +230,9 @@ fn message_reflex(raw: &str, s: &str) -> Option<Reflex> {
     }
     // chat messages: always the read-back-then-yes flow
     const VERBS: &[&str] = &["send", "dm", "message", "text", "reply", "ping", "tell", "say"];
-    if !VERBS.contains(&first) || s.starts_with("tell me") || s.starts_with("say that again") || s.contains("email") {
+    // email is never a chat-app message (live 18 Nov: "send a Gmail to … @…" → "Who should I message?")
+    let email = ["email", "gmail", "mail", "e mail", "inbox"].iter().any(|w| has_word(&s, w)) || raw.contains('@');
+    if !VERBS.contains(&first) || s.starts_with("tell me") || s.starts_with("say that again") || email {
         return None;
     }
     let to_someone = s.contains(" to ") || s.contains(" saying ") || s.contains(" that ") || first == "dm" || first == "message" || first == "text" || first == "ping" || first == "reply";
@@ -550,6 +552,164 @@ fn folder_of(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Volume, mute, dark mode, lock, media, world time, dictionary, units,
+/// coin / dice, screenshot, disk / Wi-Fi / IP / uptime — one exact tool each.
+fn everyday(s: &str) -> Option<Reflex> {
+    let t = |name: &'static str, args: Value| Some(Reflex::tool(name, args, ""));
+    let num = s.split_whitespace().find_map(|w| w.trim_end_matches('%').parse::<f64>().ok());
+    // sound
+    if has_word(s, "volume") || has_word(s, "sound") {
+        if let Some(n) = num.filter(|_| has_word(s, "to") || has_word(s, "at") || has_word(s, "set")) {
+            return t("set_volume", json!({"level": n}));
+        }
+        if ["up", "louder", "increase", "raise"].iter().any(|w| has_word(s, w)) {
+            return t("set_volume", json!({"level": "up"}));
+        }
+        if ["down", "lower", "quieter", "decrease", "reduce"].iter().any(|w| has_word(s, w)) {
+            return t("set_volume", json!({"level": "down"}));
+        }
+        if s.starts_with("what") || s.starts_with("whats") || s.starts_with("how loud") {
+            return t("get_volume", json!({}));
+        }
+    }
+    if ["mute", "mute the sound", "mute it", "mute my mac", "mute the mac"].contains(&s) {
+        return t("mute", json!({"on": true}));
+    }
+    if ["unmute", "unmute the sound", "unmute it", "sound on"].contains(&s) {
+        return t("mute", json!({"on": false}));
+    }
+    // display
+    if has_word(s, "dark mode") || has_word(s, "light mode") {
+        let on = if has_word(s, "light mode") || has_word(s, "off") || has_word(s, "disable") { "off" }
+                 else if has_word(s, "on") || has_word(s, "enable") || has_word(s, "turn on") || has_word(s, "switch to dark") { "on" } else { "toggle" };
+        return t("dark_mode", json!({"on": on}));
+    }
+    if ["lock the screen", "lock my screen", "lock the mac", "lock my mac", "lock the computer", "lock screen", "lock my computer"].contains(&s) {
+        return t("lock_screen", json!({}));
+    }
+    if has_word(s, "brighter") || has_word(s, "brightness up") || has_word(s, "increase brightness") || has_word(s, "increase the brightness") {
+        return t("brightness", json!({"direction": "up", "steps": 3}));
+    }
+    if has_word(s, "dimmer") || has_word(s, "brightness down") || has_word(s, "decrease brightness") || has_word(s, "dim the screen") || has_word(s, "lower the brightness") {
+        return t("brightness", json!({"direction": "down", "steps": 3}));
+    }
+    // media
+    for (p, a) in [("next song", "next"), ("next track", "next"), ("skip this song", "next"), ("skip song", "next"), ("previous song", "previous"),
+                   ("previous track", "previous"), ("pause the music", "pause"), ("pause music", "pause"), ("pause the song", "pause"),
+                   ("resume the music", "play"), ("resume music", "play"), ("play the music", "play")] {
+        if s == p || s.starts_with(&format!("{p} ")) {
+            return t("media_control", json!({"action": a}));
+        }
+    }
+    if ["what song is this", "whats playing", "what is playing", "what song is playing", "whats this song", "which song is this", "what am i listening to"].iter().any(|p| s.starts_with(p)) {
+        return t("now_playing", json!({}));
+    }
+    // status
+    if ["how much disk space", "how much space", "how much storage", "disk space", "free space", "storage left", "how much free space"].iter().any(|p| s.contains(p)) {
+        return t("disk_space", json!({}));
+    }
+    if ["whats my ip", "what is my ip", "my ip address", "ip address"].iter().any(|p| s.contains(p)) {
+        return t("ip_address", json!({}));
+    }
+    if ["how long has my mac been on", "uptime", "how long since restart", "when did i last restart"].iter().any(|p| s.contains(p)) {
+        return t("uptime", json!({}));
+    }
+    if (has_word(s, "wifi") || s.contains("wi fi")) && (has_word(s, "turn on") || has_word(s, "turn off") || has_word(s, "switch on") || has_word(s, "switch off")) {
+        return t("set_wifi", json!({"on": !(has_word(s, "off"))}));
+    }
+    if ["how busy is my mac", "why is my mac slow", "cpu usage", "memory usage", "how much memory", "system load", "is my mac slow"].iter().any(|p| s.contains(p)) {
+        return t("system_load", json!({}));
+    }
+    // utilities
+    if let Some(rest) = ["what time is it in ", "whats the time in ", "what is the time in ", "time in ", "current time in "].iter().find_map(|p| s.strip_prefix(p)) {
+        return t("world_time", json!({"city": rest.trim()}));
+    }
+    if let Some(w) = ["define ", "what does the word ", "whats the meaning of ", "what is the meaning of ", "meaning of ", "dictionary "]
+        .iter().find_map(|p| s.strip_prefix(p)) {
+        let w = w.trim_end_matches(" mean").trim();
+        if !w.is_empty() && w.split_whitespace().count() <= 3 {
+            return t("define_word", json!({"word": w}));
+        }
+    }
+    if let Some(rest) = s.strip_prefix("convert ").or_else(|| s.strip_prefix("how many ").filter(|r| r.contains(" in "))) {
+        let w: Vec<&str> = rest.split_whitespace().collect();
+        if let (Some(i), Some(v)) = (w.iter().position(|x| *x == "to" || *x == "in" || *x == "into"), w.first().and_then(|x| x.parse::<f64>().ok())) {
+            if i >= 2 && i + 1 < w.len() {
+                return t("convert_units", json!({"value": v, "from_unit": w[1..i].join(" "), "to_unit": w[i + 1..].join(" ")}));
+            }
+        }
+    }
+    if ["flip a coin", "toss a coin", "heads or tails", "coin flip"].iter().any(|p| s.contains(p)) {
+        return t("random_pick", json!({"kind": "coin"}));
+    }
+    if ["roll a dice", "roll a die", "roll the dice", "roll dice"].iter().any(|p| s.contains(p)) {
+        return t("random_pick", json!({"kind": "dice"}));
+    }
+    if ["take a screenshot", "take screenshot", "screenshot my screen", "capture the screen", "capture my screen"].iter().any(|p| s.starts_with(p)) {
+        return t("take_screenshot", json!({}));
+    }
+    // windows
+    for (p, a) in [("minimize this window", "minimize"), ("minimise this window", "minimize"), ("minimize the window", "minimize"),
+                   ("make it full screen", "fullscreen"), ("full screen this", "fullscreen"), ("go full screen", "fullscreen"),
+                   ("move this window to the left", "left_half"), ("snap left", "left_half"), ("move this window to the right", "right_half"),
+                   ("snap right", "right_half"), ("maximize this window", "maximize"), ("maximise this window", "maximize")] {
+        if s == p {
+            return t("window_action", json!({"action": a}));
+        }
+    }
+    if s == "empty the trash" || s == "empty trash" || s == "empty my trash" {
+        return t("empty_trash", json!({}));
+    }
+    None
+}
+
+/// "open the Shafi chat" / "open the chat named X on WhatsApp" / "open it"
+/// (after DEMASCAS listed the chats) → open_chat, which types nothing.
+fn open_chat_request(s: &str, raw: &str, recent: &Recent) -> Option<Reflex> {
+    if !(s.starts_with("open") || s.starts_with("go to") || s.starts_with("show me") || s.starts_with("switch to")) {
+        return None;
+    }
+    let app = CHAT_APPS.iter().find(|a| has_word(s, a) && **a != "messages").map(|a| match *a {
+        "whatsapp" => "WhatsApp".to_string(),
+        x => { let mut c = x.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }
+    }).unwrap_or_default();
+    let after_chat = matches!(recent.last_tool.as_deref(), Some("read_chat_messages") | Some("open_chat"));
+    if after_chat && ["open it", "open that", "open that chat", "open the chat", "open this chat", "open it up", "open that one", "open the first one"].contains(&s) {
+        return Some(Reflex::tool("open_chat", json!({"app": app, "contact": ""}), ""));
+    }
+    if !(has_word(s, "chat") || has_word(s, "conversation") || has_word(s, "dm")) {
+        return None;
+    }
+    // the name: after "named / called / with", else between "open the" and "chat"
+    let lower = raw.to_lowercase();
+    let mut who = String::new();
+    for k in [" named ", " called ", " with "] {
+        if let Some(i) = lower.find(k) {
+            who = raw[i + k.len()..].to_string();
+            break;
+        }
+    }
+    if who.is_empty() {
+        let body = s.trim_start_matches("open").trim_start_matches("go to").trim_start_matches("show me").trim_start_matches("switch to").trim();
+        let body = body.trim_start_matches("the ").trim_start_matches("my ");
+        if let Some(i) = body.find(" chat") {
+            who = body[..i].to_string();
+        }
+    }
+    let mut who = who.trim().trim_end_matches(['.', '!', '?']).to_string();
+    for cut in [" on whatsapp", " in whatsapp", " on discord", " in discord", " on slack", " in slack", " on telegram", " on WhatsApp", " in WhatsApp", " on Discord", " on Slack"] {
+        if let Some(i) = who.find(cut) {
+            who.truncate(i);
+        }
+    }
+    let who = who.trim().trim_start_matches("the ").to_string();
+    let lw = who.to_lowercase();
+    if who.is_empty() || who.split_whitespace().count() > 6 || CHAT_APPS.iter().any(|a| lw == *a) || ["it", "that", "this", "the"].contains(&lw.as_str()) {
+        return None;
+    }
+    Some(Reflex::tool("open_chat", json!({"app": app, "contact": who}), ""))
 }
 
 /// "open any random PNG file from the pictures folder" / "take any random
@@ -1002,7 +1162,7 @@ pub fn reflex(text: &str, recent: &Recent, now: chrono_lite::Now) -> Option<Refl
     const BATTERY: &[&str] = &["how much battery do i have", "how much battery is left", "whats my battery", "what is my battery",
         "battery level", "battery percentage", "whats the battery", "how is my battery", "check my battery", "check the battery"];
     if BATTERY.iter().any(|p| s.starts_with(p)) {
-        return Some(Reflex::tool("get_system_info", json!({}), ""));
+        return Some(Reflex::tool("battery_status", json!({}), ""));
     }
     const SCREEN: &[&str] = &["read this page", "read the page", "read this to me", "read the screen", "read my screen", "what does this say",
         "what does this page say", "whats on this page", "what is on this page", "summarise this page", "summarize this page",
@@ -1106,11 +1266,17 @@ pub fn reflex(text: &str, recent: &Recent, now: chrono_lite::Now) -> Option<Refl
             }
         }
     }
+    // ── open ONE chat: "open the Shafi chat", "open the chat named Junior Code Tech AIS",
+    //    "open my chat with Aman on Discord"; "open it" right after a chat-list read
+    if let Some(r) = open_chat_request(&s, raw, recent) {
+        return Some(r);
+    }
     // ── "check my WhatsApp messages" / "any new messages on Discord" — nobody named:
     //    open the app and read the chat list (live 18 Nov: refused as "not allowed")
     if let Some(app) = CHAT_APPS.iter().find(|a| has_word(&s, a) && **a != "messages") {
-        let about_msgs = ["message", "messages", "chats", "chat", "texts", "dms", "unread"].iter().any(|w| has_word(&s, w));
-        let reading = ["check", "read", "any", "show", "what", "whats", "do i have", "did i get", "see", "look", "open"].iter().any(|w| has_word(&s, w));
+        let about_msgs = ["message", "messages", "messaged", "texted", "chats", "chat", "texts", "dms", "unread", "updates", "new"].iter().any(|w| has_word(&s, w));
+        let reading = ["check", "read", "any", "show", "what", "whats", "do i have", "did i get", "see", "look", "open", "who", "has anyone",
+                       "is there", "are there", "anything"].iter().any(|w| has_word(&s, w));
         let sending = ["send", "reply", "type", "write", "tell", "message to", "text to"].iter().any(|w| has_word(&s, w));
         if about_msgs && reading && !sending && read_messages_request(&s).is_none() {
             let name = match *app { "whatsapp" => "WhatsApp".to_string(), a => { let mut c = a.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() } };
@@ -1149,6 +1315,11 @@ pub fn reflex(text: &str, recent: &Recent, now: chrono_lite::Now) -> Option<Refl
     }
     // ── "open any random PNG file from my pictures" / "a random presentation on this laptop"
     if let Some(r) = random_file(&s) {
+        return Some(r);
+    }
+
+    // ── everyday Mac things, no model
+    if let Some(r) = everyday(&s) {
         return Some(r);
     }
 
@@ -1318,6 +1489,40 @@ mod tests {
     }
 
     #[test]
+    fn everyday_reflexes() {
+        let r = Recent::default();
+        let name = |t: &str| match reflex(t, &r, now()) { Some(Reflex::Tool { name, .. }) => name, other => panic!("{t}: {other:?}") };
+        for (t, n) in [("set the volume to 30", "set_volume"), ("turn the volume up", "set_volume"), ("mute", "mute"), ("turn on dark mode", "dark_mode"),
+                       ("lock the screen", "lock_screen"), ("next song", "media_control"), ("what song is this", "now_playing"),
+                       ("how much disk space do I have", "disk_space"), ("what's my IP address", "ip_address"), ("what time is it in Tokyo", "world_time"),
+                       ("define serendipity", "define_word"), ("convert 5 miles to km", "convert_units"), ("flip a coin", "random_pick"),
+                       ("take a screenshot", "take_screenshot"), ("empty the trash", "empty_trash"), ("how much battery do I have", "battery_status")] {
+            assert_eq!(name(t), n, "{t}");
+        }
+    }
+
+    #[test]
+    fn open_one_chat() {
+        let r = Recent::default();
+        assert_eq!(reflex("open the Shafi chat.", &r, now()), Some(Reflex::tool("open_chat", json!({"app": "", "contact": "shafi"}), "")));
+        assert_eq!(reflex("I want you to open the chat and WhatsApp named Junior Code Tech AIS.", &r, now()),
+            Some(Reflex::tool("open_chat", json!({"app": "WhatsApp", "contact": "Junior Code Tech AIS"}), "")));
+        let after = Recent { last_tool: Some("read_chat_messages".into()), ..Default::default() };
+        assert_eq!(reflex("Open it.", &after, now()), Some(Reflex::tool("open_chat", json!({"app": "", "contact": ""}), "")));
+        assert!(!matches!(reflex("Open it.", &r, now()), Some(Reflex::Tool { name: "open_chat", .. })));
+    }
+
+    #[test]
+    fn whatsapp_updates_and_email() {
+        let r = Recent::default();
+        for t in ["Are there any updates on WhatsApp?", "Who has messaged me on WhatsApp?"] {
+            assert!(matches!(reflex(t, &r, now()), Some(Reflex::Tool { name: "read_chat_messages", .. })), "{t}");
+        }
+        let gmail = "send a Gmail to Paryush j1repa-line@drededgmail.com, telling that he is a very good person.";
+        assert!(!matches!(reflex(gmail, &r, now()), Some(Reflex::Tool { name: "message_contact", .. })));
+    }
+
+    #[test]
     fn check_chat_app_without_a_name() {
         let r = Recent::default();
         assert_eq!(reflex("Check for WhatsApp messages.", &r, now()), Some(Reflex::tool("read_chat_messages", json!({"app": "WhatsApp", "contact": ""}), "")));
@@ -1453,7 +1658,8 @@ mod tests {
         let r = Recent::default();
         assert_eq!(reflex("what time is it", &r, now()), Some(Reflex::Say("It's 3:07 PM.".into())));
         assert_eq!(reflex("what's today's date", &r, now()), Some(Reflex::Say("Today is Monday, November 16, 2026.".into())));
-        assert!(reflex("what time is it in Tokyo", &r, now()).is_none());
+        // the world clock answers it locally now (18 Nov)
+        assert_eq!(tool(reflex("what time is it in Tokyo", &r, now())).0, "world_time");
         assert_eq!(reflex("what is the current time?", &r, now()), Some(Reflex::Say("It's 3:07 PM.".into())));
         assert_eq!(reflex("can you tell me the time", &r, now()), Some(Reflex::Say("It's 3:07 PM.".into())));
         assert_eq!(tool(reflex("what's the weather in Delhi", &r, now())).1, json!({"location": "Delhi"}));
@@ -1530,7 +1736,7 @@ mod tests {
     #[test]
     fn reading() {
         let r = Recent { last_file: Some("/x/report.pdf".into()), ..Default::default() };
-        assert_eq!(tool(reflex("how much battery do I have", &r, now())).0, "get_system_info");
+        assert_eq!(tool(reflex("how much battery do I have", &r, now())).0, "battery_status");
         assert_eq!(tool(reflex("read this page to me", &r, now())).0, "read_screen_text");
         assert_eq!(tool(reflex("summarise the project report", &r, now())), ("read_file_text".into(), json!({"file_path": "/x/report.pdf"})));
         // no file known yet → find it, then read it
@@ -1574,7 +1780,8 @@ mod tests {
 
     #[test]
     fn shortcuts_are_reflexes() {
-        assert_eq!(tool(reflex("take a screenshot", &Recent::default(), now())).1, json!({"keys": "command+shift+3"}));
+        // a real screenshot file on the Desktop, no keystroke needed (18 Nov)
+        assert_eq!(tool(reflex("take a screenshot", &Recent::default(), now())).0, "take_screenshot");
     }
 
     #[test]

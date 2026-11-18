@@ -44,7 +44,9 @@ def get_active_window_tree(app_name: str | None = None) -> str:
     try:
         from core import axui
         target = (app_name or "").strip() or axui.frontmost_app()
-        if target and axui.available() and axui.is_electron(target):
+        # the in-process tree for EVERY app when Accessibility is on (0.1–0.6 s);
+        # the AppleScript walk below timed out on Finder (tool check, 18 Nov)
+        if target and axui.available() and (axui.is_electron(target) or axui.AS_trusted()):
             rows = axui.tree_text(target)
             if rows:
                 return f"ACTIVE APP: {target}\nUI TREE MAP:\n{rows}"

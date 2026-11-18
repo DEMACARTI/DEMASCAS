@@ -110,6 +110,12 @@ TOOL_CATEGORIES = {
     "vision": [
         "describe_screen", "look_at_image", "screen_observe", "find_image_by_content",
     ],
+    "sound_display": ["get_volume", "set_volume", "mute", "brightness", "dark_mode", "lock_screen", "sleep_display", "keep_awake"],
+    "mac_status": ["battery_status", "disk_space", "system_load", "ip_address", "wifi_status", "set_wifi", "uptime", "list_running_applications"],
+    "media": ["media_control", "now_playing", "set_volume"],
+    "windows": ["window_action", "hide_app", "list_open_windows", "activate_application"],
+    "files_more": ["create_folder", "move_file", "copy_file", "rename_file", "zip_files", "reveal_in_finder", "file_info", "recent_files", "find_file", "empty_trash"],
+    "utilities": ["world_time", "convert_units", "define_word", "random_pick", "take_screenshot", "show_notification"],
     "forms": [
         "form_read", "screen_observe", "ui_type", "ui_set_checked", "ui_select", "ui_click", "ui_scroll",
     ],
@@ -143,6 +149,18 @@ TOOL_CATEGORIES = {
 # Each keyword maps to one or more categories to include.
 
 INTENT_KEYWORDS = {
+    # everyday Mac things
+    "volume": ["sound_display", "media"], "louder": ["sound_display"], "quieter": ["sound_display"], "mute": ["sound_display"],
+    "brightness": ["sound_display"], "brighter": ["sound_display"], "dimmer": ["sound_display"], "dark mode": ["sound_display"],
+    "light mode": ["sound_display"], "lock": ["sound_display"], "awake": ["sound_display"],
+    "battery": ["mac_status"], "disk": ["mac_status"], "storage": ["mac_status"], "space": ["mac_status"], "wifi": ["mac_status"],
+    "wi-fi": ["mac_status"], "ip address": ["mac_status"], "memory": ["mac_status"], "cpu": ["mac_status"], "uptime": ["mac_status"],
+    "song": ["media"], "music": ["media"], "playing": ["media"], "pause": ["media"], "next track": ["media"], "spotify": ["media"],
+    "window": ["windows"], "minimize": ["windows"], "full screen": ["windows"], "half": ["windows"], "hide": ["windows"],
+    "folder": ["files_more"], "move": ["files_more"], "copy": ["files_more"], "rename": ["files_more"], "zip": ["files_more"],
+    "trash": ["files_more"], "recent": ["files_more"],
+    "time in": ["utilities"], "convert": ["utilities"], "define": ["utilities"], "meaning": ["utilities"], "coin": ["utilities"],
+    "dice": ["utilities"], "screenshot": ["utilities"], "notify": ["utilities"], "notification": ["utilities"],
     # forms, quizzes, assignments — fill in on screen (submit only on a yes)
     "tick":        ["forms"],
     "untick":      ["forms"],

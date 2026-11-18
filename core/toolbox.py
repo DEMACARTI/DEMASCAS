@@ -2232,6 +2232,7 @@ TOOLS = [
     {'type': 'function', 'function': {'name': 'add_event', 'description': "Add an event to the user's calendar (asks the user first).", 'parameters': {'type': 'object', 'properties': {"title": {"type": "string"}, "when": {"type": "string", "description": "e.g. 'tomorrow at 3 pm'"}, "duration_minutes": {"type": "integer"}, "location": {"type": "string"}}, 'required': ['title', 'when']}}},
     {'type': 'function', 'function': {'name': 'remind_me', 'description': "Create a reminder in the Reminders app (syncs to the user's iPhone).", 'parameters': {'type': 'object', 'properties': {"title": {"type": "string"}, "when": {"type": "string", "description": "e.g. 'at 6 pm', 'tomorrow at 9'"}}, 'required': ['title']}}},
     {'type': 'function', 'function': {'name': 'list_reminders', 'description': "The user's open reminders.", 'parameters': {'type': 'object', 'properties': {"count": {"type": "integer"}}, 'required': []}}},
+    {'type': 'function', 'function': {'name': 'open_chat', 'description': "Open one conversation in WhatsApp / Discord / Slack / Telegram and check it's that person's. Types nothing.", 'parameters': {'type': 'object', 'properties': {"contact": {"type": "string"}, "app": {"type": "string"}}, 'required': ['contact']}}},
     {'type': 'function', 'function': {'name': 'open_copied_path', 'description': 'Open the file, folder or app whose path is on the clipboard and say what it is.', 'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
     {'type': 'function', 'function': {'name': 'open_settings_pane', 'description': 'Open System Settings at a Privacy & Security pane: screen recording, accessibility, microphone, full disk access, contacts, automation.', 'parameters': {'type': 'object', 'properties': {"pane": {"type": "string"}}, 'required': []}}},
     {'type': 'function', 'function': {'name': 'describe_screen', 'description': "LOOK at the screen with the vision model and describe it, or answer a question about what's shown (pictures, layouts, charts, anything visual).", 'parameters': {'type': 'object', 'properties': {"question": {"type": "string"}}, 'required': []}}},
@@ -2351,3 +2352,31 @@ TOOLS = [
                                                                                         'forget.'}},
                                           'required': ['match']}}},
 ]
+
+
+# ── Everyday tools (actuators/everyday.py): schemas generated from each
+#    function's signature + docstring, so they can't drift from the code ──
+def _schema_from_function(fn) -> dict:
+    import inspect
+    sig = inspect.signature(fn)
+    props, required = {}, []
+    types = {int: "integer", float: "number", bool: "boolean", str: "string"}
+    for name, p in sig.parameters.items():
+        ann = p.annotation if p.annotation is not inspect.Parameter.empty else str
+        if isinstance(ann, str):
+            ann = {"int": int, "float": float, "bool": bool}.get(ann, str)
+        props[name] = {"type": types.get(ann, "string")}
+        if p.default is inspect.Parameter.empty:
+            required.append(name)
+    doc = (inspect.getdoc(fn) or fn.__name__).split("\n")[0]
+    return {"type": "function", "function": {"name": fn.__name__, "description": doc,
+                                             "parameters": {"type": "object", "properties": props, "required": required}}}
+
+
+try:
+    from actuators.everyday import TOOLS as _EVERYDAY
+    from core.screen.look import vision_status as _vision_status
+    _have = {t["function"]["name"] for t in TOOLS}
+    TOOLS.extend(_schema_from_function(f) for f in [*_EVERYDAY, _vision_status] if f.__name__ not in _have)
+except Exception as _e:  # never break the server over an optional module
+    print(f"[toolbox] everyday tools unavailable: {_e}")

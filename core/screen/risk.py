@@ -133,6 +133,17 @@ def classify(ctx: dict, element: dict, action: str = "click") -> dict:
 NEVER_PREAPPROVED = {"money", "destructive", "security", "outward", "blocked"}
 
 
+def extra_risk(query: str, label: str) -> str:
+    """A risky word the matched LABEL has that the user's words don't
+    (asked "Shafi", matched "Block Shafi Advaita" → "Block").  '' = fine."""
+    q = (query or "").lower()
+    for pat in (MONEY, DESTRUCTIVE, SECURITY, OUTWARD):
+        for m in pat.finditer(label or ""):
+            if m.group(0).lower() not in q:
+                return m.group(0)
+    return ""
+
+
 # ── per-site trust (only ever for harmless clicks) ───────────────────
 
 def _load_trust() -> dict:

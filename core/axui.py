@@ -33,12 +33,41 @@ def available() -> bool:
         return False
 
 
+def AS_trusted() -> bool:
+    """Accessibility permission granted (the tree can be read and pressed)."""
+    try:
+        import ApplicationServices as AS
+        return bool(AS.AXIsProcessTrusted())
+    except Exception:
+        return False
+
+
 def pid_of(app: str) -> int:
     try:
         out = subprocess.run(["pgrep", "-x", app], capture_output=True, text=True, timeout=2).stdout
-        return int(out.split()[0]) if out.strip() else 0
+        if out.strip():
+            return int(out.split()[0])
     except Exception:
-        return 0
+        pass
+    # the app's name isn't its process name (VS Code runs as "Electron" …)
+    return next((pid for name, pid in running_apps() if name.lower() == (app or "").lower()), 0)
+
+
+def running_apps() -> list[tuple[str, int]]:
+    """(name, pid) of every app with a Dock icon, live (lsappinfo, ~25 ms).
+    NSWorkspace.runningApplications() is NOT used: without a run loop (the
+    tool server) it stays frozen at start-up and missed apps opened later."""
+    try:
+        out = subprocess.run(["lsappinfo", "list"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return []
+    apps = []
+    for blk in re.split(r"\n(?=\s*\d+\) \")", out):
+        m = re.match(r'\s*\d+\) "([^"]+)"', blk)
+        pid = re.search(r"pid = (\d+)", blk)
+        if m and pid and 'type="Foreground"' in blk:
+            apps.append((m.group(1), int(pid.group(1))))
+    return apps
 
 
 def frontmost_app() -> str:
@@ -129,6 +158,13 @@ def find(app: str, query: str, roles: tuple = INTERACTIVE, cutoff: float = 0.6,
     q = _clean(query)
     if not q or not items:
         return None
+    # never "find" a riskier control than was asked for (live 18 Nov: "Shafi"
+    # matched "Block Shafi Advaita" before the chat itself)
+    try:
+        from core.screen.risk import extra_risk
+        items = [it for it in items if not extra_risk(query, it["name"])]
+    except Exception:
+        pass
     for it in items:
         if _clean(it["name"]) == q:
             return it

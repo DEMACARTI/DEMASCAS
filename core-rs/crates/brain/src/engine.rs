@@ -39,7 +39,9 @@ pub const READ_ONLY: &[&str] = &[
     "browser_get_url", "browser_get_title", "browser_get_page_text", "browser_get_links",
     "browser_get_dom_summary", "browser_list_tabs", "summarize_latest_pdf", "summarize_selected_pdf",
     "read_current_email", "gmail_read_email", "guide_app", "ask_my_files", "find_document", "list_agenda",
-    "list_reminders", "find_contact", "recent_calls", "check_permissions", "read_chat_messages", "screen_observe", "screen_find", "form_read", "find_image_by_content", "describe_screen", "look_at_image", "vision_status", "read_notes", "read_mail", "read_screen_text", "read_file_text", "morning_brief", "check_internet",
+    "list_reminders", "find_contact", "recent_calls", "check_permissions", "read_chat_messages", "open_chat",
+    "get_volume", "battery_status", "disk_space", "system_load", "ip_address", "wifi_status", "uptime", "now_playing", "file_info",
+    "recent_files", "world_time", "convert_units", "define_word", "random_pick", "vision_status", "screen_observe", "screen_find", "form_read", "find_image_by_content", "describe_screen", "look_at_image", "vision_status", "read_notes", "read_mail", "read_screen_text", "read_file_text", "morning_brief", "check_internet",
 ];
 
 /// Tools whose next step needs on-screen element names (a screen read
@@ -413,16 +415,19 @@ impl Engine {
                     return c;
                 }
                 if name == "read_chat_messages" && !failed {
-                    // summarise what they said, from the messages themselves
-                    let who = args.get("contact").and_then(Value::as_str).unwrap_or("they").to_string();
-                    let notes = format!("These are the latest messages in the chat (newest last):\n{}", crate::governance::fence_untrusted(bridge::utf8_cut(&actions::speakable(&tr.result), 1800)));
-                    let q = format!("Briefly tell me what {who} said — the latest first, in one or two sentences. Quote anything important.");
-                    let cancel = CancellationToken::new();
-                    let mut c = self.chat(&q, &notes, &cancel, say).await;
-                    self.chat_history.clear(); // the summary isn't conversation
-                    c.tools = out.tools;
-                    c.path = "reflex";
-                    return c;
+                    // summarise ONLY what was read — never the conversation (live 18 Nov:
+                    // with nothing readable it "summarised" our own chat as a message)
+                    let who = args.get("contact").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string);
+                    let app_name = args.get("app").and_then(Value::as_str).unwrap_or("the app");
+                    let read = actions::speakable(&tr.result);
+                    let q = match &who {
+                        Some(w) => format!("These are the latest messages in my chat with {w} on {app_name} (newest last). In one or two spoken sentences, tell me what {w} said, latest first. Quote anything important."),
+                        None => format!("This is my {app_name} chat list (newest first: name, last message, time, unread count). In one or two spoken sentences, tell me who has messaged me recently and which chats are unread."),
+                    };
+                    let reply = self.summarize_only(&q, &read).await;
+                    say(&reply);
+                    out.reply = reply;
+                    return out;
                 }
                 if name == "open_file" && !failed {
                     out.last_file = args.get("file_path").and_then(Value::as_str).map(str::to_string);
@@ -603,6 +608,25 @@ impl Engine {
         out.reply = reply;
         out.success = filled > 0;
         out
+    }
+
+    /// Summarise text that was READ from an app, with nothing else in the
+    /// prompt — no conversation, no memories — so nothing can be made up.
+    async fn summarize_only(&self, question: &str, read: &str) -> String {
+        let Some(llm) = &self.llm else { return bridge::utf8_cut(read, 300).to_string() };
+        if read.trim().is_empty() {
+            return "I couldn't read anything there.".into();
+        }
+        let req = Request {
+            messages: vec![
+                json!({"role": "system", "content": "You summarise text read from the user's screen for a voice reply. Use ONLY the text between the markers. If it holds no actual messages, say you couldn't see any messages. Never invent names or messages. Write numbers as digits."}),
+                json!({"role": "user", "content": format!("{}\n\n{question}", crate::governance::fence_untrusted(bridge::utf8_cut(read, 2200)))}),
+            ],
+            max_tokens: 90,
+            temperature: 0.0,
+        };
+        llm.complete(&req, Duration::from_secs(40)).await.ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "I read it, but couldn't summarise it just now.".into())
     }
 
     /// One short, non-streamed model answer (quiz options, a field's value).
@@ -1083,6 +1107,19 @@ impl Engine {
         }
         let screen_work = !lookup_only && crate::router::mentions_screen(text);
         let mut screen_seen_empty = false;
+        // email: the draft tools (nothing is ever sent without a spoken yes)
+        {
+            let ls = crate::utterance::simplify(text);
+            if !lookup_only && (["email", "gmail", "mail"].iter().any(|w| crate::utterance::has_word(&ls, w)) || text.contains('@')) {
+                for name in ["gmail_compose_draft", "draft_mail", "find_contact"] {
+                    if !tools.iter().any(|t| prompts::tool_name(t) == name) {
+                        if let Some(t) = self.all_tools.iter().find(|t| prompts::tool_name(t) == name) {
+                            tools.push(t.clone());
+                        }
+                    }
+                }
+            }
+        }
         if screen_work {
             // the model must SEE the ui_ tools' arguments, not just their names
             for name in ["ui_click", "ui_type", "ui_set_checked", "ui_select", "ui_scroll", "screen_observe"] {

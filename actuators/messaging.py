@@ -219,21 +219,52 @@ def _chat_overview(app: str) -> dict:
     from actuators.system_control import open_application
     open_application(app)
     time.sleep(1.2)                      # let the window draw its chat list
-    seen, lines = set(), []
-    for t in axui.texts(app):
-        t = " ".join(str(t).split())
-        if len(t) < 2 or t.lower() in _UI_WORDS or t in seen or len(t) > 160:
-            continue
-        seen.add(t)
-        lines.append(t)
-        if len(lines) >= 24:
-            break
-    if not lines:
-        return {"success": False, "message": f"[-] I opened {app} but couldn't read its chat list — is Accessibility on for DEMASCAS?"}
-    unread = [l for l in lines if "unread" in l.lower()]
+    rows = _chat_rows(app)
+    if not rows:                          # still drawing (live: 1st try failed, 2nd worked)
+        time.sleep(1.2)
+        rows = _chat_rows(app)
+    if not rows:
+        # live 18 Nov: only the sidebar ("Chats, 2", "Calls, 48") was readable —
+        # say so plainly instead of passing that off as messages
+        return {"success": False, "message": f"[-] I opened {app}, but I couldn't read the chat list itself — only its menus. "
+                                             f"Name someone (\"read my messages from Aman on {app}\") and I'll open that chat."}
+    unread = [r for r in rows if re.search(r"\bunread\b", r, re.I)]
     head = f"{len(unread)} chat{'s' if len(unread) != 1 else ''} with unread messages. " if unread else ""
-    return {"success": True, "app": app, "messages": lines,
-            "message": f"{head}Your recent {app} chats:\n" + "\n".join(lines[:12])}
+    return {"success": True, "app": app, "messages": rows, "overview": True,
+            "message": f"{head}Your recent {app} chats (newest first):\n" + "\n".join(rows[:10])}
+
+
+def _clean(t: str) -> str:
+    return " ".join(str(t).replace("\u200e", "").replace("\u200f", "").split())
+
+
+def _is_ui_label(t: str) -> bool:
+    """Sidebar / toolbar labels: "Chats, 2", "Calls, 48", "Archived, 6", "Search"…"""
+    base = re.sub(r",\s*\d+$", "", t).strip().lower()
+    return base in _UI_WORDS or len(base) < 2 or base.startswith(("your personal messages", "version "))
+
+
+def _chat_rows(app: str) -> list[str]:
+    """The chat list's rows ("Aman Sharma, Are you coming?, 10:42 PM, 2 unread"),
+    from the accessibility tree: rows / cells / buttons whose label carries a
+    name plus a message or a time — never the app's menus."""
+    from core import axui
+    time_or_day = re.compile(r"\b(\d{1,2}[:.]\d{2}\s*(am|pm)?|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}/\d{1,2}/\d{2,4}|unread)\b", re.I)
+    out, seen = [], set()
+    try:
+        items = axui.snapshot(app, roles=("AXCell", "AXRow", "AXButton", "AXGroup", "AXLink", "AXStaticText"), max_nodes=6000)
+    except Exception:
+        items = []
+    for it in items:
+        t = _clean(it.get("name", ""))
+        if len(t) < 8 or len(t) > 400 or t in seen or _is_ui_label(t):
+            continue
+        if t.count(",") >= 1 and time_or_day.search(t):
+            seen.add(t)
+            out.append(t[:220])
+        if len(out) >= 15:
+            break
+    return out
 
 
 def deliver_chat_message(app: str, contact: str, text: str) -> dict:
