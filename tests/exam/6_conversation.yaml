@@ -1,0 +1,45 @@
+# Follow-ups, side talk, memory, stopping — being a good companion in a conversation.
+- id: side-talk
+  turns:
+    - {say: "what's the capital of Japan", expect: {no_action: true, say_any: ['tokyo']}}
+    - {say: "yeah I told him that yesterday, he never listens", wake: false, expect: {no_action: true, silent: true}}
+- id: named-followup
+  turns:
+    - {say: "tell me a fun fact", expect: {no_action: true, speaks: true}}
+    - {say: "DEMASCAS, tell me another one", wake: false, expect: {no_action: true, speaks: true}}
+- id: close-it
+  turns:
+    - {say: "open Safari", expect: {tools: [open_application]}}
+    - {say: "close it", wake: false, expect: {any_tool: [quit_application, press_keyboard_shortcut]}}
+- id: weather-followup
+  turns:
+    - {say: "what's the weather in Delhi", expect: {tools: [get_weather]}}
+    - {say: "and in Mumbai?", wake: false, expect: {tools: [get_weather], args: {get_weather: 'mumbai'}}}
+- id: done-for-day
+  turns:
+    - {say: "open Discord", expect: {tools: [open_application]}}
+    - {say: "that's enough for the day, I want to stop now", wake: false, expect: {no_action: true, sleeps: true}}
+- {id: stop-dismiss, say: "stop", expect: {no_action: true, sleeps: true}}
+- {id: never-mind, say: "never mind", expect: {no_action: true, sleeps: true}}
+- id: remember-brother
+  cat: memory
+  turns:
+    - {say: "remember that my brother's name is Neon", expect: {any_tool: [save_memory, save_user_preference, set_preference], args: {save_memory: 'neon'}}}
+    - {say: "what's my brother's name", reset: true, expect: {no_action: true, say_any: ['neon']}}
+- id: remember-exam
+  cat: memory
+  turns:
+    - {say: "remember that my maths exam is on Friday", expect: {any_tool: [save_memory, save_user_preference, set_preference]}}
+    - {say: "when is my maths exam", reset: true, expect: {no_action: true, say_any: ['friday']}}
+- id: favourite-colour
+  cat: memory
+  turns:
+    - {say: "my favourite colour is blue", expect: {no_action: true}}
+    - {say: "what's my favourite colour", wake: false, expect: {no_action: true, say_any: ['blue']}}
+- id: last-request
+  cat: memory
+  turns:
+    - {say: "open Discord", expect: {tools: [open_application]}}
+    - {say: "what was the last thing I asked you to do", wake: false, expect: {no_action: true, say_any: ['discord']}}
+- {id: what-doing-idle, say: "what are you doing right now", expect: {no_action: true, speaks: true}}
+- {id: who-am-i, cat: memory, say: "what do you know about me", expect: {no_action: true, speaks: true}}

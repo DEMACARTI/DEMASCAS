@@ -1,0 +1,4 @@
+# The app session of 18 Nov late: app requests were refused as "not allowed"
+- {id: n18c-whatsapp-check, cat: apps-2, world: {running: [Finder, WhatsApp]}, say: "Check for WhatsApp messages.", expect: {tools: [read_chat_messages], args: {read_chat_messages: 'whatsapp'}, say_not: ['not allowed', 'cannot'], max_s: 1.5}}
+- {id: n18c-interact, cat: apps-2, say: "I want you to interact with WhatsApp application.", expect: {any_tool: [open_application, activate_application, read_chat_messages], say_not: ['not allowed', 'cannot directly interact']}}
+- {id: n18c-status-idle, cat: apps-2, say: "what are you doing right now?", expect: {no_action: true, say_any: ['free', 'nothing'], max_s: 1}}

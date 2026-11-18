@@ -97,8 +97,8 @@ def web_analyze_page() -> dict:
                 inp_summary = [f"    {i.get('tag','')}[{i.get('type','')}] name={i.get('name','')} placeholder={i.get('placeholder','')}"
                                for i in inputs_data[:10]]
                 parts.append("  Input fields:\n" + "\n".join(inp_summary))
-        except (json.JSONDecodeError, TypeError):
-            pass
+        except (json.JSONDecodeError, TypeError) as _e:  # was silent
+            __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     # Add memory context
     if url:

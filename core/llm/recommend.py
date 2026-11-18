@@ -127,7 +127,8 @@ def install_steps(model: catalog.CatalogModel, runtime: str, os_name: str) -> li
     if runtime == "mlx":
         return ["Install MLX: pip install mlx-lm",
                 f"Start the server (downloads the model the first time): "
-                f"python -m mlx_lm server --model {model.ids['mlx']} --port 8081"]
+                f"python -m mlx_lm server --model {model.ids['mlx']} --port 8081 "
+                "--chat-template-args '{\"enable_thinking\":false}'"]
     if runtime == "lmstudio":
         return ["Install LM Studio from https://lmstudio.ai",
                 f"In LM Studio, search for and download: {model.ids.get('gguf', model.label)} (Q4_K_M)",

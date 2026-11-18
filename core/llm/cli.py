@@ -4,7 +4,7 @@ Command-line setup for the plug-in LLM.
 
   python main.py setup            guided: profile → detect → recommend → benchmark → save
   python main.py setup --yes      accept the recommended INSTALLED model without prompts
-  python main.py setup --url http://127.0.0.1:11434 --model qwen2.5:3b   (explicit)
+  python main.py setup --url http://127.0.0.1:11434 --model gemma4:e2b   (explicit)
   python main.py doctor [--bench] status of hardware, model, runtime (+ speed test)
   python main.py detect           JSON list of detected runtimes/models
   python main.py llm-check        used by scripts/run.sh (exit codes below)
@@ -183,6 +183,29 @@ def _finish(cfg: settings.LLMConfig, p: hardware.HardwareProfile, args) -> int:
     return EXIT_OK
 
 
+def _print_memory() -> None:
+    """Swap in use + the biggest apps: on 8 GB, swap is what makes replies slow."""
+    import subprocess
+    try:
+        out = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=3).stdout
+        used = float(out.split("used = ")[1].split("M")[0]) / 1024
+        ps = subprocess.run(["ps", "-axo", "rss=,comm="], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return
+    apps: dict[str, float] = {}
+    for line in ps.splitlines():
+        rss, _, path = line.strip().partition(" ")
+        if not rss.isdigit():
+            continue
+        name = path[:path.find(".app/")].rsplit("/", 1)[-1] if ".app/" in path else path.rsplit("/", 1)[-1]
+        if path.startswith(("/System/", "/usr/libexec", "/usr/sbin")) or name in ("python", "python3", "demascasd", "WindowServer"):
+            continue
+        apps[name] = apps.get(name, 0) + int(rss) / 1024 / 1024
+    top = ", ".join(f"{n} ({g:.1f} GB)" for n, g in sorted(apps.items(), key=lambda x: -x[1])[:3])
+    hint = " ⚠ high — replies will be slow; close an app below" if used > 2 else ""
+    print(f"Memory   : swap {used:.1f} GB{hint}\n           biggest apps: {top}")
+
+
 def cmd_doctor(args) -> int:
     p = hardware.profile()
     cfg = settings.load()
@@ -213,6 +236,11 @@ def cmd_doctor(args) -> int:
         pass
     if up and args.bench:
         print("Speed    : " + benchmark.run(cfg).summary())
+    _print_memory()
+    if getattr(args, "permissions", False):
+        from core import permissions
+        print("Permissions (for the app that runs this — start DEMASCAS from the same one):")
+        print(permissions.report())
     return EXIT_OK if up else EXIT_UNREACHABLE
 
 
@@ -223,7 +251,9 @@ def cmd_detect(args) -> int:
 
 
 def cmd_llm_check(args) -> int:
-    """For scripts/run.sh.  Prints `<model>\\n<port>` when MLX must be started."""
+    """For scripts/run.sh.  When MLX must be started, prints four lines:
+    model, port, LoRA adapter (or empty), server kind ("lm" = mlx_lm text-only,
+    "vlm" = mlx_vlm serving text AND vision from one copy of the weights)."""
     cfg = settings.load()
     if not cfg.configured:
         return EXIT_NOT_CONFIGURED
@@ -231,10 +261,23 @@ def cmd_llm_check(args) -> int:
         return EXIT_OK
     if cfg.runtime == "mlx" and cfg.autostart:
         from urllib.parse import urlparse
+        ad = cfg.adapter_path
+        ad = ad if ad and os.path.exists(os.path.join(ad, "adapters.safetensors")) else ""
+        kind = "lm"
+        if cfg.shared_vision:
+            if ad:
+                # Adapters are trained with mlx_lm; untested under mlx_vlm.
+                print("[!] A learned adapter is active — serving text only (no vision).",
+                      file=sys.stderr)
+            elif importlib.util.find_spec("mlx_vlm") is None:
+                print("[!] Vision needs mlx-vlm (pip install mlx-vlm) — serving text only.",
+                      file=sys.stderr)
+            else:
+                kind = "vlm"
         print(cfg.model)
         print(urlparse(cfg.chat_url).port or 8081)
-        ad = cfg.adapter_path        # 3rd line: learned LoRA adapter (or empty)
-        print(ad if ad and os.path.exists(os.path.join(ad, "adapters.safetensors")) else "")
+        print(ad)
+        print(kind)
         return EXIT_MLX_AUTOSTART
     return EXIT_UNREACHABLE
 
@@ -315,6 +358,7 @@ def main(argv: list[str]) -> int:
     s.add_argument("--model", help="model id at that runtime (explicit setup)")
     d = sub.add_parser("doctor", help="show hardware, model and runtime status")
     d.add_argument("--bench", action="store_true", help="also measure model speed")
+    d.add_argument("--permissions", action="store_true", help="also check macOS permissions (prompts nothing)")
     sub.add_parser("detect", help="list detected runtimes as JSON")
     sub.add_parser("llm-check", help="(internal) used by scripts/run.sh")
     sub.add_parser("learn", help="fine-tune the model on what DEMASCAS learned, now")

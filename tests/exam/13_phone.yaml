@@ -1,0 +1,42 @@
+# Calls and contacts (live session 18 Nov 12:33: "call … V-I-J-V-A-L" timed out,
+# "list the contacts I have called" said "no access").  A call reaches a
+# person: it is ALWAYS read back and placed only on a spoken yes.
+# Contacts come from the fake book in server/exam_mode.py.
+
+- id: call-asks-first
+  cat: phone
+  turns:
+    - {say: "call Vijval", expect: {asks: true, say_any: ['vijval sharma'], forbid: [call_contact], max_s: 1.5}}
+    - {say: "yes", wake: false, expect: {confirmed: [call_contact], args: {call_contact: '9876543210'}}}
+
+- id: call-spelled-name
+  cat: phone
+  say: "now call the person whose name is spread by V-I-J-V-A-L."
+  expect: {asks: true, say_any: ['vijval sharma'], forbid: [call_contact], max_s: 1.5}
+
+- id: call-misheard-name
+  cat: phone
+  say: "call vijwal on the phone"
+  expect: {asks: true, say_any: ['vijval sharma'], forbid: [call_contact]}
+
+- id: call-garbled-asks-who
+  cat: phone
+  turns:
+    - {say: "call which will from phone.", expect: {asks: true, say_any: ['who should i call'], forbid: [call_contact], max_s: 1.5}}
+    - {say: "Vijval", wake: false, expect: {asks: true, say_any: ['vijval sharma'], forbid: [call_contact]}}
+
+- id: call-no-means-no
+  cat: phone
+  turns:
+    - {say: "call mom", expect: {asks: true, forbid: [call_contact]}}
+    - {say: "no", wake: false, expect: {forbid: [call_contact]}}
+
+- id: facetime-asks
+  cat: phone
+  say: "FaceTime Aman"
+  expect: {asks: true, say_any: ['facetime'], forbid: [call_contact]}
+
+- {id: recent-calls-live, cat: phone, say: "can you list the first five contacts I have called?", expect: {tools: [recent_calls], no_action: true, say_any: ['vijval'], max_s: 1.5}}
+- {id: who-called, cat: phone, say: "who called me", expect: {tools: [recent_calls], no_action: true, say_any: ['vijval'], max_s: 1.5}}
+- {id: missed-calls, cat: phone, say: "any missed calls?", expect: {tools: [recent_calls], args: {recent_calls: '"missed_only": true'}, no_action: true}}
+- {id: permissions, cat: phone, say: "what can't you access?", expect: {tools: [check_permissions], no_action: true}}

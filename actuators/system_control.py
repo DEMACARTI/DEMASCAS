@@ -179,10 +179,27 @@ def _build_key_command(keys: str) -> str:
     return f'keystroke "{safe_char}"'
 
 
+_MODIFIER_WORDS = {"command", "cmd", "shift", "option", "alt", "control", "ctrl"}
+
+
+def _canon_combo(combo: str) -> str:
+    """'command q' / 'cmd-shift-t' → 'command+q' / 'cmd+shift+t'.
+    Models sometimes separate keys with spaces or hyphens; joined only when
+    every word before the last is a modifier ('page down' stays as is)."""
+    if "+" in combo:
+        return combo
+    words = [w for w in re.split(r"[\s-]+", combo) if w]
+    if len(words) > 1 and all(w.lower() in _MODIFIER_WORDS for w in words[:-1]):
+        return "+".join(words)
+    return combo
+
+
 def _split_key_sequence(keys: str) -> list[str]:
-    """'command+shift+4, space' → ['command+shift+4', 'space']."""
+    """'command+shift+4, space' → ['command+shift+4', 'space'].
+    The safety check (is_risky_shortcut) and the key presser both read keys
+    through here, so they always agree on what will be pressed."""
     parts = re.split(r"\s*(?:,|\bthen\b)\s*", keys or "")
-    return [p for p in (x.strip() for x in parts) if p]
+    return [_canon_combo(p) for p in (x.strip() for x in parts) if p]
 
 
 def click_ui_element(element_name: str) -> str:
@@ -378,8 +395,8 @@ def type_text(text: str, app_name: str = "", press_enter: bool = False,
         try:
             key_cmd = _build_key_command(focus_shortcut)
             lines.append(f'  {key_cmd}')
-        except ValueError:
-            pass
+        except ValueError as _e:  # was silent
+            __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
         lines.append('  delay 0.2')
 
     # Type the text (line by line; Shift+Return between lines)
@@ -507,8 +524,8 @@ def open_application(app_name: str) -> str:
             if conf < 1.0:
                 from core.vocabulary import add_correction
                 add_correction(heard, resolved)
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
     safe_name = _sanitize_for_applescript(app_name)
     print(f"[*] DEMASCAS is opening: '{safe_name}'...")
 
@@ -666,6 +683,12 @@ def _norm_combo(combo: str) -> str:
 _RISKY_NORM = {_norm_combo(r) for r in _RISKY_SHORTCUTS}
 
 
+def canonical_keys(keys: str) -> str:
+    """'command enter, cmd q' → 'command+enter,cmd+q' — the form safety
+    checks should match against."""
+    return ",".join(_split_key_sequence(keys or ""))
+
+
 def is_risky_shortcut(keys: str) -> bool:
     return any(_norm_combo(c) in _RISKY_NORM for c in _split_key_sequence(keys or ""))
 
@@ -788,6 +811,17 @@ def list_running_applications() -> str:
         A comma-separated list of application names, or a failure message.
     """
     print("[*] DEMASCAS is listing running applications...")
+    # The Mac's own list (no AppleScript, no Automation permission, ~1 ms) —
+    # the System Events route failed with no permission in the app (18 Nov)
+    try:
+        from AppKit import NSWorkspace
+        names = [str(a.localizedName()) for a in NSWorkspace.sharedWorkspace().runningApplications()
+                 if a.activationPolicy() == 0 and a.localizedName()]
+        names = [n for n in dict.fromkeys(names) if n not in ("DEMASCAS",)]
+        if names:
+            return f"You have {len(names)} apps open: {', '.join(names)}."
+    except Exception:
+        pass
 
     applescript_code = """
     tell application "System Events"
@@ -1074,8 +1108,8 @@ def wait_for_element(element_name: str, timeout: int = 10) -> str:
             )
             if "true" in result.stdout.strip().lower():
                 return f"Success: Element '{safe_name}' found."
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-            pass
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as _e:  # was silent
+            __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
         time.sleep(0.5)
 
     return f"[-] Timeout: Element '{safe_name}' not found after {timeout}s."
@@ -1133,8 +1167,8 @@ def wait_for_app_ready(app_name: str, timeout: int = 10) -> str:
             # (Finder used to "time out" after 10 s).
             if status == "no_window" and safe_name.lower() in _WINDOWLESS_OK:
                 return f"Success: '{safe_name}' is running (no window open)."
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-            pass
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as _e:  # was silent
+            __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
         time.sleep(0.5)
 
     if last_status == "no_window":
@@ -1462,8 +1496,8 @@ def scroll_to_element(element_name: str, max_scrolls: int = 10) -> str:
             )
             if "true" in result.stdout.strip().lower():
                 return f"Success: Found '{safe_name}' after {i} scrolls."
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-            pass
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as _e:  # was silent
+            __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
         # Scroll down
         scroll_direction("down", clicks=3)

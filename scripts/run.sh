@@ -4,11 +4,12 @@
 #
 # Starts the DEMASCAS stack:
 #   1. Your plugged-in local LLM (checked; MLX is started if configured to)
-#   2. MLX vision server      (localhost:8082)  — optional, manual
+#   2. Vision: shared with the LLM when it is the same model (Gemma 4 via
+#      mlx-vlm on the LLM port); else the old MLX vision server (8082) — manual
 #   3. Python tool micro-service  (localhost:5001)
-#   4. C++ bare-metal daemon      (audio → whisper.cpp → LLM → TTS)
+#   4. The Rust daemon, core-rs   (ears → whisper → brain → voice)
 #
-# The C++ daemon runs in the foreground; Ctrl-C stops all processes.
+# The daemon runs in the foreground; Ctrl-C stops all processes.
 #
 # Usage:
 #   chmod +x scripts/run.sh
@@ -20,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-DAEMON_BIN="daemon/build/demascas_daemon"
+DAEMON_BIN="core-rs/target/release/demascasd"
 TOOL_SERVER="server/tool_server.py"
 VLM_SERVER="scripts/start_vlm_server.py"
 VENV_DIR="$(cd "$PROJECT_ROOT/.." && pwd)/venv"
@@ -48,7 +49,7 @@ trap cleanup EXIT INT TERM
 # ── Preflight checks ────────────────────────────────────────────────
 
 if [ ! -f "$DAEMON_BIN" ]; then
-    echo "❌  Daemon not built.  Run first:"
+    echo "❌  The Rust daemon isn't built.  Run first:"
     echo "    ./scripts/build.sh"
     exit 1
 fi
@@ -115,6 +116,7 @@ case "$LLM_STATUS" in
         MLX_MODEL="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 1p)"
         MLX_PORT="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 2p)"
         MLX_ADAPTER="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 3p)"
+        MLX_KIND="$(printf '%s\n' "$LLM_CHECK_OUT" | sed -n 4p)"
         if lsof -nP -iTCP:"${MLX_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
             echo "❌  Port ${MLX_PORT} is in use by something that isn't answering as an LLM."
             exit 1
@@ -125,14 +127,36 @@ case "$LLM_STATUS" in
             echo "[*] Using learned adapter: ${MLX_ADAPTER}"
             MLX_EXTRA=(--adapter-path "$MLX_ADAPTER")
         fi
-        echo "[*] Starting MLX server: ${MLX_MODEL} on port ${MLX_PORT}..."
-        python -m mlx_lm server --model "$MLX_MODEL" --port "$MLX_PORT" ${MLX_EXTRA[@]+"${MLX_EXTRA[@]}"} &
+        if [ "$MLX_KIND" = "vlm" ]; then
+            # One mlx-vlm server answers text AND screenshots from one copy of
+            # the weights (a second vision model would not fit in 8 GB).
+            # Local only (--host 127.0.0.1; mlx-vlm defaults to 0.0.0.0).
+            # Thinking is off by default in mlx-vlm.  Prefix cache in RAM only,
+            # capped at 0.5 GB with no fixed reserve: the automatic budget
+            # refuses every request on an 8 GB Mac, and the disk tier would
+            # write up to 20 GB.  One request at a time (DEMASCAS is serial).
+            echo "[*] Starting MLX vision+text server: ${MLX_MODEL} on port ${MLX_PORT}..."
+            APC_ENABLED=1 APC_DISK_ENABLED=0 APC_MEMORY_MAX_GB=0.5 APC_MEMORY_RESERVE_GB=0 \
+            MLX_VLM_MAX_NUM_SEQS=1 \
+            python -m mlx_vlm.server --model "$MLX_MODEL" --host 127.0.0.1 --port "$MLX_PORT" &
+            MLX_READY_URL="http://127.0.0.1:${MLX_PORT}/health"
+            MLX_READY_PATTERN='"model_ready":true'
+        else
+            echo "[*] Starting MLX server: ${MLX_MODEL} on port ${MLX_PORT}..."
+            # Thinking off: mlx-lm turns it ON by default for models that support it
+            # (e.g. Gemma 4), which hides the answer behind seconds of reasoning.
+            python -m mlx_lm server --model "$MLX_MODEL" --port "$MLX_PORT" \
+                --chat-template-args '{"enable_thinking":false}' ${MLX_EXTRA[@]+"${MLX_EXTRA[@]}"} &
+            MLX_READY_URL="http://127.0.0.1:${MLX_PORT}/v1/models"
+            MLX_READY_PATTERN=''
+        fi
         TEXT_PID=$!
         PIDS+=($TEXT_PID)
         # First run downloads the model — wait up to MLX_STARTUP_TIMEOUT s.
+        # (mlx-vlm answers HTTP before its model is loaded — wait for /health.)
         MLX_STARTUP_TIMEOUT="${MLX_STARTUP_TIMEOUT:-300}"
         for i in $(seq 1 "$MLX_STARTUP_TIMEOUT"); do
-            if curl -s "http://127.0.0.1:${MLX_PORT}/v1/models" > /dev/null 2>&1; then
+            if curl -s "$MLX_READY_URL" 2>/dev/null | grep -q -- "$MLX_READY_PATTERN"; then
                 echo "[✓] MLX server ready."
                 break
             fi
@@ -221,14 +245,15 @@ else
     done
 fi
 
-# ── 4. Start C++ daemon in foreground ───────────────────────────────
+# ── 4. Start the daemon in foreground ──────────────────────────────
 
-echo "[*] Starting C++ daemon..."
 echo ""
-cd daemon
-
-# sherpa-onnx shared libraries
-export DYLD_LIBRARY_PATH="${PWD}/models/sherpa-onnx/lib:${DYLD_LIBRARY_PATH:-}"   # macOS
-export LD_LIBRARY_PATH="${PWD}/models/sherpa-onnx/lib:${LD_LIBRARY_PATH:-}"       # Linux
-
-./build/demascas_daemon
+echo "════════════════════════════════════════"
+echo "  DEMASCAS — Rust daemon"
+echo "════════════════════════════════════════"
+echo ""
+export DEMASCAS_MODELS="${PROJECT_ROOT}/models"
+# sherpa-onnx shared libraries (the binary also carries an rpath to them)
+export DYLD_LIBRARY_PATH="${PROJECT_ROOT}/models/sherpa-onnx/lib:${DYLD_LIBRARY_PATH:-}"   # macOS
+export LD_LIBRARY_PATH="${PROJECT_ROOT}/models/sherpa-onnx/lib:${LD_LIBRARY_PATH:-}"       # Linux
+"$PROJECT_ROOT/$DAEMON_BIN"

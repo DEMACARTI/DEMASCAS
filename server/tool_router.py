@@ -42,6 +42,8 @@ def should_exclude_open_url(query: str) -> bool:
 
 TOOL_CATEGORIES = {
     "ui_interaction": [
+        # element-based (numbered from screen_observe; risky elements are asked about)
+        "screen_observe", "ui_click", "ui_type", "ui_set_checked", "ui_select", "ui_scroll",
         "click_ui_element", "type_text", "type_text_into_element",
         "scroll_direction", "drag_element", "find_and_click",
         "right_click_element", "scroll_to_element",
@@ -61,6 +63,7 @@ TOOL_CATEGORIES = {
         "forget_web", "search_web",
     ],
     "browser": [
+        "screen_observe", "ui_click", "ui_type", "ui_set_checked", "ui_select", "ui_scroll", "form_read",
         "open_url", "open_url_and_wait",
         "browser_navigate", "browser_navigate_and_wait",
         "browser_get_url", "browser_get_title", "browser_get_dom_summary", "browser_get_page_text",
@@ -99,10 +102,16 @@ TOOL_CATEGORIES = {
         "summarize_latest_pdf", "summarize_selected_pdf", "find_file", "open_file",
     ],
     "screen_reading": [
+        "describe_screen", "screen_observe", "screen_find", "form_read", "read_screen_text",
         "get_active_window_tree", "list_open_windows",
     ],
+    # no vision model is loaded (text-only Gemma, 18 Nov): pictures are read
+    # with Apple's on-device Vision instead
     "vision": [
-        "vision_execute",
+        "describe_screen", "look_at_image", "screen_observe", "find_image_by_content",
+    ],
+    "forms": [
+        "form_read", "screen_observe", "ui_type", "ui_set_checked", "ui_select", "ui_click", "ui_scroll",
     ],
     "keyboard": [
         "press_keyboard_shortcut",
@@ -134,6 +143,25 @@ TOOL_CATEGORIES = {
 # Each keyword maps to one or more categories to include.
 
 INTENT_KEYWORDS = {
+    # forms, quizzes, assignments — fill in on screen (submit only on a yes)
+    "tick":        ["forms"],
+    "untick":      ["forms"],
+    "checkbox":    ["forms"],
+    "check box":   ["forms"],
+    "form":        ["forms"],
+    "field":       ["forms"],
+    "fill":        ["forms"],
+    "quiz":        ["forms"],
+    "assignment":  ["forms"],
+    "dropdown":    ["forms"],
+    "radio":       ["forms"],
+    "on screen":   ["screen_reading"],
+    "on my screen": ["screen_reading"],
+    "this page":   ["screen_reading", "browser"],
+    "image":       ["vision"],
+    "picture":     ["vision"],
+    "photo":       ["vision"],
+    "qr":          ["vision"],
     # UI interaction
     "click":       ["ui_interaction", "screen_reading"],
     "tap":         ["ui_interaction", "screen_reading"],

@@ -41,8 +41,16 @@ CATALOG: list[CatalogModel] = [
              "mlx": "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
              "gguf": "Qwen/Qwen2.5-1.5B-Instruct-GGUF"}),
     CatalogModel(
+        # params_b = effective (compute) size; the per-layer embedding
+        # tables bring the total to ~5B but cost memory, not compute.
+        "gemma4-e2b", "Gemma 4 E2B Instruct", 2.3, 3.2,
+        notes="DEMASCAS default for 8 GB laptops (thinking stays off).",
+        ids={"ollama": "gemma4:e2b",
+             "mlx": "mlx-community/gemma-4-e2b-it-4bit",
+             "gguf": "ggml-org/gemma-4-E2B-it-GGUF"}),
+    CatalogModel(
         "qwen2.5-3b", "Qwen2.5 3B Instruct", 3.0, 2.3,
-        notes="Best speed/quality balance for 8 GB laptops; reliable JSON.",
+        notes="Previous DEMASCAS default; reliable JSON.",
         ids={"ollama": "qwen2.5:3b",
              "mlx": "mlx-community/Qwen2.5-3B-Instruct-4bit",
              "gguf": "Qwen/Qwen2.5-3B-Instruct-GGUF"}),

@@ -72,8 +72,8 @@ def _grounding(topic: str, max_chars: int = 1500) -> str:
         notes = store.context_block(topic, max_chars=max_chars, k=4)
         if notes:
             return notes
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
     try:   # fallback: search-result snippets
         from actuators.network import search_web
         res = search_web(topic, max_results=5)
@@ -113,8 +113,8 @@ def _remember(kind: str, path: str) -> None:
         state[f"last_{kind}"] = path
         with open(_STATE_PATH, "w") as f:
             json.dump(state, f, indent=2)
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
 
 def _last(kind: str) -> str:

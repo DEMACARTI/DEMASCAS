@@ -360,6 +360,31 @@ from core.config import MLX_VL_BASE as _VLM_BASE, MLX_VL_MODEL as _VLM_MODEL, VL
 
 _vlm_state = {"ok": None, "checked": 0.0}
 
+# Gemma-family vision models point with boxes normalized to 0-1000
+# ({"box_2d": [ymin, xmin, ymax, xmax]}), which map straight onto screen points
+# whatever the screenshot size.  Qwen2.5-VL answers in screenshot pixels.
+_NORMALIZED_BOXES = "gemma" in (_VLM_MODEL or "").lower()
+VLM_MAX_WIDTH = 1280      # Gemma resizes internally; a 3360 px Retina PNG only adds payload
+
+
+def _shrink_for_vlm(b64_png: str) -> tuple[str, str]:
+    """Downscale a screenshot to VLM_MAX_WIDTH as JPEG → (base64, mime).
+    Only used with normalized-box models (pixel-coordinate models need the
+    original scale).  Falls back to the original on any error."""
+    import base64
+    import io
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(base64.b64decode(b64_png)))
+        if img.width > VLM_MAX_WIDTH:
+            img = img.resize((VLM_MAX_WIDTH, round(img.height * VLM_MAX_WIDTH / img.width)),
+                             Image.BILINEAR)
+        out = io.BytesIO()
+        img.convert("RGB").save(out, "JPEG", quality=85)
+        return base64.b64encode(out.getvalue()).decode(), "jpeg"
+    except Exception:
+        return b64_png, "png"
+
 
 def vlm_available(ttl_up: float = 60.0, ttl_down: float = 10.0) -> bool:
     """Cheap, cached check that the VLM server is listening.
@@ -449,6 +474,10 @@ def vision_query(prompt: str, screenshot_b64: str | None = None) -> str:
         if screenshot_b64.startswith("[-]"):
             return screenshot_b64  # propagate error
 
+    mime = "png"
+    if _NORMALIZED_BOXES:
+        screenshot_b64, mime = _shrink_for_vlm(screenshot_b64)
+
     messages = [
         {
             "role": "user",
@@ -456,7 +485,7 @@ def vision_query(prompt: str, screenshot_b64: str | None = None) -> str:
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{screenshot_b64}"
+                        "url": f"data:image/{mime};base64,{screenshot_b64}"
                     }
                 },
                 {
@@ -514,15 +543,27 @@ def vision_execute(action: str) -> str:
         return screenshot_b64
 
     # Ask VLM to locate the element and return coordinates
-    vlm_prompt = (
-        f"Look at this screenshot and help me: {action}\n\n"
-        "Respond with ONLY a JSON object in one of these formats:\n"
-        '{"action":"click","x":123,"y":456}\n'
-        '{"action":"type","x":123,"y":456,"text":"hello"}\n'
-        '{"action":"scroll","direction":"down","amount":3}\n'
-        '{"action":"not_found","reason":"element not visible"}\n'
-        "Output ONLY the JSON, nothing else."
-    )
+    if _NORMALIZED_BOXES:
+        vlm_prompt = (
+            f"Look at this screenshot and help me: {action}\n\n"
+            "Respond with ONLY a JSON object in one of these formats, where box_2d is the "
+            "element's box [ymin, xmin, ymax, xmax] normalized to 0-1000:\n"
+            '{"action":"click","box_2d":[ymin,xmin,ymax,xmax]}\n'
+            '{"action":"type","box_2d":[ymin,xmin,ymax,xmax],"text":"hello"}\n'
+            '{"action":"scroll","direction":"down","amount":3}\n'
+            '{"action":"not_found","reason":"element not visible"}\n'
+            "Output ONLY the JSON, nothing else."
+        )
+    else:
+        vlm_prompt = (
+            f"Look at this screenshot and help me: {action}\n\n"
+            "Respond with ONLY a JSON object in one of these formats:\n"
+            '{"action":"click","x":123,"y":456}\n'
+            '{"action":"type","x":123,"y":456,"text":"hello"}\n'
+            '{"action":"scroll","direction":"down","amount":3}\n'
+            '{"action":"not_found","reason":"element not visible"}\n'
+            "Output ONLY the JSON, nothing else."
+        )
 
     vlm_response = vision_query(vlm_prompt, screenshot_b64)
     if vlm_response.startswith("[-]"):
@@ -556,6 +597,14 @@ def vision_execute(action: str) -> str:
             x = max(0, min(x, screen_w - 1))
             y = max(0, min(y, screen_h - 1))
             return x, y
+
+        if isinstance(result.get("box_2d"), list) and len(result["box_2d"]) == 4:
+            # Normalized box → centre in logical points; feed it through as
+            # "pixels" that _correct_coords maps back to the same points.
+            ymin, xmin, ymax, xmax = (float(v) for v in result["box_2d"])
+            k = SCREENSHOT_SCALE * RETINA_FACTOR
+            result["x"] = (xmin + xmax) / 2 / 1000 * screen_w * k
+            result["y"] = (ymin + ymax) / 2 / 1000 * screen_h * k
 
         if act == "click":
             raw_x, raw_y = result["x"], result["y"]

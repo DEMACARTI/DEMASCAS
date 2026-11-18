@@ -14,7 +14,7 @@ Example config:
   "llm": {
     "runtime": "ollama",
     "chat_url": "http://127.0.0.1:11434/v1/chat/completions",
-    "model": "qwen2.5:3b",
+    "model": "gemma4:e2b",
     "context_tokens": 4096,
     "keep_loaded_minutes": 15,
     "autostart": false,
@@ -58,6 +58,14 @@ class LLMConfig:
     @property
     def configured(self) -> bool:
         return bool(self.chat_url and self.model)
+
+    @property
+    def shared_vision(self) -> bool:
+        """Vision is the SAME model behind the same server as text (e.g. Gemma 4
+        via mlx-vlm): one copy of the weights answers both, instead of a second
+        vision model competing for RAM."""
+        return bool(self.configured and self.vision.model == self.model
+                    and self.vision.chat_url == self.chat_url)
 
     @property
     def base_url(self) -> str:

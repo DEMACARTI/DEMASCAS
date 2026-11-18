@@ -114,7 +114,7 @@ from actuators.web_agent import (
     web_ecommerce_search,
 )
 from core.screen_context import get_screen_context_block, get_screen_digest
-from actuators.system_control import is_risky_shortcut
+from actuators.system_control import is_risky_shortcut, canonical_keys
 from actuators.app_script import (
     run_app_script, is_destructive as _script_is_destructive, click_menu_item, is_risky_menu,
 )
@@ -336,8 +336,8 @@ def _serialize_result(obj) -> str:
     if isinstance(obj, (dict, list)):
         try:
             return json.dumps(obj, ensure_ascii=False, default=str)
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
     return str(obj)
 
 
@@ -375,8 +375,12 @@ def _parse_result(obj):
 # daemon asks the user.  Only POST /confirm with that token executes it,
 # so a model can't "confirm" on its own by passing extra arguments.
 
-CONFIRM_REQUIRED_TOOLS = frozenset({"delete_file", "deliver_chat_message"})
+# type_and_submit presses Enter/Send wherever it is (a browser Gmail tab sent an
+# email in testing) — it ALWAYS needs a spoken yes.
+# call_contact rings a real person — always asked, never pre-approved.
+CONFIRM_REQUIRED_TOOLS = frozenset({"delete_file", "deliver_chat_message", "add_event", "type_and_submit", "call_contact"})
 _CONFIRM_TTL_SEC = 120
+_LAST_VERIFIED: dict[int, object] = {}   # thread → verification of its last tool call
 _PENDING: dict[str, dict] = {}
 _PENDING_LOCK = threading.Lock()
 
@@ -394,16 +398,201 @@ def _create_pending(tool: str, args: dict, speech: str) -> dict:
         "pending_tool": tool,
         "pending_args": dict(args or {}),
         "confirm_token": token,
+        # a "first time on this site" OK: after the yes, the task carries on
+        "resume": bool((args or {}).get("_trust")),
         "message": "Waiting for the user to confirm. Do not call this tool again.",
     }
 
 
+# Older tools that click by a text label — the same words make them ask.
+_LABEL_CLICKS = {"find_and_click", "click_ui_element", "browser_click_text", "web_smart_click", "browser_click",
+                 "browser_click_xpath", "browser_submit_form", "browser_fill_form", "type_text_into_element"}
+
+
+def _label_is_risky(args: dict) -> bool:
+    from core.screen import risk as _risk
+    label = " ".join(str(args.get(k, "")) for k in ("search_text", "element_name", "text", "element_description",
+                                                   "selector", "xpath", "field_values"))
+    if any(p.search(label) for p in (_risk.MONEY, _risk.DESTRUCTIVE, _risk.SECURITY, _risk.OUTWARD)):
+        return True
+    try:
+        from actuators.browser import browser_get_url
+        url = str(browser_get_url().get("message", "")).lower()
+        return bool(url) and any(p in url for p in _risk._protected())
+    except Exception:
+        return False
+
+
+_REDIRECT_CLICKS = {"find_and_click", "click_ui_element", "browser_click_text", "web_smart_click", "type_text_into_element"}
+
+
+def _normalize_ui_args(name: str, args: dict) -> dict:
+    """Small models guess argument names ({"number": 2}, {"element_name": "2"},
+    {"value": true}) — map them onto the real ones instead of failing."""
+    a = dict(args or {})
+    v = a.get("element_id")
+    if isinstance(v, str) and v.strip(" []#").isdigit():          # "[2]" / "2" / "#2"
+        a["element_id"] = int(v.strip(" []#"))
+    if a.get("element_id") in (None, ""):
+        for k in ("id", "number", "element", "index", "element_number", "element_name", "target"):
+            v = a.get(k)
+            if v is not None and str(v).strip().lstrip("[").rstrip("]").isdigit():
+                a["element_id"] = int(str(v).strip().lstrip("[").rstrip("]"))
+                break
+        else:
+            label = a.get("element_name") or a.get("label") or a.get("name") or a.get("target")
+            if label:
+                from core import screen as _screen
+                hits = _screen.find(str(label), _screen.last() or None)
+                if hits:
+                    a["element_id"] = hits[0]["id"]
+    if name == "ui_set_checked" and "checked" not in a:
+        for k in ("value", "state", "check", "on"):
+            if k in a:
+                a["checked"] = a[k]
+                break
+    if name == "ui_type" and "text" not in a:
+        for k in ("text_input", "value", "content", "input"):
+            if k in a:
+                a["text"] = a[k]
+                break
+    if name == "ui_select" and "option" not in a:
+        for k in ("value", "choice", "text"):
+            if k in a:
+                a["option"] = a[k]
+                break
+    return a
+
+
+def _front_app_fast() -> str:
+    """The frontmost app's name (NSWorkspace: microseconds, no AppleScript)."""
+    if _exam.ENABLED:
+        from core import axui
+        return axui.frontmost_app()
+    try:
+        from AppKit import NSWorkspace
+        return str(NSWorkspace.sharedWorkspace().frontmostApplication().localizedName() or "")
+    except Exception:
+        return ""
+
+
+def _click_by_label(name: str, args: dict):
+    """find_and_click("Next") on a web page → the numbered element named
+    "Next" → ui_click through the per-element gate.  Native apps keep the
+    old path (menus, Discord flows) but no-go places are still refused.
+    None = carry on with the original tool."""
+    from core import screen as _screen
+    from core.screen import risk as _risk
+    label = str(args.get("search_text") or args.get("element_name") or
+                (args.get("text") if name != "type_text_into_element" else "") or args.get("element_description") or "").strip()
+    if not label:
+        return None
+    obs = _screen.observe(str(args.get("app_name") or ""))
+    if not obs.get("success"):
+        return None
+    ctx = {k: obs.get(k, "") for k in ("app", "url", "title", "window", "dialog")}
+    why = _risk.blocked_reason(ctx)
+    if why:
+        r = {"success": False, "blocked": True, "message": "[-] " + why}
+        return _serialize_result(r), True, r
+    if obs.get("source") != "dom":
+        return None
+    # a bare number is the element's number from the list, not a label
+    num = label.strip("[] ")
+    hit = next((e for e in obs.get("elements", []) if num.isdigit() and e.get("id") == int(num)), None)
+    if hit is None:
+        hits = _screen.find(label, obs)
+        if not hits:
+            return None
+        hit = hits[0]
+    if name == "type_text_into_element":
+        text = str(args.get("text_input") or args.get("text") or "")
+        print(f"[SCREEN] {name}({label!r}) → ui_type [{hit['id']}] \"{hit.get('name')}\"")
+        return _dispatch_native("ui_type", {"element_id": hit["id"], "text": text}, confirmed=False)
+    print(f"[SCREEN] {name}({label!r}) → ui_click [{hit['id']}] \"{hit.get('name')}\"")
+    return _dispatch_native("ui_click", {"element_id": hit["id"]}, confirmed=False)
+
+
+_UI_ACTIONS = {"ui_click": "click", "ui_type": "type", "ui_set_checked": "check", "ui_select": "select"}
+
+
+def _ui_gate(name: str, args: dict, confirmed: bool):
+    """Classify the element about to be acted on (core/screen/risk.py).
+    Returns a finished result to send back (blocked / screen changed), or
+    None and marks args["_ask"] with the question when the user must say yes."""
+    from core import screen as _screen
+    from core.screen import risk as _risk
+    obs = _screen.last()
+    try:
+        eid = int(args.get("element_id"))
+    except (TypeError, ValueError):
+        # fail closed: no clear element → no action
+        r = {"success": False, "message": "[-] Give the element's number from the screen list, like 13."}
+        return _serialize_result(r), True, r
+    el = next((e for e in obs.get("elements", []) if e.get("id") == eid), None)
+    if el is None:
+        r = {"success": False, "message": f"[-] There's no [{eid}] on the screen I last saw — call screen_observe again."}
+        return _serialize_result(r), True, r
+    ctx = {k: obs.get(k, "") for k in ("app", "url", "title", "window", "dialog")}
+    if confirmed:
+        # the yes was for a specific element — make sure [id] still is that one
+        if args.get("_label") is not None and el.get("name") != args.get("_label"):
+            r = {"success": False, "message": "[-] The screen changed after you said yes — I'll look again before doing anything."}
+            return _serialize_result(r), True, r
+        if args.get("_trust"):
+            _risk.trust(args["_trust"])
+        return None
+    v = _risk.classify(ctx, el, _UI_ACTIONS[name])
+    if v["tier"] == "blocked":
+        r = {"success": False, "blocked": True, "message": "[-] " + v["why"]}
+        return _serialize_result(r), True, r
+    if v["tier"] == "local":
+        return None
+    place = _risk.place_of(ctx)
+    label = el.get("name", "")
+    if name == "ui_type":
+        what = f"type \"{str(args.get('text', ''))[:60]}\" into \"{label}\""
+    elif name == "ui_set_checked":
+        what = f"{'tick' if str(args.get('checked', True)).lower() not in ('false', '0') else 'untick'} \"{label}\""
+    elif name == "ui_select":
+        what = f"choose \"{args.get('option', '')}\" in \"{label}\""
+    else:
+        what = f"click \"{label}\""
+    if v["tier"] == "first_use":
+        question = f"I'll {what} on {place}. Okay? I'll remember that {place} is fine for simple clicks."
+        args["_trust"] = place
+        _highlight(obs, eid)
+    else:
+        question = f"{what[0].upper() + what[1:]} on {place}? {v['why'][0].upper() + v['why'][1:]}."
+    args["_ask"] = question
+    args["_label"] = label
+    return None
+
+
+def _highlight(obs: dict, eid: int) -> None:
+    """Outline the element in the page for 6 s while DEMASCAS asks about it."""
+    if obs.get("source") != "dom":
+        return
+    try:
+        from actuators.browser import browser_execute_js
+        browser_execute_js("(function(){var e=document.querySelector('[data-dmx-id=\"%d\"]');if(!e)return '';"
+                           "var o=e.style.outline;e.style.outline='3px solid #ff2d75';e.scrollIntoView({block:'center'});"
+                           "setTimeout(function(){e.style.outline=o;},6000);return 'ok';})()" % eid)
+    except Exception:
+        pass
+
+
 def _describe_action(tool: str, args: dict) -> str:
+    if args.get("_ask"):
+        return str(args["_ask"])
     if tool == "delete_file":
         path = str(args.get("file_path", "that file"))
         return f"Move {os.path.basename(path.rstrip('/')) or path} to the Trash?"
     if tool == "deliver_chat_message":
         return f"Send '{args.get('text', '')}' to {args.get('contact', 'them')} on {args.get('app', 'the app')}?"
+    if tool == "call_contact":
+        how = {"facetime": " on FaceTime video", "facetime_audio": " on FaceTime audio"}.get(str(args.get("via", "")), "")
+        return f"Call {args.get('name') or args.get('number')} on {args.get('spoken_number') or args.get('number')}{how}?"
     if tool == "press_keyboard_shortcut":
         if is_risky_shortcut(str(args.get("keys", ""))):
             return f"Press {args.get('keys')}? That can close, quit or delete something."
@@ -469,13 +658,13 @@ def _get_tool_args(func, raw_args: dict) -> dict:
                     and isinstance(val, (str, float)):
                 try:
                     val = int(float(val))
-                except ValueError:
-                    pass
+                except ValueError as _e:  # was silent
+                    __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
             elif (ann is float or isinstance(default, float)) and isinstance(val, (str, int)):
                 try:
                     val = float(val)
-                except ValueError:
-                    pass
+                except ValueError as _e:  # was silent
+                    __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
             cleaned[param_name] = val
         elif param.default is inspect.Parameter.empty:
             missing.append(param_name)
@@ -487,16 +676,22 @@ def _get_tool_args(func, raw_args: dict) -> dict:
 def _would_send_in_chat_app(name: str, args: dict) -> bool:
     """Enter / submit while a chat app is in front sends a message to real
     people — outside the read-back flow it needs a spoken yes."""
-    keys = str(args.get("keys", "")).lower().replace(" ", "")
+    keys = canonical_keys(str(args.get("keys", ""))).lower().replace(" ", "")
+    enter = args.get("press_enter")
     sends = name == "type_and_submit" or (
         name == "press_keyboard_shortcut"
-        and (re.search(r"(^|\+|,)(return|enter)$", keys) or keys in ("cmd+shift+d", "command+shift+d")))
+        and (re.search(r"(^|\+|,)(return|enter)(,|$)", keys)
+             or re.search(r"(^|,)(cmd|command)\+shift\+d(,|$)", keys))) or (
+        # typing WITH Enter is sending too (a live Rust-loop test sent a Slack DM this way)
+        name in ("type_text", "type_text_into_element") and (enter is True or str(enter).lower() in ("true", "1", "yes")
+                                                             # a trailing newline presses Enter too (live: "hello everyone\n")
+                                                             or str(args.get("text", "")).endswith(("\n", "\r"))))
     if not sends:
         return False
     try:
         from core.axui import frontmost_app
         from actuators.messaging import is_chat_app
-        app = frontmost_app()
+        app = str(args.get("app_name") or "") or frontmost_app()
         # Mail apps too: ⌘↩ / ⌘⇧D send an email (a live session pressed ⌘↩ in Mail).
         return is_chat_app(app) or app in ("Mail", "Microsoft Outlook", "Outlook", "Spark", "Airmail")
     except Exception:
@@ -539,6 +734,51 @@ def _app_running(app: str) -> bool:
 
 
 TOOL_MAP["send_chat_message"] = _send_chat_message_tool
+
+
+def _read_chat_messages_tool(app: str = "", contact: str = "", count: int = 15) -> dict:
+    from actuators.messaging import read_chat_messages, is_chat_app, CHAT_APPS
+    if not app:
+        active = str(ACTIVE_CONTEXT.get("active_app", ""))
+        running = [a for a in CHAT_APPS if _app_running(a)]
+        app = active if is_chat_app(active) else (running[0] if len(running) == 1 else "")
+    return read_chat_messages(app, contact, count)
+
+
+TOOL_MAP["read_chat_messages"] = _read_chat_messages_tool
+
+# The Apple apps on this Mac (actuators/apple.py) — on-device, no login.
+from actuators import apple as _apple  # noqa: E402
+for _n in ("list_agenda", "add_event", "remind_me", "list_reminders", "find_contact",
+           "read_notes", "add_note", "read_mail", "draft_mail", "call_contact", "recent_calls"):
+    TOOL_MAP[_n] = getattr(_apple, _n)
+# Reading: any app's screen, any document.
+from core.axui import read_screen_text as _read_screen_text  # noqa: E402
+from actuators.file_system import read_file_text as _read_file_text  # noqa: E402
+TOOL_MAP["read_screen_text"] = _read_screen_text
+from actuators.network import check_internet as _check_internet  # noqa: E402
+TOOL_MAP["check_internet"] = _check_internet
+from actuators import mac_extras as _mac_extras  # noqa: E402
+TOOL_MAP["open_settings_pane"] = _mac_extras.open_settings_pane
+TOOL_MAP["open_copied_path"] = _mac_extras.open_copied_path
+from core.permissions import check_permissions as _check_permissions  # noqa: E402
+TOOL_MAP["check_permissions"] = _check_permissions
+# The screen as numbered elements (page structure / accessibility / Apple
+# Vision) and actions on ONE numbered element — gated per element (_ui_gate).
+from core import screen as _screen_mod  # noqa: E402
+from core.screen import act as _screen_act, ocr as _screen_ocr  # noqa: E402
+for _n in ("screen_observe", "screen_find", "form_read"):
+    TOOL_MAP[_n] = getattr(_screen_mod, _n)
+for _n in ("ui_click", "ui_type", "ui_set_checked", "ui_select", "ui_scroll", "ui_undo"):
+    TOOL_MAP[_n] = getattr(_screen_act, _n)
+TOOL_MAP["find_image_by_content"] = _screen_ocr.find_image_by_content
+# Seeing: the vision model, loaded only while it's being used (core/screen/vlm.py)
+from core.screen import look as _screen_look  # noqa: E402
+for _n in ("describe_screen", "look_at_image", "vision_status"):
+    TOOL_MAP[_n] = getattr(_screen_look, _n)
+from actuators.brief import morning_brief as _morning_brief, briefed_today as _briefed_today  # noqa: E402
+TOOL_MAP["morning_brief"] = _morning_brief
+TOOL_MAP["read_file_text"] = _read_file_text
 TOOL_MAP["message_contact"] = _message_contact_tool
 
 
@@ -560,20 +800,71 @@ def _dispatch_native(name: str, args: dict, *, confirmed: bool = False) -> tuple
         name == "run_app_script" and _script_is_destructive(str(args.get("script", "")))) or (
         name == "click_menu_item" and is_risky_menu(str(args.get("menu_path", "")))) or (
         name in ("find_and_click", "click_ui_element")
-        and is_risky_menu(str(args.get("search_text") or args.get("element_name") or "")))
+        and is_risky_menu(str(args.get("search_text") or args.get("element_name") or ""))) or (
+        name in _LABEL_CLICKS and _label_is_risky(args))
+    if name in _UI_ACTIONS or name in ("ui_scroll", "ui_undo"):
+        args = _normalize_ui_args(name, args)
+    # ── older label-based clickers on a web page go through the element gate
+    if name in _REDIRECT_CLICKS and not confirmed:
+        redirected = _click_by_label(name, args)
+        if redirected is not None:
+            return redirected
+    # ── DEMASCAS never shuts itself down: quitting its own app, or the
+    #    terminal it was started from, would end the request half-way
+    if name in ("quit_application", "force_quit_application") and not _exam.ENABLED:
+        target = str(args.get("app_name") or args.get("app") or "").strip()
+        from core import axui as _axui
+        own = target.lower() in ("demascas", "python", "python3") or (
+            not os.environ.get("DEMASCAS_APP") and target and target == _axui._console_terminal())
+        if own:
+            why = ("that's me — say 'stand by' and I'll go quiet instead" if target.lower() in ("demascas", "python", "python3")
+                   else f"I'm running inside {target}, so closing it would shut me down. Start me from the DEMASCAS app "
+                        f"(~/Applications/DEMASCAS.app) and I can close {target} for you")
+            r = {"success": False, "blocked": True, "message": f"[-] I won't quit {target}: {why}."}
+            return _serialize_result(r), True, r
+    # ── never type into a no-go app (Terminal, Keychain, password managers…)
+    if name in ("type_text", "type_and_submit", "press_keyboard_shortcut") and not confirmed:
+        from core.screen import risk as _risk
+        front = _front_app_fast()
+        if front in _risk.NO_GO_APPS:
+            r = {"success": False, "blocked": True, "message": f"[-] I don't type or press keys inside {front} — that's yours to do."}
+            return _serialize_result(r), True, r
+    # ── screen actions: the risk is the ELEMENT ("Next" vs "Place order")
+    if name in _UI_ACTIONS:
+        gate = _ui_gate(name, args, confirmed)
+        if gate is not None:
+            return gate
+        if not confirmed and args.get("_ask"):
+            needs_yes = True
+    if needs_yes and not confirmed and name == "call_contact":
+        # say exactly WHO and WHICH number before asking — or ask who/which
+        who = _apple.resolve_callee(str(args.get("name", "")), str(args.get("number", "")))
+        if not who.get("success"):
+            if "Contacts" in str(who.get("message", "")):          # no permission — a real failure
+                return _serialize_result(who), True, who
+            asked = {"success": True, "asked": True, "message": who.get("message", "Who should I call?")}
+            return _serialize_result(asked), False, asked            # a question, not an error
+        args = {"name": who["display"], "number": who["number"], "via": args.get("via", "phone"),
+                "spoken_number": who.get("spoken_number", who["number"])}
     if needs_yes and not confirmed:
         pending = _create_pending(name, args, _describe_action(name, args))
         return _serialize_result(pending), False, pending
 
+    from core import verify
     try:
         safe_args = _get_tool_args(func, args)
+        state = verify.before(name, safe_args) if not _exam.ENABLED else {}
         raw = func(**safe_args)
     except TypeError as e:
         return f"[-] Bad arguments for {name}: {e}", True, None
     except Exception as e:
         return f"[-] Tool error ({name}): {e}", True, None
 
-    return _serialize_result(raw), _result_failed(raw), raw
+    failed = _result_failed(raw)
+    # Did it really happen?  (looked at, not assumed — see core/verify.py)
+    checked = None if failed else (_exam.verified(name, safe_args) if _exam.ENABLED else verify.after(name, safe_args, state, raw))
+    _LAST_VERIFIED[threading.get_ident()] = checked
+    return _serialize_result(raw), failed, raw
 
 # ── Active Context (cross-turn persistent state) ─────────────────────
 # Replaces the old SESSION_STATE with richer fields that track what the
@@ -728,8 +1019,8 @@ def _update_context(tool_name: str, args: dict, result, success: bool):
                     ACTIVE_CONTEXT["awaiting_user_choice"] = True
                 else:
                     ACTIVE_CONTEXT["awaiting_user_choice"] = False
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
 
     # ── open_file → clear pending, set active file ──
     elif tool_name == "open_file":
@@ -842,8 +1133,8 @@ def _normalize_user_command(command: str) -> str:
     try:
         from core.vocabulary import apply_corrections
         text = apply_corrections(text)
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
 
     fixed = text.strip()
     if fixed != original:
@@ -1138,13 +1429,13 @@ def _note_user_activity():
         try:
             from core.finetune.scheduler import note_activity
             note_activity()
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
         try:
             from core.web.crawler import note_activity as web_activity
             web_activity()               # background web research yields too
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
 
 
 @app.before_request
@@ -1192,8 +1483,8 @@ def _shutdown_mcp() -> None:
     if _mcp is not None:
         try:
             _mcp.shutdown_all()
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
 
 
 # ── Unified tool list (native + MCP, no name collisions) ────────────
@@ -1237,8 +1528,12 @@ def execute_tool():
 
     # Priority 1: native (in-process, ~0 µs overhead)
     if name in TOOL_MAP:
+        _LAST_VERIFIED.pop(threading.get_ident(), None)
         result, failed, raw = _run_and_track(name, args)
         response = {"result": result, "success": not failed}
+        checked = _LAST_VERIFIED.pop(threading.get_ident(), None)
+        if checked is not None:
+            response["verified"] = checked
 
         # Screen state after UI actions costs a full accessibility-tree read
         # (~1-2 s), so it is only done when the caller asks for it (the
@@ -1277,14 +1572,14 @@ def _run_and_track(name: str, args: dict, *, confirmed: bool = False) -> tuple[s
     try:
         from core.skills.trajectories import note_tool_call
         note_tool_call(name, args, result, not failed)
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
     if not failed:
         try:
             from core.knowledge import auto_save_from_tool_result
             auto_save_from_tool_result(name, args, raw if raw is not None else result, success=True)
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
     return result, failed, raw
 
 
@@ -1299,6 +1594,104 @@ def vocabulary_endpoint():
     """Words the speech recogniser should expect (taught words, learned apps)."""
     from core.vocabulary import terms
     return jsonify({"terms": terms()}), 200
+
+
+@app.route("/brief/status", methods=["GET"])
+def brief_status():
+    """Has the user had today's brief yet?"""
+    return jsonify({"briefed_today": _briefed_today()}), 200
+
+
+@app.route("/channel/inbox", methods=["GET"])
+def channel_inbox():
+    """Texts from the owner waiting for the brain (iMessage)."""
+    from server import imessage
+    return jsonify({"messages": imessage.take_inbox(), "status": imessage.status()}), 200
+
+
+@app.route("/channel/reply", methods=["POST"])
+def channel_reply():
+    """The brain answers the owner over iMessage."""
+    from server import imessage
+    data = request.get_json(silent=True) or {}
+    text, to = str(data.get("text", "")).strip(), str(data.get("to", "")).strip()
+    if not text:
+        return jsonify({"sent": False}), 200
+    if _exam.ENABLED:
+        _exam.record_reply(to, text)
+        return jsonify({"sent": True}), 200
+    owner = imessage.settings()["owner"]
+    to = to or (owner[0] if owner else "")
+    if to not in owner:                     # replies go to the owner only
+        return jsonify({"sent": False, "error": "not the owner"}), 200
+    return jsonify({"sent": imessage.send(to, text)}), 200
+
+
+@app.route("/pending", methods=["POST"])
+def pending_endpoint():
+    """The brain wants a spoken yes before running a tool the server doesn't
+    gate itself (shell commands, form submits…).  /confirm then runs it."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", ""))
+    if name not in TOOL_MAP:
+        return jsonify({"error": f"unknown tool {name}"}), 200
+    p = _create_pending(name, dict(data.get("arguments") or {}), str(data.get("speech") or f"Should I {name.replace('_', ' ')}?"))
+    return jsonify(p), 200
+
+
+@app.route("/ui", methods=["GET"])
+def ui_endpoint():
+    """What's on screen in an app, compactly: '[button] Friends', ... (read-only,
+    ~0.1–0.6 s for Electron apps via the in-process accessibility reader)."""
+    from core import axui
+    app_name = request.args.get("app", "") or axui.frontmost_app()
+    limit = max(10, min(int(request.args.get("limit", 60) or 60), 150))
+    try:
+        items = axui.snapshot(app_name) if app_name else []
+    except Exception:
+        items = []
+    seen, rows = set(), []
+    for it in items:
+        key = (it["role"], it["name"])
+        if key in seen or len(it["name"]) > 80:
+            continue
+        seen.add(key)
+        rows.append(f"[{it['role'][2:].lower()}] {it['name']}")
+        if len(rows) >= limit:
+            break
+    return jsonify({"app": app_name, "elements": rows}), 200
+
+
+@app.route("/app_hints", methods=["GET"])
+def app_hints_endpoint():
+    """What DEMASCAS learned about an app for this goal (menus, shortcuts,
+    how-tos, verified by use).  An app it has never studied starts being
+    learned in the background, so the next request is better informed."""
+    from core.appknowledge import learner
+    app_name = request.args.get("app", "")
+    goal = request.args.get("goal", "")
+    if not app_name:
+        return jsonify({"app": "", "known": False, "hints": ""}), 200
+    real = learner._resolve_app_name(app_name) or app_name
+    known = os.path.exists(learner.manual_path(real))
+    hints = learner.hints(real, goal) if known else ""
+    if not known and not _exam.ENABLED:
+        threading.Thread(target=lambda: learner.learn_app(real), name=f"learn-{real}", daemon=True).start()
+    return jsonify({"app": real, "known": known, "hints": hints, "learning": not known}), 200
+
+
+@app.route("/apps", methods=["GET"])
+def apps_endpoint():
+    """Installed apps (cached 5 min), running apps (cached 10 s) and the app in
+    front — lets the Rust brain open/close apps without the model, and tell
+    the model what's on screen.  ~1 ms cached; the frontmost read ~40 ms."""
+    from core.appnames import installed_apps, running_apps
+    try:
+        from core.axui import frontmost_app
+        front = frontmost_app() if request.args.get("frontmost", "1") != "0" else ""
+    except Exception:
+        front = ""
+    return jsonify({"installed": installed_apps(), "running": running_apps(), "frontmost": front}), 200
 
 
 def _skill_dispatch(name: str, args: dict):
@@ -1421,7 +1814,8 @@ def skill_run_endpoint():
         return jsonify({"success": False, "summary": "I don't know that skill."}), 200
     params = data.get("params") if isinstance(data.get("params"), dict) else {}
     r = runner.run(sk, params, _skill_dispatch)
-    out = {"success": r.success, "summary": r.summary, "tool_calls": r.tool_calls, "ms": round(r.ms)}
+    out = {"success": r.success, "summary": r.summary, "tool_calls": r.tool_calls, "ms": round(r.ms),
+           "file": r.file}
     if r.pending:
         out.update(confirm_token=r.pending.get("confirm_token", ""),
                    confirm_speech=r.pending.get("confirm_speech", ""),
@@ -1636,8 +2030,8 @@ def get_learned_context():
             if knowledge_block:
                 existing = ctx.get("context_text", "")
                 ctx["context_text"] = (existing + "\n\n" + knowledge_block).strip() if existing else knowledge_block
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
         # Append active context
         ctx_block = _context_block()
         if ctx_block:
@@ -1692,8 +2086,8 @@ def _record_learning(data: dict) -> None:
         from core.web.crawler import note_question
         if note_question(str(data.get("command", ""))):
             print(f"[WEB] Queued for background research: {str(data.get('command', ''))[:60]}")
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
     # Experience → trajectory → (maybe) a new learned skill.
     try:
         from core.skills import trajectories, induce
@@ -1720,8 +2114,8 @@ def _record_learning(data: dict) -> None:
         from core.config import LLM
         from core.llm.governor import touch
         touch(LLM)
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
     try:
         tools_used = data.get("tools", [])
         success = data.get("success", True)
@@ -1869,8 +2263,8 @@ def _flush_learning() -> None:
     try:
         from core.learning import flush
         flush()
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).debug("ignored error: %r", _e)
 
 
 def _warm_up() -> None:
@@ -1939,16 +2333,23 @@ def run_server() -> None:
     atexit.register(_flush_learning)
     atexit.register(lambda: _LEARN_EXECUTOR.shutdown(wait=True))
     threading.Thread(target=_warm_up, name="warm-up", daemon=True).start()
-    try:   # learn into the model when idle + plugged in (see core/finetune)
-        from core.finetune.scheduler import start_background
-        start_background()
-    except Exception as e:
-        print(f"[!] Auto fine-tuning unavailable: {e}")
-    try:   # read the web while idle (see core/web/crawler.py)
-        from core.web.crawler import start_background as start_web
-        start_web()
-    except Exception as e:
-        print(f"[!] Background web research unavailable: {e}")
+    if not _exam.ENABLED:   # reach DEMASCAS by iMessage (owner-only; see server/imessage.py)
+        try:
+            from server import imessage
+            imessage.start()
+        except Exception as e:
+            print(f"[!] iMessage channel unavailable: {e}")
+    if not _exam.ENABLED:   # the exam must not train, browse or learn in the background
+        try:   # learn into the model when idle + plugged in (see core/finetune)
+            from core.finetune.scheduler import start_background
+            start_background()
+        except Exception as e:
+            print(f"[!] Auto fine-tuning unavailable: {e}")
+        try:   # read the web while idle (see core/web/crawler.py)
+            from core.web.crawler import start_background as start_web
+            start_web()
+        except Exception as e:
+            print(f"[!] Background web research unavailable: {e}")
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
     except ValueError:
@@ -1980,6 +2381,10 @@ def run_server() -> None:
     app.run(host=_server_host(), port=_server_port(), debug=False,
             use_reloader=False, threaded=True)
 
+
+# Exam mode (DEMASCAS_EXAM=1): record + fake every tool call (server/exam_mode.py).
+from server import exam_mode as _exam  # noqa: E402
+_exam.install(app, globals())
 
 if __name__ == "__main__":
     run_server()

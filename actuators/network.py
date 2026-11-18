@@ -139,3 +139,58 @@ def ping_service(url: str) -> str:
         return f"Service at {url} is UP (HTTP {resp.status_code})."
     except Exception as e:
         return f"Service at {url} is DOWN: {e}"
+
+
+def check_internet() -> dict:
+    """
+    Is this Mac online, and how good is the connection?  Local and read-only:
+    a TCP connect to two public resolvers (latency), one DNS lookup, and the
+    Wi-Fi network's name when macOS shares it.  ~0.1–2 s.
+    """
+    import socket
+    import subprocess
+    import time
+
+    def connect_ms(host: str, port: int) -> float | None:
+        t = time.time()
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                return (time.time() - t) * 1000
+        except OSError:
+            return None
+
+    def dns() -> float | None:
+        t = time.time()
+        try:
+            socket.getaddrinfo("apple.com", 443)
+            return (time.time() - t) * 1000
+        except OSError:
+            return None
+
+    def wifi_name() -> str:
+        try:
+            out = subprocess.run(["networksetup", "-getairportnetwork", "en0"], capture_output=True, text=True, timeout=2).stdout
+            if ":" in out and "not associated" not in out.lower():
+                return out.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
+
+    # all four at once: the answer takes as long as the slowest (≤ ~2 s), not their sum
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f1, f2 = ex.submit(connect_ms, "1.1.1.1", 443), ex.submit(connect_ms, "8.8.8.8", 53)
+        fd, fw = ex.submit(dns), ex.submit(wifi_name)
+        times = [m for m in (f1.result(), f2.result()) if m is not None]
+        dns_ms, wifi = fd.result(), fw.result()
+    via = f" over Wi-Fi “{wifi}”" if wifi else ""
+    if not times:
+        msg = ("You're offline — I can't reach the internet" + (f", although Wi-Fi “{wifi}” is connected" if wifi else "") + ".")
+        return {"success": True, "online": False, "wifi": wifi, "message": msg}
+    best = min(times)
+    if dns_ms is None:
+        return {"success": True, "online": True, "latency_ms": round(best), "wifi": wifi,
+                "message": f"You're connected{via}, but looking up websites is failing, so pages may not load."}
+    quality = "fast" if best < 60 else "fine" if best < 150 else "slow"
+    return {"success": True, "online": True, "latency_ms": round(best), "dns_ms": round(dns_ms), "wifi": wifi,
+            "message": f"You're online{via}. The connection is {quality} — it answers in {round(best)} milliseconds."}

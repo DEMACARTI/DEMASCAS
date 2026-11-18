@@ -161,6 +161,174 @@ def message_box(app: str, items: list[dict] | None = None) -> dict | None:
     return None
 
 
+def focused_value(app: str = "") -> str | None:
+    """Text in the focused field of the app (None = can't read it)."""
+    if not available():
+        return None
+    app = app or frontmost_app()
+    pid = pid_of(app) if app else 0
+    if not pid:
+        return None
+    import ApplicationServices as AS
+    el = _attr(AS.AXUIElementCreateApplication(pid), "AXFocusedUIElement")
+    if el is None:
+        return None
+    v = _attr(el, "AXValue")
+    return str(v) if v is not None else None
+
+
+def texts(app: str, max_nodes: int = 12000, max_depth: int = 45) -> list[str]:
+    """Every visible text of the app's front window, in reading order
+    (static text values + labelled groups) — what a person would read."""
+    if not available():
+        return []
+    enable_electron(app)
+    pid = pid_of(app)
+    if not pid:
+        return []
+    import ApplicationServices as AS
+    root = AS.AXUIElementCreateApplication(pid)
+    wins = _attr(root, "AXWindows") or []
+    start = wins[0] if wins else root
+    out, stack, seen = [], [(start, 0)], 0
+    while stack and seen < max_nodes:
+        e, d = stack.pop()
+        seen += 1
+        role = _attr(e, "AXRole")
+        if role == "AXStaticText":
+            v = _attr(e, "AXValue") or _attr(e, "AXDescription") or ""
+            if isinstance(v, str) and v.strip():
+                out.append(v.strip())
+        if d < max_depth:
+            kids = _attr(e, "AXChildren") or []
+            for c in reversed(kids):             # keep document order on the stack
+                stack.append((c, d + 1))
+    return out
+
+
+_TERMINALS = ("Terminal", "iTerm2", "iTerm", "Warp", "Ghostty", "Alacritty", "kitty", "WezTerm")
+_NOT_WINDOWS = ("Window Server", "Dock", "Control Center", "Control Centre", "Notification Center", "Notification Centre", "SystemUIServer",
+                "Spotlight", "loginwindow", "WindowManager", "Wallpaper")
+
+
+_CONSOLE: list = []
+
+
+def _console_terminal() -> str:
+    """The terminal app DEMASCAS was started from: walk up this process's
+    parents (tool server → run.sh → shell → Terminal).  Cached."""
+    if _CONSOLE:
+        return _CONSOLE[0]
+    found, pid = "", os.getpid()
+    for _ in range(12):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True, timeout=2).stdout.strip()
+        except Exception:
+            break
+        if not out:
+            break
+        ppid, _, comm = out.partition(" ")
+        for t in _TERMINALS:
+            if t.lower().replace(" ", "") in comm.lower().replace(" ", ""):
+                found = t
+        try:
+            pid = int(ppid)
+        except ValueError:
+            break
+        if pid <= 1 or found:
+            break
+    _CONSOLE.append(found)
+    return found
+
+
+def _is_demascas_console(app: str) -> bool:
+    """The terminal in front is the one DEMASCAS itself is running in.
+    (Terminal doesn't expose its text as controls, so the old check — looking
+    for "demascas" among the window's buttons — never matched: live 18 Nov
+    "what's on the screen?" read Terminal and found nothing.)"""
+    if app and app == _console_terminal():
+        return True
+    try:
+        names = " ".join(it["name"] for it in snapshot(app)[:60]).lower()
+    except Exception:
+        return False
+    return any(k in names for k in ("demascas", "run.sh", "demascasd"))
+
+
+def app_on_screen() -> str:
+    """The app whose window the user is looking at.  Usually the frontmost
+    one — but when that's the terminal running DEMASCAS (live log: "what's on
+    the screen?" read DEMASCAS's own log), the window right behind it."""
+    front = frontmost_app()
+    if front not in _TERMINALS or not _is_demascas_console(front):
+        return front
+    try:
+        import Quartz
+        opts = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+        for w in Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID) or []:   # front → back
+            owner = str(w.get("kCGWindowOwnerName", ""))
+            bounds = w.get("kCGWindowBounds") or {}
+            if (w.get("kCGWindowLayer", 1) == 0 and owner and owner != front and owner not in _NOT_WINDOWS
+                    and float(bounds.get("Width", 0)) > 200 and float(bounds.get("Height", 0)) > 150):
+                return owner
+    except Exception as e:
+        print(f"[axui] window order unavailable: {e}")
+    return front
+
+
+def read_screen_text(app_name: str = "", max_chars: int = 4000) -> dict:
+    """Everything readable in the front window of an app (web pages in
+    Safari, documents, chats…) — what a person would read on screen."""
+    app = app_name or app_on_screen()
+    if not app:
+        return {"success": False, "message": "[-] I can't tell which app is in front."}
+    lines, seen, total = [], set(), 0
+    for t in texts(app):
+        t = " ".join(t.split())
+        if len(t) < 2 or t in seen:
+            continue
+        seen.add(t)
+        lines.append(t)
+        total += len(t) + 1
+        if total >= max(500, min(int(max_chars or 4000), 12000)):
+            break
+    if not lines:
+        # apps like Finder show names, not text: list what's there instead
+        # (window content only — the menu bar's items aren't "what's on screen")
+        lines = list(dict.fromkeys(it["name"] for it in snapshot(app)
+                                   if len(it["name"]) > 1 and it["role"] not in ("AXMenuItem", "AXMenuBarItem")))[:80]
+    if not lines:
+        # nothing in the accessibility tree (canvas apps, images, games): read the pixels
+        try:
+            from core.screen import ocr
+            if ocr.available():
+                path = ocr.screenshot_window(_window_box(app))
+                if path:
+                    try:
+                        lines = [t["text"] for t in ocr.read_text(path)][:120]
+                    finally:
+                        os.unlink(path)
+        except Exception as e:
+            print(f"[axui] OCR fallback failed: {e}")
+    if not lines:
+        return {"success": False, "message": f"[-] I couldn't read any text in {app}."}
+    return {"success": True, "app": app, "message": f"On screen in {app}:\n" + "\n".join(lines)}
+
+
+def _window_box(app: str) -> list | None:
+    """The app's front window on screen, in points [x, y, w, h]."""
+    try:
+        import Quartz
+        opts = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+        for w in Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID) or []:
+            b = w.get("kCGWindowBounds") or {}
+            if str(w.get("kCGWindowOwnerName", "")) == app and w.get("kCGWindowLayer", 1) == 0 and float(b.get("Width", 0)) > 200:
+                return [int(b["X"]), int(b["Y"]), int(b["Width"]), int(b["Height"])]
+    except Exception:
+        pass
+    return None
+
+
 def tree_text(app: str, limit: int = 120) -> str:
     """Compact 'ROLE : name' listing (for agents' screen reads)."""
     rows = [f"- [{it['role'][2:].lower()}] : '{it['name'][:80]}'" for it in snapshot(app)[:limit]]

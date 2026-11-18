@@ -219,8 +219,8 @@ def run_shell_command(command: str) -> str:
         for p in procs:
             try:
                 p.kill()
-            except Exception:
-                pass
+            except Exception as _e:  # was silent
+                __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
         return f"[-] Error executing command: {e}"
 
     output = (output or "").strip()
@@ -252,27 +252,27 @@ def get_system_info() -> str:
         lines = sw.split("\n")
         version = lines[1].split(":")[1].strip() if len(lines) > 1 else "Unknown"
         info.append(f"macOS Version: {version}")
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     try:
         up = subprocess.check_output(["uptime"], text=True, timeout=5).strip()
         info.append(f"Uptime details: {up}")
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     try:
         user = subprocess.check_output(["whoami"], text=True, timeout=5).strip()
         info.append(f"Current User: {user}")
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     try:
         df = subprocess.check_output(["df", "-h", "/"], text=True, timeout=5).strip().split("\n")
         if len(df) > 1:
             info.append(f"Disk Space (/): {df[1]}")
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     if not info:
         return "[-] Could not retrieve system information."

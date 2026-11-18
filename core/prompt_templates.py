@@ -111,6 +111,10 @@ def compose_email_prompt(
         "- No markdown formatting in the email body\n"
         "- Use natural paragraph breaks (\\n\\n)\n"
         "- Sign off appropriately (Best regards, Thanks, Cheers, etc.)\n"
+        "- Say ONLY what the key points say. Never add meetings, projects, updates or\n"
+        "  questions that aren't in them. A key point like 'hi' is a one- or two-line email.\n"
+        "- Never invent an email address: leave 'to' as the name you were given.\n"
+        "- Never write placeholders like [Your Name].\n"
         "- The 'confirm' field is what you'll SAY to the user for approval\n"
         f"{ctx_block}{profile_block}{contact_block}"
     )

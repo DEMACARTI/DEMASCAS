@@ -59,8 +59,8 @@ def _load_config() -> dict:
         if os.path.exists(_CONFIG_PATH):
             with open(_CONFIG_PATH, "r") as f:
                 _config = json.load(f)
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     # Also check environment variables (run.sh can set these)
     if not _config.get("google_api_key"):
@@ -87,8 +87,8 @@ def _check_fact_cache(query: str, ttl_hours: float = 24.0) -> str | None:
                 return fact
             # Other facts are always valid
             return fact
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
     return None
 
 
@@ -226,8 +226,8 @@ def smart_search(query: str, ttl_hours: float = 24.0) -> str:
             f"Search result for '{query}': {answer[:300]}",
             category="search_cache",
         )
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     return answer
 

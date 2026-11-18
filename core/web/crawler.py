@@ -238,12 +238,17 @@ _PERSONAL = re.compile(r"\b(my|me|i|i'm|you|your|yourself|demascas|screen|file|f
                        r"brightness|computer|laptop|mac|desktop|this|that|here)\b", re.I)
 
 
+# "what is up?" is a greeting, not a research topic (live log 18 Nov)
+_SMALL_TALK = re.compile(r"^\W*(hey|hi|hello|so|yo)?\W*(what(?:'?s| is) (?:up|new|going on)|how(?:'?s| is) it going|"
+                         r"how (?:are|r) (?:you|u)(?: doing)?|how have you been|how do you do|sup|wassup)\W*$", re.I)
+
+
 def note_question(command: str) -> bool:
     """Queue a world-knowledge question for background research if the
     store can't answer it yet.  (Personal / device questions never leave
     the machine.)"""
     q = (command or "").strip().rstrip("?.! ")
-    if len(q) < 8 or not _QUESTION.search(q) or _PERSONAL.search(q):
+    if len(q) < 8 or not _QUESTION.search(q) or _PERSONAL.search(q) or _SMALL_TALK.match(q):
         return False
     try:   # only world-knowledge questions — never device / screen ones
         from core.routing import intent

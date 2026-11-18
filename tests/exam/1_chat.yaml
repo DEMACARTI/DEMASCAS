@@ -1,0 +1,29 @@
+# Questions and conversation: answer well, do nothing on the computer.
+- {id: how-are-you, say: "how are you", expect: {no_action: true, speaks: true}}
+- {id: capital-france, say: "what is the capital of France", expect: {no_action: true, say_any: ['paris']}}
+- {id: joke, say: "tell me a joke", expect: {no_action: true, speaks: true}}
+- {id: einstein, say: "who was Albert Einstein", expect: {no_action: true, say_any: ['physic', 'relativity']}}
+- {id: recursion, say: "explain recursion simply", expect: {no_action: true, say_any: ['itself', 'smaller', 'repeat']}}
+- {id: arithmetic, say: "what is two plus two times three", expect: {no_action: true, say_any: ['\b8\b', 'eight']}}
+- {id: planets, say: "how many planets are there in the solar system", expect: {no_action: true, say_any: ['\b8\b', 'eight']}}
+- {id: translate, say: "translate hello to Spanish", expect: {no_action: true, say_any: ['hola']}}
+- {id: good-morning, say: "good morning", expect: {no_action: true, speaks: true}}
+- {id: thanks, say: "thank you so much", expect: {no_action: true}}
+- {id: name, say: "what's your name", expect: {no_action: true, say_any: ['demascas']}}
+- {id: tired, say: "I'm feeling tired today", expect: {no_action: true, speaks: true}}
+- {id: quote, say: "give me a motivational quote", expect: {no_action: true, speaks: true}}
+- {id: photosynthesis, say: "what does photosynthesis mean", expect: {no_action: true, say_any: ['light', 'plant', 'sun']}}
+- {id: virus-bacteria, say: "what's the difference between a virus and bacteria", expect: {no_action: true, say_any: ['cell', 'living', 'antibiotic', 'host']}}
+- {id: airplanes, say: "how do airplanes fly", expect: {no_action: true, say_any: ['lift', 'wing']}}
+- {id: entropy, say: "define entropy", expect: {no_action: true, say_any: ['disorder', 'energy', 'random', 'uncertain']}}
+- {id: boiling, say: "what is the boiling point of water", expect: {no_action: true, say_any: ['100', 'hundred', '212']}}
+- {id: poem, say: "write a short poem about rain", expect: {no_action: true, speaks: true}}
+- {id: book, say: "recommend a good book", expect: {no_action: true, speaks: true}}
+- {id: sqrt, say: "what's the square root of 144", expect: {no_action: true, say_any: ['12', 'twelve']}}
+- {id: shakespeare, say: "who wrote Romeo and Juliet", expect: {no_action: true, say_any: ['shakespeare']}}
+- {id: light-speed, say: "what is the speed of light", expect: {no_action: true, say_any: ['300', '299', '186', '3 ?x ?10']}}
+- {id: movie-chat, say: "I watched a movie called Ramayana today", expect: {no_action: true, speaks: true}}
+- {id: ocean, say: "what is the largest ocean", expect: {no_action: true, say_any: ['pacific']}}
+- {id: leap-year, say: "how many days are in a leap year", expect: {no_action: true, say_any: ['366', 'three hundred sixty']}}
+- {id: black-hole-q, say: "what's a black hole", expect: {no_action: true, say_any: ['gravit', 'light', 'escape']}}
+- {id: ai-opinion, say: "what do you think about artificial intelligence", expect: {no_action: true, speaks: true}}

@@ -3,11 +3,12 @@
 # DEMASCAS — Build Script (macOS / Apple Silicon · Linux: Arch, Debian/Ubuntu, Fedora)
 #
 # What this does:
-#   1. Checks prerequisites (cmake, pkg-config, portaudio, speexdsp) and
+#   1. Checks prerequisites (Rust, cmake, pkg-config, speexdsp) and
 #      installs missing ones with Homebrew / pacman / apt / dnf
-#   2. Downloads whisper.cpp GGML models if missing
-#   3. Installs Python deps (flask) for the tool server
-#   4. Compiles the C++ daemon via CMake (Release mode)
+#      (cmake is needed by whisper-rs, which compiles whisper.cpp)
+#   2. Downloads the models (whisper, Kokoro, Silero, sherpa-onnx) to models/
+#   3. Installs Python deps for the tool server
+#   4. Builds the Rust daemon (core-rs, release)
 #
 # Usage:
 #   chmod +x scripts/build.sh
@@ -37,7 +38,7 @@ echo "[1/5] Checking prerequisites..."
 if [ "$OS" = "Darwin" ]; then
     command -v brew >/dev/null 2>&1 || {
         echo "❌  Homebrew not found.  Install from https://brew.sh"; exit 1; }
-    for pkg in cmake pkg-config portaudio speexdsp; do
+    for pkg in cmake pkg-config speexdsp; do
         if ! brew list "$pkg" &>/dev/null; then
             echo "[*] Installing $pkg via Homebrew..."
             brew install "$pkg"
@@ -47,7 +48,7 @@ elif [ "$OS" = "Linux" ]; then
     # Package names per distro: build tools, PortAudio (mic + speaker),
     # speexdsp (echo cancellation), curl/bzip2 (model downloads).
     if command -v pacman >/dev/null 2>&1; then          # Arch / Manjaro / EndeavourOS
-        PKGS="base-devel cmake pkgconf git curl bzip2 lsof portaudio speexdsp python"
+        PKGS="base-devel cmake pkgconf git curl bzip2 lsof portaudio speexdsp python clang alsa-lib"
         MISSING=$(pacman -T $PKGS 2>/dev/null || true)
         if [ -n "$MISSING" ]; then
             echo "[*] Installing with pacman: $MISSING"
@@ -56,10 +57,10 @@ elif [ "$OS" = "Linux" ]; then
     elif command -v apt-get >/dev/null 2>&1; then       # Debian / Ubuntu
         sudo apt-get update -qq
         sudo apt-get install -y build-essential cmake pkg-config git curl bzip2 lsof \
-            portaudio19-dev libspeexdsp-dev python3-venv
+            portaudio19-dev libspeexdsp-dev python3-venv libclang-dev libasound2-dev
     elif command -v dnf >/dev/null 2>&1; then           # Fedora
         sudo dnf install -y gcc-c++ make cmake pkgconf-pkg-config git curl bzip2 lsof \
-            portaudio-devel speexdsp-devel python3
+            portaudio-devel speexdsp-devel python3 clang-devel alsa-lib-devel
     else
         echo "⚠️  Unknown package manager — install: cmake, pkg-config, a C++17 compiler,"
         echo "   PortAudio (dev headers), speexdsp (dev headers), curl, bzip2."
@@ -70,7 +71,14 @@ fi
 for tool in cmake pkg-config curl; do
     command -v "$tool" >/dev/null 2>&1 || { echo "❌  $tool is still missing."; exit 1; }
 done
-pkg-config --exists portaudio-2.0 || { echo "❌  PortAudio development files not found."; exit 1; }
+pkg-config --exists speexdsp || { echo "❌  speexdsp development files not found."; exit 1; }
+CARGO="$(command -v cargo || true)"
+[ -z "$CARGO" ] && [ -x "$HOME/.cargo/bin/cargo" ] && CARGO="$HOME/.cargo/bin/cargo"
+if [ -z "$CARGO" ]; then
+    echo "❌  Rust isn't installed. Install it with:"
+    echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    exit 1
+fi
 
 # ── 2. (macOS: Homebrew packages are checked above) ─────────────────
 
@@ -79,12 +87,12 @@ echo "[2/5] Prerequisites ✓"
 # ── 3. Download whisper.cpp GGML models ─────────────────────────────
 
 echo "[3/5] Checking whisper models..."
-mkdir -p daemon/models
+mkdir -p models
 
 MODEL_BASE_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
 for model in tiny base; do
-    MODEL_FILE="daemon/models/ggml-${model}.bin"
+    MODEL_FILE="models/ggml-${model}.bin"
     if [ ! -f "$MODEL_FILE" ]; then
         echo "     Downloading ggml-${model}.bin..."
         curl -L --progress-bar -o "$MODEL_FILE" \
@@ -97,7 +105,7 @@ done
 # ── 3b. Download sherpa-onnx pre-built library (native arm64 TTS) ────
 
 echo "[3b/5] Checking sherpa-onnx library..."
-SHERPA_DIR="daemon/models/sherpa-onnx"
+SHERPA_DIR="models/sherpa-onnx"
 SHERPA_VER="v1.12.28"
 
 if [ ! -d "$SHERPA_DIR/lib" ]; then
@@ -129,7 +137,7 @@ fi
 # ── 3c. Download Kokoro TTS voice model ──────────────────────────────
 
 echo "[3c/5] Checking Kokoro TTS model..."
-KOKORO_DIR="daemon/models/kokoro-en-v0_19"
+KOKORO_DIR="models/kokoro-en-v0_19"
 
 if [ ! -f "$KOKORO_DIR/model.onnx" ]; then
     KOKORO_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2"
@@ -137,7 +145,7 @@ if [ ! -f "$KOKORO_DIR/model.onnx" ]; then
     TMP_TAR="$(mktemp -t kokoro.XXXXXX).tar.bz2"
     curl -L --fail --progress-bar -o "$TMP_TAR" "$KOKORO_URL"
 
-    tar -xjf "$TMP_TAR" -C "daemon/models/"
+    tar -xjf "$TMP_TAR" -C "models/"
     rm -f "$TMP_TAR"
 
     if [ -f "$KOKORO_DIR/model.onnx" ]; then
@@ -152,7 +160,7 @@ fi
 # ── 3d. Speech detector (Silero VAD, 644 KB) — tells a human voice from
 #        fans/typing/music, and powers barge-in at a normal speaking voice.
 echo "[3d/5] Checking speech detector model..."
-VAD_MODEL="daemon/models/silero_vad.onnx"
+VAD_MODEL="models/silero_vad.onnx"
 if [ ! -f "$VAD_MODEL" ]; then
     curl -L --progress-bar -o "$VAD_MODEL" \
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx" \
@@ -176,31 +184,19 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 echo "     Python packages ✓ (venv)"
 
-# ── 5. Build C++ daemon ─────────────────────────────────────────────
+# ── 5. Build the Rust daemon (ears + voice + brain) ─────────────────
+#    Needs libclang (Xcode Command Line Tools on macOS; clang / libclang-dev
+#    on Linux) for the sherpa-onnx bindings.
 
-echo "[5/5] Building C++ daemon..."
-mkdir -p daemon/build
-cd daemon/build
-
-CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release)
-if [ "$OS" = "Darwin" ]; then
-    CMAKE_ARGS+=(-DCMAKE_OSX_ARCHITECTURES=arm64)
-fi
-cmake .. "${CMAKE_ARGS[@]}" \
-    2>&1 | grep -E "^(--|Fetching|Configuring|Building|\\[)" || true
-
-NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-cmake --build . --config Release -j"$NPROC"
-
-cd "$PROJECT_ROOT"
+echo "[5/5] Building the Rust daemon (core-rs)..."
+(cd core-rs && "$CARGO" build --release -p demascasd)
 
 echo ""
 echo "═══════════════════════════════════════════════"
 echo "✅  Build complete!"
 echo ""
-echo "Binary:  daemon/build/demascas_daemon"
-echo "Models:  daemon/models/ggml-tiny.bin"
-echo "         daemon/models/ggml-base.bin"
+echo "Binary:  core-rs/target/release/demascasd"
+echo "Models:  models/"
 echo ""
 echo "Run with:  ./scripts/run.sh"
 echo "═══════════════════════════════════════════════"

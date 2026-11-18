@@ -1233,3 +1233,124 @@ def gmail_read_email() -> dict:
         return {"success": True, "message": msg}
     except (json.JSONDecodeError, KeyError):
         return {"success": True, "message": result.get("value", "")}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Gmail inbox (read-only) — the list of latest emails, from whichever
+# Chromium browser has Gmail open.  Never clicks, never sends.
+# ══════════════════════════════════════════════════════════════════════
+
+_GMAIL_BROWSERS = ("Brave Browser", "Google Chrome", "Microsoft Edge", "Arc", "Chromium")
+
+_GMAIL_INBOX_JS = r'''
+(function(){
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tr.zA'));
+  var out = [];
+  for (var i = 0; i < rows.length && out.length < 15; i++) {
+    var r = rows[i];
+    var who = r.querySelector('.yX [email], .yW [email], .zF, .yP');
+    var subj = r.querySelector('.bog, .bqe');
+    var snip = r.querySelector('.y2');
+    var when = r.querySelector('.xW span[title], td.xW span');
+    out.push({
+      from: who ? (who.getAttribute('name') || who.innerText || who.getAttribute('email') || '') : '',
+      email: who ? (who.getAttribute('email') || '') : '',
+      subject: subj ? subj.innerText : '',
+      text: snip ? snip.innerText.replace(/^\s*[-–]\s*/, '') : '',
+      when: when ? (when.getAttribute('title') || when.innerText) : '',
+      unread: r.className.indexOf('zE') >= 0
+    });
+  }
+  return JSON.stringify({url: location.href, rows: out, signedOut: !!document.querySelector('a[href*=ServiceLogin]')});
+})()
+'''
+
+
+def _running(app: str) -> bool:
+    return subprocess.run(["pgrep", "-f", f"/{app}.app/Contents/MacOS/"], capture_output=True).returncode == 0
+
+
+def _js_in_gmail_tab(browser: str, js: str) -> tuple[str, str]:
+    """Run `js` in the first Gmail tab of `browser`.  ("", "no tab") if none."""
+    script = f'''
+    tell application "{browser}"
+        repeat with w in windows
+            repeat with t in tabs of w
+                if (URL of t) contains "mail.google.com" then
+                    return execute t javascript "{_sanitize_js(js)}"
+                end if
+            end repeat
+        end repeat
+        return "@@NO_TAB@@"
+    end tell'''
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=8)
+    except subprocess.TimeoutExpired:
+        return "", "timed out"
+    if r.returncode != 0:
+        err = r.stderr.strip()
+        if "JavaScript" in err and ("turned off" in err or "Allow JavaScript" in err or "not allowed" in err):
+            return "", "js off"
+        return "", err[:160]
+    out = r.stdout.strip()
+    return ("", "no tab") if out == "@@NO_TAB@@" else (out, "")
+
+
+def gmail_read_inbox(count: int = 5, unread_only: bool = False, sender: str = "") -> dict:
+    """
+    The latest emails in your Gmail inbox, read from the browser tab where
+    Gmail is open (Brave first).  If no tab has Gmail, it's opened in the
+    background.  Read-only.
+
+    Returns {"success", "mails": [{from, subject, text, when, unread}], "message"}.
+    """
+    n = max(1, min(int(count or 5), 15))
+    browsers = [b for b in _GMAIL_BROWSERS if _running(b)]
+    raw, err = "", "no tab"
+    for b in browsers:
+        raw, err = _js_in_gmail_tab(b, _GMAIL_INBOX_JS)
+        if raw or err not in ("no tab",):
+            break
+    if err == "no tab":
+        # open Gmail in the background (Brave if installed) and wait for the list
+        target = next((b for b in browsers), "Brave Browser")
+        subprocess.run(["open", "-g", "-a", target, "https://mail.google.com/mail/u/0/#inbox"], capture_output=True)
+        for _ in range(12):
+            time.sleep(1.0)
+            raw, err = _js_in_gmail_tab(target, _GMAIL_INBOX_JS)
+            if raw:
+                try:
+                    if json.loads(raw).get("rows"):
+                        break
+                except ValueError:
+                    pass
+            elif err not in ("no tab",):
+                break
+    if err == "js off":
+        return {"success": False, "message": "I can't read Gmail yet: in Brave, open View, Developer, and turn on "
+                                             "Allow JavaScript from Apple Events. Then ask me again."}
+    if not raw:
+        return {"success": False, "message": "I couldn't open Gmail in the browser."
+                                             if err == "no tab" else "Gmail in the browser didn't answer."}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {"success": False, "message": "Gmail's page didn't look like an inbox."}
+    if data.get("signedOut"):
+        return {"success": False, "message": "Gmail isn't signed in in the browser."}
+    rows = data.get("rows") or []
+    if sender:
+        s = sender.lower()
+        rows = [r for r in rows if s in (r.get("from", "") + " " + r.get("email", "")).lower()]
+    if unread_only:
+        unread = [r for r in rows if r.get("unread")]
+        rows = unread or rows                 # nothing unread → the latest anyway
+    rows = rows[:n]
+    if not rows:
+        return {"success": True, "mails": [], "source": "gmail",
+                "message": "I don't see any emails in your Gmail inbox list right now."}
+    mails = [{"from": (r.get("from") or r.get("email") or "someone").strip(), "subject": (r.get("subject") or "(no subject)").strip(),
+              "text": " ".join((r.get("text") or "").split())[:300], "when": r.get("when", ""), "unread": bool(r.get("unread"))}
+             for r in rows]
+    return {"success": True, "mails": mails, "source": "gmail",
+            "message": "\n".join(f"From {m['from']}: {m['subject']} — {m['text'][:160]}" for m in mails)}

@@ -4,6 +4,7 @@
  */
 
 #include "whisper_engine.hpp"
+#include "textio.hpp"
 #include "config.hpp"
 
 #include <algorithm>
@@ -18,6 +19,7 @@ WhisperEngine::~WhisperEngine() { shutdown(); }
 
 bool WhisperEngine::init(const std::string& tiny_path,
                           const std::string& base_path) {
+    if (textio::enabled()) { std::cout << "[✓] Recogniser: text mode (typed lines)\n"; return true; }
     auto t0 = std::chrono::steady_clock::now();
 
     std::cout << "[*] Loading whisper tiny  → " << tiny_path << "\n";
@@ -51,15 +53,22 @@ void WhisperEngine::set_prompt(const std::string& prompt) {
 }
 
 std::string WhisperEngine::transcribe_wake(const std::vector<float>& pcm) {
+    if (textio::enabled()) return textio::last();
     // tiny + reduced audio_ctx measured unstable (repetition loops) → full window
     return run(tiny_, pcm, /*adaptive_ctx=*/false);
 }
 
 std::string WhisperEngine::transcribe_command(const std::vector<float>& pcm) {
+    if (textio::enabled()) {
+        last_conf_ = textio::conf();
+        last_unsure_ = textio::unsure();
+        return textio::last();
+    }
     return run(base_, pcm, demascas::config::WHISPER_ADAPTIVE_CTX);
 }
 
 void WhisperEngine::warm_up() {
+    if (textio::enabled()) return;
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> silence(
         static_cast<size_t>(demascas::config::WHISPER_MIN_SEC * 16000), 0.0f);

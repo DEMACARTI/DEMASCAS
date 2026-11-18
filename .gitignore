@@ -13,16 +13,22 @@ __pycache__/
 .DS_Store
 
 # Whisper GGML models (auto-downloaded by scripts/build.sh)
-daemon/models/*.bin
+models/*.bin
 
 # C++ build artifacts
 daemon/build/
 
 # Large model directories (auto-downloaded by build.sh)
-daemon/models/kokoro-en-v0_19/
-daemon/models/sherpa-onnx/
-daemon/models/piper/
-daemon/models/silero_vad.onnx
+models/kokoro-en-v0_19/
+models/sherpa-onnx/
+models/piper/
+models/silero_vad.onnx
 
 # Shell config (personal)
 .zshrc
+
+# Rust build artifacts
+core-rs/target/
+
+# JARVIS exam per-run detail (the summary row lives in docs/exam_history.md)
+docs/exam_runs/

@@ -322,7 +322,7 @@ Examples:
     
     print("\n[✓] Optimization complete!")
     print("[*] Restart DEMASCAS daemon for changes to take effect:")
-    print("     ./daemon/build/demascas_daemon\n")
+    print("     ./scripts/run.sh\n")
 
 
 if __name__ == "__main__":

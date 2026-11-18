@@ -49,6 +49,7 @@ class SkillRun:
     ms: float
     results: list[str] = field(default_factory=list)
     pending: dict | None = None        # a step is waiting for the user's yes/no
+    file: str = ""                     # a file a step made ("open it" next means this)
 
 
 def _short(v):
@@ -208,6 +209,7 @@ def run(skill: Skill, params: dict, dispatch: Dispatch) -> SkillRun:
              else [{"tool": s["tool"], "args": _substitute(s.get("args", {}), params)}
                    for s in skill.steps])
     last_msg = ""
+    made = ""
     for st in steps:
         result, failed, raw = dispatch(st["tool"], st.get("args") or {})
         calls.append(st["tool"])
@@ -218,6 +220,8 @@ def run(skill: Skill, params: dict, dispatch: Dispatch) -> SkillRun:
                             results, pending=raw)
         if isinstance(raw, dict) and raw.get("message"):
             last_msg = str(raw["message"])
+        if isinstance(raw, dict) and raw.get("path") and not failed:
+            made = str(raw["path"])
         if failed:
             ok = False
             last_msg = last_msg or result
@@ -229,7 +233,7 @@ def run(skill: Skill, params: dict, dispatch: Dispatch) -> SkillRun:
     else:
         msg = re.sub(r"^\[-\]\s*", "", last_msg or "")
         summary = msg if msg and len(msg) < 140 else f"I couldn't finish \"{skill.name}\"."
-    return SkillRun(ok, summary, calls, ms, results)
+    return SkillRun(ok, summary, calls, ms, results, file=made)
 
 
 def record_outcome(skill: Skill, success: bool, ms: float = 0.0, verified: bool = False) -> None:

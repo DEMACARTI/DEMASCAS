@@ -76,8 +76,8 @@ def parse_request(command: str) -> dict:
             from core.appnames import resolve
             hit, conf = resolve(out["app"])
             out["app"] = hit if hit and conf >= 0.72 else out["app"]
-        except Exception:
-            pass
+        except Exception as _e:  # was silent
+            __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
     t = out["text"]
     if t.lower() in _ASR_FIXES:
         out["text"] = _ASR_FIXES[t.lower()]
@@ -109,18 +109,16 @@ def _switcher_keys(app: str) -> str:
             if e.get("keys") and re.search(r"quick switch|jump to|find (?:or start )?a? ?conversation|"
                                             r"search (?:for )?(?:chats?|conversations?|dms?)", e["task"], re.I):
                 return e["keys"]
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
     return _QUICK_SWITCHER.get(app, "")
 
 
-def prepare_chat_message(app: str, contact: str, text: str) -> dict:
-    """Open the conversation, verify it, type the text — do NOT send."""
+def open_chat(app: str, contact: str) -> dict:
+    """Open the conversation with `contact` and VERIFY it's really theirs.
+    {"success", "contact" (as the app shows it), "message"} — nothing is typed."""
     from core import axui
     from actuators.system_control import open_application, press_keyboard_shortcut, type_text
-    if not (app and contact and text):
-        missing = [n for n, v in (("app", app), ("who to message", contact), ("what to say", text)) if not v]
-        return {"success": False, "message": f"[-] I need {' and '.join(missing)}."}
     open_application(app)
     time.sleep(0.8)
     if not axui.available():
@@ -145,18 +143,97 @@ def prepare_chat_message(app: str, contact: str, text: str) -> dict:
         press_keyboard_shortcut("return")
         time.sleep(1.0)
 
-    # 3. verify the chat really is with that person before typing anything
+    # 3. verify the chat really is with that person
     box = axui.message_box(app)
     shown = re.sub(r"(?i)^message\s+@?", "", box["name"]).strip() if box else ""
     if not box or not _same_person(contact, shown):
         return {"success": False,
                 "message": f"[-] I couldn't open a chat with {contact} in {app}"
-                           + (f" (the open chat is {shown})" if shown else "") + ". Nothing was typed."}
+                           + (f" (the open chat is {shown})" if shown else "") + "."}
+    return {"success": True, "contact": shown or contact, "box": box, "message": f"Opened the chat with {shown or contact}."}
+
+
+def prepare_chat_message(app: str, contact: str, text: str) -> dict:
+    """Open the conversation, verify it, type the text — do NOT send."""
+    from core import axui
+    from actuators.system_control import type_text
+    if not (app and contact and text):
+        missing = [n for n, v in (("app", app), ("who to message", contact), ("what to say", text)) if not v]
+        return {"success": False, "message": f"[-] I need {' and '.join(missing)}."}
+    opened = open_chat(app, contact)
+    if not opened["success"]:
+        return {"success": False, "message": opened["message"] + " Nothing was typed."}
+    box, shown = opened["box"], opened["contact"]
     axui.focus(box)
     time.sleep(0.2)
     type_text(text)                     # exact text, no Enter
     return {"success": True, "app": app, "contact": shown or contact, "text": text,
             "message": f"Typed '{text}' for {shown or contact} in {app} — waiting for your OK to send."}
+
+
+_UI_NOISE = re.compile(r"^(today|yesterday|new|edited|reply|more|add reaction|\d{1,2}:\d{2}( ?[ap]m)?|"
+                       r"\d{1,2}/\d{1,2}/\d{2,4}.*|jump to present|new messages?|message @.*)$", re.I)
+
+
+def chat_lines(texts: list[str], contact: str, keep: int = 25) -> list[str]:
+    """The conversation part of a chat window's texts: drop UI labels,
+    keep the last `keep` lines (newest last)."""
+    lines = [t for t in texts if len(t) > 1 and not _UI_NOISE.match(t.strip())]
+    # the message list usually starts at the contact's name (header / first message)
+    for i in range(len(lines) - 1, -1, -1):
+        if _same_person(contact, lines[i]) and i < len(lines) - 1:
+            lines = lines[i:]
+            break
+    return lines[-keep:]
+
+
+def read_chat_messages(app: str = "", contact: str = "", count: int = 15) -> dict:
+    """Open the chat with `contact` in `app` and read the latest messages
+    (read-only — nothing is typed or sent)."""
+    from core import axui
+    app = app or next((a for a in CHAT_APPS if axui.pid_of(a)), "")
+    if not app:
+        return {"success": False, "message": "[-] Which app — Discord, Slack, WhatsApp?"}
+    if not contact:
+        return _chat_overview(app)
+    opened = open_chat(app, contact)
+    if not opened["success"]:
+        return {"success": False, "message": opened["message"]}
+    time.sleep(0.6)
+    lines = chat_lines(axui.texts(app), opened["contact"], keep=max(5, min(int(count or 15), 40)))
+    if not lines:
+        return {"success": False, "message": f"[-] I opened the chat with {opened['contact']} but couldn't read any messages."}
+    return {"success": True, "app": app, "contact": opened["contact"], "messages": lines,
+            "message": f"Latest messages in the chat with {opened['contact']} on {app}:\n" + "\n".join(lines)}
+
+
+_UI_WORDS = {"search", "chats", "chat", "archived", "filter", "all", "unread", "favourites", "favorites", "groups", "calls",
+             "status", "settings", "new chat", "communities", "channels", "updates", "starred", "contacts", "whatsapp",
+             "discord", "slack", "telegram", "messages", "direct messages", "friends", "home", "servers", "inbox", "today", "yesterday"}
+
+
+def _chat_overview(app: str) -> dict:
+    """"Check my WhatsApp messages" — no one named: open the app and read the
+    chat list (names, last messages, unread counts).  Read-only."""
+    from core import axui
+    from actuators.system_control import open_application
+    open_application(app)
+    time.sleep(1.2)                      # let the window draw its chat list
+    seen, lines = set(), []
+    for t in axui.texts(app):
+        t = " ".join(str(t).split())
+        if len(t) < 2 or t.lower() in _UI_WORDS or t in seen or len(t) > 160:
+            continue
+        seen.add(t)
+        lines.append(t)
+        if len(lines) >= 24:
+            break
+    if not lines:
+        return {"success": False, "message": f"[-] I opened {app} but couldn't read its chat list — is Accessibility on for DEMASCAS?"}
+    unread = [l for l in lines if "unread" in l.lower()]
+    head = f"{len(unread)} chat{'s' if len(unread) != 1 else ''} with unread messages. " if unread else ""
+    return {"success": True, "app": app, "messages": lines,
+            "message": f"{head}Your recent {app} chats:\n" + "\n".join(lines[:12])}
 
 
 def deliver_chat_message(app: str, contact: str, text: str) -> dict:
@@ -173,8 +250,8 @@ def deliver_chat_message(app: str, contact: str, text: str) -> dict:
             return {"success": False, "message": f"[-] The open chat changed to {shown}; I didn't send it."}
         if box:
             axui.focus(box)
-    except Exception:
-        pass
+    except Exception as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
     press_keyboard_shortcut("return")
     return {"success": True, "message": f"Sent '{text}' to {contact} on {app}."}
 

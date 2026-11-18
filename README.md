@@ -4,7 +4,7 @@
 
 A fully local, privacy-first, autonomous OS-level AI agent for macOS — like JARVIS for your Mac. DEMASCAS can **see** the screen via VLM-powered vision + accessibility trees, **hear** commands via local speech-to-text, **browse the web** autonomously via Brave Browser JS injection, and **execute** actions via native AppleScript function calling. All processing runs 100 % on-device — no data ever leaves your machine.
 
-**Architecture:** Polyglot C++ / Python — bare-metal C++ daemon for the hot path (audio → STT → LLM → TTS) with a lightweight Python tool server for OS actions, browser automation, memory, and learning.
+**Architecture:** Rust / Python — the Rust daemon (`core-rs/`) runs the hot path (audio → STT → brain → LLM → TTS) with a lightweight Python tool server for OS actions, browser automation, memory, and learning. The old C++ daemon has been retired.
 
 **Bring your own model:** DEMASCAS ships as a tool/harness **without an LLM**. It profiles your laptop, detects the local runtime you already use (Ollama, LM Studio, llama.cpp, MLX, Jan or any OpenAI-compatible server), recommends a model that fits your RAM/GPU so the machine never lags or overheats, benchmarks it, and plugs it in — `python main.py setup`.
 
@@ -12,7 +12,40 @@ A fully local, privacy-first, autonomous OS-level AI agent for macOS — like JA
 
 ---
 
-## Latest Update — Plug-in Local LLM (Phase 0 of the harness)
+## Latest Update — the Rust core (`core-rs/`)
+
+The ears, voice and brain now live in Rust; this is the only daemon. The Python tool server stays as it is.
+
+> Sections further down that describe routing paths, `config.hpp` or the CONFIRMING state come from the retired C++ daemon; the Rust brain is described by the table below and by `docs/test_report_2026-11-17.md`.
+
+| Crate | Does |
+|---|---|
+| `bridge` | Typed client for the tool server (all endpoints; never panics, degrades instead) |
+| `llm` | Streaming client for any OpenAI-compatible local model: sentence streaming, 20 s / 45 s deadlines, loop cut, cancel |
+| `brain` | **One** router + **one** tool loop + policy. Reflexes run without the model (open/close/switch real apps, shortcuts, time, date, weather, "remember…", timers, open/delete a named file); questions get read-only tools; pending confirmations are always asked aloud |
+| `events` | Timers, alarms, reminders — exact, saved in `~/.demascas/timers.json`, spoken when due |
+| `audio` | Mic + speaker (cpal), speexdsp echo cancellation, barge-in detection |
+| `sherpa` | Kokoro voice + Silero speech detector (bindings generated from the shipped sherpa-onnx headers) |
+| `speech` | whisper.cpp (Metal) with recogniser confidence |
+| `voice` | Kokoro on a worker thread, streamed to the speaker; interrupt / hold |
+| `demascasd` | The daemon: one state machine for voice mode and the exam's text mode |
+
+```bash
+./scripts/build.sh          # builds core-rs (needs Rust: https://rustup.rs)
+./scripts/run.sh            # LLM check + tool server + the Rust daemon
+cd core-rs && cargo test    # unit tests (no audio is played, no mic is opened)
+```
+
+**The JARVIS exam** (`scripts/exam.py`, `tests/exam/*.yaml`): 146 real requests typed into the daemon with the real model, every tool call faked so nothing on the computer is touched. Results per run are appended to `docs/exam_history.md`:
+
+```bash
+../venv/bin/python scripts/exam.py --target rust                     # every exam file
+../venv/bin/python scripts/exam.py --target rust --files t3_intelligent # one file
+```
+
+---
+
+## Plug-in Local LLM (Phase 0 of the harness)
 
 DEMASCAS no longer ships or assumes a model:
 
@@ -188,7 +221,7 @@ Fourth state in the state machine: `SLEEPING → LISTENING → PROCESSING → CO
 
 - 🎤 **Voice loop with barge-in** — Interrupt DEMASCAS while it is speaking, streaming TTS, energy-based VAD
 - 🧠 **Bring-your-own local LLM** — any OpenAI-compatible runtime (Ollama, LM Studio, llama.cpp, MLX, Jan); `python main.py setup` picks a model that fits your laptop
-- 👁️ **Vision-language model** — MLX `Qwen2.5-VL-3B-Instruct-4bit` (~1.6 GB) on port 8082; screenshot-based screen understanding
+- 👁️ **Vision-language model** — the same Gemma 4 E2B that answers text: when `llm.vision` names the LLM's own model and URL, `scripts/run.sh` serves both from one `mlx-vlm` process (one copy of the weights, ~4 GB). Other setups can still run a separate vision server (e.g. Qwen2.5-VL on port 8082)
 - 🗣️ **Neural TTS** — Kokoro 82M via sherpa-onnx (native arm64); sentence-queued streaming to PortAudio
 - 🖥️ **Screen awareness** — Dual mode: macOS accessibility trees + VLM screenshot analysis
 - 🛠️ **97 OS-level tools** — Click, type, wait, clipboard, right-click, switch tabs, open apps/URLs, browse the web, create/delete files, vision queries, compose/read email, smart reply, web research, contact extraction, full browser automation, autonomous web agent
@@ -272,7 +305,7 @@ DEMASCAS doesn't include a model. Run the guided setup — it checks your hardwa
 ```bash
 python main.py setup            # interactive
 python main.py setup --yes      # accept the recommended installed model
-python main.py setup --url http://127.0.0.1:11434 --model qwen2.5:3b   # explicit
+python main.py setup --url http://127.0.0.1:11434 --model gemma4:e2b   # explicit
 python main.py doctor --bench   # check it any time
 ```
 
@@ -280,13 +313,13 @@ Typical recommendations (balanced mode, latency-first):
 
 | Laptop | Model budget | Suggested |
 |---|---|---|
-| 8 GB Apple Silicon | 3.2 GB | Qwen2.5 3B (MLX or Ollama) |
+| 8 GB Apple Silicon | 3.2 GB | Gemma 4 E2B (MLX or Ollama) |
 | 16–18 GB Apple Silicon | 6–7 GB | Qwen2.5 7B |
 | NVIDIA 8 GB VRAM | 7.2 GB | Qwen2.5 7B (Ollama) |
-| CPU-only (Intel Mac, most Windows/Linux laptops) | capped at ~3B | Qwen2.5 3B |
+| CPU-only (Intel Mac, most Windows/Linux laptops) | capped at ~3B | Gemma 4 E2B |
 | 4 GB machine | 1.6 GB | Qwen2.5 1.5B |
 
-No runtime yet? The setup prints exact install steps — e.g. Ollama (`brew install ollama` / `winget install Ollama.Ollama` / `curl -fsSL https://ollama.com/install.sh | sh`, then `ollama pull qwen2.5:3b`) or, on Apple Silicon, MLX (`pip install mlx-lm`; `scripts/run.sh` then starts the MLX server for you).
+No runtime yet? The setup prints exact install steps — e.g. Ollama (`brew install ollama` / `winget install Ollama.Ollama` / `curl -fsSL https://ollama.com/install.sh | sh`, then `ollama pull gemma4:e2b`) or, on Apple Silicon, MLX (`pip install mlx-lm`; `scripts/run.sh` then starts the MLX server for you).
 
 On **Arch Linux**, install Ollama from the official repos. Pick the package for your GPU, start the service, then pull a model:
 
@@ -295,13 +328,13 @@ sudo pacman -S ollama          # CPU only
 sudo pacman -S ollama-cuda     # NVIDIA GPU (e.g. RTX 5060)
 sudo pacman -S ollama-rocm     # AMD GPU
 sudo systemctl enable --now ollama
-ollama pull qwen2.5:7b         # 8 GB VRAM; use qwen2.5:3b on CPU-only machines
+ollama pull qwen2.5:7b         # 8 GB VRAM; use gemma4:e2b on CPU-only machines
 python main.py setup --yes
 ```
 
 > **Context window:** DEMASCAS's tool prompt needs ≥ 4096 tokens. Ollama's default is 4096; 8192 is better for long tasks (`OLLAMA_CONTEXT_LENGTH=8192`). `setup`/`doctor` warn if yours is smaller.
 
-### 4. Build the C++ daemon
+### 4. Build the Rust daemon
 
 The build script handles everything — dependencies, model downloads, and compilation — on macOS and Linux:
 
@@ -313,18 +346,18 @@ chmod +x scripts/build.sh scripts/run.sh
 On Arch it asks for your `sudo` password once, to install any missing packages with `pacman -S --needed`.
 
 This will:
-1. Detect the system and install missing CMake, pkg-config, PortAudio, speexdsp (and on Linux: `base-devel`, `curl`, `lsof`) via Homebrew / pacman / apt / dnf
-2. Download whisper GGML models (~75 MB tiny + ~147 MB base) to `daemon/models/`
+1. Detect the system and install missing CMake (whisper-rs compiles whisper.cpp with it), pkg-config, speexdsp (and on Linux: `base-devel`, `curl`, `lsof`) via Homebrew / pacman / apt / dnf, and check that Rust is installed
+2. Download whisper GGML models (~75 MB tiny + ~147 MB base) to `models/`
 3. Download the sherpa-onnx pre-built library for your system (macOS universal2, Linux x86\_64 or aarch64)
-4. Download Kokoro-en-v0\_19 neural TTS model (~335 MB) and the Silero speech detector (644 KB) to `daemon/models/`
+4. Download Kokoro-en-v0\_19 neural TTS model (~335 MB) and the Silero speech detector (644 KB) to `models/`
 5. Create `../venv` if needed and install `requirements.txt` into it
-6. Compile the C++ daemon via CMake (Release; arm64 on macOS, native on Linux)
+6. Build the Rust daemon (`cargo build --release -p demascasd`)
 
 On success you'll see:
 
 ```
 ✅  Build complete!
-Binary:  daemon/build/demascas_daemon
+Binary:  core-rs/target/release/demascasd
 ```
 
 ---
@@ -342,7 +375,7 @@ docker compose up --build tool-server
 ```
 
 - The port is published on **`127.0.0.1:5001` only** — the server has no authentication, so it must never be reachable from your network.
-- The container reaches your LLM runtime on the host through `host.docker.internal`. Tell it which model to use: `DEMASCAS_LLM_MODEL=qwen2.5:3b docker compose up --build tool-server` (override `DEMASCAS_LLM_URL` for non-Ollama runtimes). On Linux the runtime must listen on a non-loopback address (e.g. `OLLAMA_HOST=0.0.0.0`).
+- The container reaches your LLM runtime on the host through `host.docker.internal`. Tell it which model to use: `DEMASCAS_LLM_MODEL=gemma4:e2b docker compose up --build tool-server` (override `DEMASCAS_LLM_URL` for non-Ollama runtimes). On Linux the runtime must listen on a non-loopback address (e.g. `OLLAMA_HOST=0.0.0.0`).
 - Persistent data lives in the `demascas-home` volume at `/home/demascas/.demascas`.
 - `./scripts/run.sh` detects a tool server already listening on :5001 and reuses it.
 
@@ -362,7 +395,7 @@ docker compose up --build tool-server
 
 ## Running DEMASCAS
 
-DEMASCAS runs as **three processes** — an MLX text server, a Python tool server, and a C++ daemon — plus an **optional** MLX vision server you start manually (it is off by default to save RAM on 8 GB Macs).
+DEMASCAS runs as **three processes** — an MLX text server, a Python tool server, and the Rust daemon — plus an **optional** MLX vision server you start manually (it is off by default to save RAM on 8 GB Macs).
 
 ### Quick Start (One Command)
 
@@ -377,24 +410,20 @@ source ../venv/bin/activate
 The run script starts:
 1. **Your plugged-in LLM** — checked for reachability; if you chose MLX it is started automatically (waits up to `MLX_STARTUP_TIMEOUT`=300 s on the first run while the model downloads). Ollama / LM Studio / llama.cpp run as their own apps/services. With no model configured, DEMASCAS still runs shortcuts and non-LLM actions and tells you to run setup.
 2. **Python tool server** on `localhost:5001` — 97 tools + MCP + learning (reused if already running)
-3. **C++ daemon** in foreground — audio → whisper.cpp → your LLM → Kokoro TTS
+3. **The Rust daemon** in foreground — audio → whisper → the brain → your LLM → Kokoro TTS
 
-The **vision server** (Qwen2.5-VL-3B, port 8082) is not started automatically; run `python scripts/start_vlm_server.py` in another terminal if you want screenshot-based vision.
+**Vision** comes from the LLM itself when `~/.demascas/config.json` has `"vision": {"chat_url": <same as llm.chat_url>, "model": <same as llm.model>}` (Gemma 4 E2B; needs `pip install mlx-vlm`) — `run.sh` then starts one `mlx-vlm` server for text and screenshots. A separate vision model (Qwen2.5-VL-3B, port 8082) is not started automatically; run `python scripts/start_vlm_server.py` for that.
 
 ```
 [*] Checking your local LLM...
 [✓] LLM runtime reachable.
 [*] VLM server disabled (lazy-load mode for 8GB RAM). Start manually if needed.
 [*] Starting Python tool server (localhost:5001)...
-[*] Starting C++ daemon...
+[✓] Tool server ready.
 
-╔══════════════════════════════════════════╗
-║   DEMASCAS — Bare-Metal C++ Daemon       ║
-║   Plug-in local LLM • Kokoro TTS         ║
-╚══════════════════════════════════════════╝
-
-[✓] Microphone opened (16 kHz mono, PortAudio)
-[✓] Whisper models loaded
+════════════════════════════════════════
+  DEMASCAS — Rust daemon
+════════════════════════════════════════
 
 [*] DEMASCAS is ready.  Say "demascas" to activate!
 ```
@@ -411,7 +440,8 @@ If you prefer to run the processes separately (useful for debugging):
 
 ```bash
 ollama serve                         # Ollama (usually already running as an app/service)
-python -m mlx_lm server --model mlx-community/Qwen2.5-3B-Instruct-4bit --port 8081   # MLX
+python -m mlx_lm server --model mlx-community/gemma-4-e2b-it-4bit --port 8081 \
+    --chat-template-args '{"enable_thinking":false}'   # MLX (thinking must stay off)
 ```
 
 **Terminal 2 — MLX vision server (optional, off by default):**
@@ -438,13 +468,12 @@ python main.py
  * Running on http://127.0.0.1:5001
 ```
 
-**Terminal 4 — C++ daemon (voice engine):**
+**Terminal 4 — the Rust daemon (voice engine):**
 
 ```bash
-cd ~/Desktop/OS_RAG/DEMASCAS/daemon
-export DYLD_LIBRARY_PATH="$PWD/models/sherpa-onnx/lib:${DYLD_LIBRARY_PATH:-}"   # macOS
-export LD_LIBRARY_PATH="$PWD/models/sherpa-onnx/lib:${LD_LIBRARY_PATH:-}"       # Linux (Arch)
-./build/demascas_daemon
+cd ~/Desktop/OS_RAG/DEMASCAS
+export DEMASCAS_MODELS="$PWD/models"
+./core-rs/target/release/demascasd
 ```
 
 On Arch, if the daemon can't open the microphone, check that PipeWire's audio server is running (`systemctl --user status pipewire pipewire-pulse`). Install `pipewire-alsa` or `pipewire-pulse` if PortAudio lists no input devices.
@@ -1042,7 +1071,7 @@ The model, endpoint and context window are **not** compile-time settings — the
 | `SESSION_MAX_TURNS` | `6` | Turns persisted to `~/.demascas/session.json` (0600) |
 | `WHISPER_PROMPT` | *(vocabulary hint)* | Expected vocabulary to reduce hallucinations |
 
-After changing config, rebuild with `./scripts/build.sh` (or `cmake --build daemon/build`).
+After changing config, rebuild with `./scripts/build.sh` (or `cd core-rs && cargo build --release`).
 
 ---
 
@@ -1122,7 +1151,7 @@ Measured on an M1 / 8 GB (Python + C++ components; LLM time depends on the model
 | **PortAudio not found** | `brew install portaudio` |
 | **Whisper models missing** | `./scripts/build.sh` auto-downloads them |
 | **Kokoro model missing** | `./scripts/build.sh` auto-downloads it (~335 MB) |
-| **sherpa-onnx dylib error** | Ensure `daemon/models/sherpa-onnx/lib/` exists; re-run `./scripts/build.sh` |
+| **sherpa-onnx dylib error** | Ensure `models/sherpa-onnx/lib/` exists; re-run `./scripts/build.sh` |
 | **TTS falls back to `say`** | Check that `USE_KOKORO = true` in `config.hpp` and model files are present |
 | **"Permission denied" on scripts** | `chmod +x scripts/build.sh scripts/run.sh` |
 | **Wrong app closed** | DEMASCAS distinguishes "close window" (⌘W) from "quit app" (⌘Q) |

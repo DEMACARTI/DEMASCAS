@@ -1,0 +1,22 @@
+[package]
+name = "demascasd"
+description = "The DEMASCAS daemon: listening, speaking, and the conversation state machine"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+bridge = { path = "../bridge" }
+llm = { path = "../llm" }
+brain = { path = "../brain" }
+events = { path = "../events" }
+audio = { path = "../audio" }
+sherpa = { path = "../sherpa" }
+speech = { path = "../speech" }
+voice = { path = "../voice" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "net"] }
+tokio-util.workspace = true
+
+[dev-dependencies]

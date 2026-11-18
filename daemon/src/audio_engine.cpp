@@ -4,6 +4,7 @@
  */
 
 #include "audio_engine.hpp"
+#include "textio.hpp"
 #include "vad.hpp"
 #include "config.hpp"
 
@@ -35,11 +36,12 @@ int AudioEngine::pa_callback(const void* in, void* /*out*/,
 
 // ── Lifecycle ───────────────────────────────────────────────────────
 
-AudioEngine::AudioEngine()  { Pa_Initialize(); }
+AudioEngine::AudioEngine()  { if (!textio::enabled()) Pa_Initialize(); }
 
-AudioEngine::~AudioEngine() { stop(); Pa_Terminate(); }
+AudioEngine::~AudioEngine() { if (textio::enabled()) return; stop(); Pa_Terminate(); }
 
 void AudioEngine::list_devices() {
+    if (textio::enabled()) return;
     int count = Pa_GetDeviceCount();
     if (count <= 0) {
         std::cout << "[*] No audio devices found.\n";
@@ -58,6 +60,7 @@ void AudioEngine::list_devices() {
 }
 
 bool AudioEngine::start(int device_index) {
+    if (textio::enabled()) return true;   // typed lines instead of a microphone
     if (active_) return true;
 
     PaError err;
@@ -123,6 +126,7 @@ bool AudioEngine::start(int device_index) {
 }
 
 void AudioEngine::stop() {
+    if (textio::enabled()) return;
     if (!active_) return;
     Pa_StopStream(stream_);
     Pa_CloseStream(stream_);
@@ -131,12 +135,14 @@ void AudioEngine::stop() {
 }
 
 bool AudioEngine::is_stream_healthy() const {
+    if (textio::enabled()) return true;
     if (!active_ || stream_ == nullptr) return false;
     PaError err = Pa_IsStreamActive(stream_);
     return err == 1;  // 1 = active, 0 = stopped, <0 = error
 }
 
 bool AudioEngine::reinit_on_wake(int device_index) {
+    if (textio::enabled()) return true;
     std::cout << "[AUDIO] Reinitializing after sleep/wake...\n";
 
     // Tear down everything
@@ -178,6 +184,7 @@ bool AudioEngine::reinit_on_wake(int device_index) {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 std::vector<float> AudioEngine::drain_timed(clk::time_point& last_sample_time) {
+    if (textio::enabled()) { last_sample_time = clk::now(); return {}; }
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<float> out;
     out.swap(ring_);
@@ -187,6 +194,7 @@ std::vector<float> AudioEngine::drain_timed(clk::time_point& last_sample_time) {
 }
 
 std::vector<float> AudioEngine::drain() {
+    if (textio::enabled()) return {};
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<float> out;
     out.swap(ring_);
@@ -215,6 +223,7 @@ std::vector<float> AudioEngine::capture_chunk(float seconds) {
 }
 
 std::vector<float> AudioEngine::collect(float seconds) {
+    if (textio::enabled()) return {};
     const size_t need = static_cast<size_t>(seconds * cfg::SAMPLE_RATE);
     auto deadline = clk::now() + std::chrono::milliseconds(
         static_cast<int>(seconds * 2000) + 500);   // safety if the stream stalls
@@ -232,6 +241,16 @@ std::vector<float> AudioEngine::capture_utterance(
         float timeout_sec, float silence_sec, const std::vector<float>& already_spoken,
         const std::function<bool()>& abort_before_speech,
         const std::function<void()>& on_speech_start) {
+    if (textio::enabled()) {
+        // The next typed line is the "utterance"; its text is picked up by
+        // the recogniser's text mode.  A finished task / pending speech
+        // returns first, exactly like the microphone path.
+        if (abort_before_speech && abort_before_speech()) return {};
+        std::string line;
+        if (!textio::read_line("LISTENING", line) || line.empty()) return {};
+        if (on_speech_start) on_speech_start();
+        return std::vector<float>(cfg::SAMPLE_RATE, 0.05f);   // 1 s placeholder
+    }
     drain();  // start clean
 
     auto deadline = clk::now()

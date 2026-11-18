@@ -1,0 +1,20 @@
+# Word for word from the first live voice session on the Rust daemon (2026-11-16).
+- {id: live-time-and-weather, cat: live, say: "what time is it, and what's the weather in Delhi?", expect: {tools: [get_weather], say_any: ['\d{1,2}:\d{2}'], say: ['24|clear'], max_s: 6}}
+- {id: live-this-card, cat: live, conf: 0.54, say: "open this card.", expect: {tools: [open_application], args: {open_application: 'discord'}, only: true}}
+- {id: live-send-fragment, cat: live, conf: 0.72, say: "send high, do,", expect: {no_action: true, asks: true}}
+- {id: live-garbled-skill, cat: live, conf: 0.58, say: "I am going to get the message, Discord,", expect: {no_action: true}}
+- id: live-discord-messages
+  cat: live
+  turns:
+    - {say: "open Discord and check what messages, Krishmithal has sent me.", expect: {tools: [open_application, read_chat_messages], args: {read_chat_messages: 'krishmithal'}, say_any: ['tonight', 'notes'], say_not: ['^done']}}
+- id: live-resume-followup
+  cat: live
+  world: {stubs: {find_file: {"success": true, "found": false, "matches": [], "count": 0, "message": "No files matching."}}}
+  turns:
+    - {say: "find my resume", expect: {tools: [find_file], asks: true, no_action: true}}
+    - {say: "the file name is, Daksh, underscore, Ratthor, underscore, CV.", wake: false, expect: {tools: [find_file], args: {find_file: 'daksh_ratthor_cv'}, no_action: true}}
+- id: live-show-it
+  cat: live
+  turns:
+    - {say: "find my resume", expect: {tools: [find_file], say_any: ['resume']}}
+    - {say: "show it to me.", wake: false, expect: {tools: [open_file], only: true}}

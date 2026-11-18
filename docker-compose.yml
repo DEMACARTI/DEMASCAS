@@ -13,7 +13,7 @@ services:
       DEMASCAS_SKIP_MCP_BOOT: "1"
       # Your LLM runtime runs on the host (DEMASCAS ships without a model).
       # Set DEMASCAS_LLM_MODEL in your shell first, e.g.:
-      #   DEMASCAS_LLM_MODEL=qwen2.5:3b docker compose up --build tool-server
+      #   DEMASCAS_LLM_MODEL=gemma4:e2b docker compose up --build tool-server
       DEMASCAS_LLM_URL: ${DEMASCAS_LLM_URL:-http://host.docker.internal:11434}
       DEMASCAS_LLM_MODEL: ${DEMASCAS_LLM_MODEL:-}
       DEMASCAS_LLM_RUNTIME: ${DEMASCAS_LLM_RUNTIME:-ollama}

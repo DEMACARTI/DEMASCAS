@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DEMASCAS</title>
+<style>
+:root { --ph: #9ad8ff; --line: 154,216,255; --bg0: #0b1033; --bg1: #02030b; --hold: #ff9a4d; --dmx: #5cffb0; --you: #d5c8ff;
+        --neb1: #6a2bd9; --neb2: #1f5fd6; --neb3: #c2318f; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg1); overflow: hidden; -webkit-user-select: none; user-select: none; cursor: default; }
+body { font: 14px/1.85 "SF Mono", Menlo, Monaco, monospace; color: var(--ph); }
+#crt { position: relative; height: 100%; padding: 26px 34px 18px; display: grid; grid-template-columns: 1fr 112px; grid-template-rows: auto 70px 1fr auto; column-gap: 24px; row-gap: 14px;
+       background: radial-gradient(ellipse at 50% 30%, var(--bg0) 0%, var(--bg1) 75%); animation: flicker 6s linear infinite; -webkit-app-region: drag; overflow: hidden; }
+#space { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+.neb { position: absolute; border-radius: 50%; filter: blur(70px); opacity: .38; }
+.neb.a { width: 460px; height: 320px; left: -80px; top: -60px; background: var(--neb1); animation: drift 22s ease-in-out infinite; }
+.neb.b { width: 520px; height: 360px; right: -140px; bottom: -120px; background: var(--neb2); animation: drift 28s ease-in-out infinite reverse; }
+.neb.c { width: 300px; height: 220px; right: 22%; top: 18%; background: var(--neb3); opacity: .18; animation: drift 34s ease-in-out infinite; }
+.star { position: absolute; border-radius: 50%; background: #fff; animation: twinkle var(--d, 3s) ease-in-out infinite; }
+@keyframes drift { 0%,100% { transform: translate(0,0) scale(1); } 50% { transform: translate(60px,30px) scale(1.15); } }
+@keyframes twinkle { 0%,100% { opacity: .15; } 50% { opacity: .95; } }
+#crt > header, #crt > #scope, #crt > #meters, #crt > #log, #crt > footer { position: relative; z-index: 1; }
+#crt::before { content: ""; position: absolute; inset: 0; z-index: 3; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px); }
+#crt::after { content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none; box-shadow: inset 0 0 160px rgba(0,0,8,.95); }
+.scan { position: absolute; left: 0; right: 0; top: -70px; height: 70px; z-index: 3; pointer-events: none; background: linear-gradient(180deg, transparent, rgba(var(--line),.07), transparent); animation: scan 7s linear infinite; }
+@keyframes flicker { 0%,100%{opacity:.97} 48%{opacity:1} 50%{opacity:.88} 52%{opacity:1} }
+@keyframes scan { to { transform: translateY(110vh); } }
+@keyframes glitch { 0%,86%,100%{filter:drop-shadow(0 0 12px rgba(150,120,255,.75));transform:none} 88%{filter:drop-shadow(-4px 0 #ff4fd8) drop-shadow(4px 0 #4fe3ff);transform:translateX(2px)} 90%{filter:drop-shadow(3px 0 #ff4fd8) drop-shadow(-3px 0 #4fe3ff);transform:translateX(-3px) skewX(-6deg)} 92%{filter:drop-shadow(0 0 12px rgba(150,120,255,.75));transform:none} }
+@keyframes ping { 0%{transform:scale(.6);opacity:1} 100%{transform:scale(2.4);opacity:0} }
+@keyframes blink { 50% { opacity: 0; } }
+@keyframes fadein { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+
+header { grid-column: 1 / 3; display: flex; justify-content: space-between; align-items: center; }
+#title { font-size: 46px; font-weight: 700; letter-spacing: 10px; line-height: 1; animation: glitch 4.2s steps(1) infinite;
+         background: linear-gradient(90deg, #9ad8ff 0%, #b69bff 45%, #ff8ad8 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+#state { display: flex; align-items: center; gap: 10px; font-size: 12px; letter-spacing: 1px; }
+.dot { position: relative; width: 12px; height: 12px; }
+.dot i { position: absolute; inset: 0; border-radius: 50%; border: 2px solid var(--c, #ff3b3b); animation: ping 1.6s ease-out infinite; }
+.dot b { position: absolute; inset: 2px; border-radius: 50%; background: var(--c, #ff3b3b); box-shadow: 0 0 10px var(--c, #ff3b3b); }
+
+#scope { grid-column: 1 / 2; border: 1px solid rgba(var(--line),.28); background: rgba(20,30,80,.25); position: relative; }
+#scope canvas { width: 100%; height: 100%; display: block; }
+
+#meters { grid-column: 2 / 3; grid-row: 2 / 4; display: flex; flex-direction: column; align-items: center; gap: 8px; border: 1px solid rgba(var(--line),.28); background: rgba(20,30,80,.25); padding: 12px 0; }
+#meters .cols { display: flex; gap: 6px; flex: 1; }
+#meters .col { display: flex; flex-direction: column-reverse; gap: 3px; }
+#meters .seg { width: 20px; flex: 1; min-height: 6px; border-radius: 2px; opacity: .12; transition: opacity .06s; }
+#meters .seg.on { opacity: 1; }
+#meters small { font-size: 11px; letter-spacing: 2px; }
+
+#log { grid-column: 1 / 2; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; text-shadow: 0 0 6px rgba(var(--line),.45); }
+.row { display: flex; gap: 10px; animation: fadein .25s ease-out; }
+.row .k { flex: 0 0 auto; }
+.row .lead { flex: 0 0 170px; overflow: hidden; white-space: nowrap; }
+.row .lead::after { content: " ........................................................"; opacity: .55; }
+.row .t { flex: 1; min-width: 0; }
+.row.hold { color: var(--hold); text-shadow: 0 0 8px var(--hold); }
+.row.dim { opacity: .65; }
+/* the conversation: DEMASCAS on the left in green, you on the right */
+.row.dmx { color: var(--dmx); text-shadow: 0 0 8px rgba(92,255,176,.55); }
+.row.dmx .t { max-width: 78%; }
+.row.you { justify-content: flex-end; text-align: right; color: var(--you); text-shadow: 0 0 8px rgba(213,200,255,.45); }
+.row.you .t { flex: 0 1 auto; max-width: 78%; }
+.row.you .lead { flex: 0 0 auto; }
+.row.you .lead::after { content: ""; }
+.row.you .lead::before { content: "......... "; opacity: .55; }
+.row.sys { opacity: .72; font-size: 13px; }
+#ask { display: none; gap: 14px; margin-top: 10px; -webkit-app-region: no-drag; }
+#ask.show { display: flex; }
+button { -webkit-app-region: no-drag; min-height: 44px; padding: 0 20px; border: 1px solid var(--ph); background: transparent; color: var(--ph); font: 600 14px "SF Mono", Menlo, monospace; cursor: pointer; }
+button.solid { background: var(--ph); color: #050a24; box-shadow: 0 0 18px rgba(var(--line),.7); }
+button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+footer { grid-column: 1 / 3; display: flex; justify-content: space-between; gap: 16px; font-size: 12px; border-top: 1px dashed rgba(var(--line),.4); padding-top: 10px; align-items: center; }
+#stop { display: none; min-height: 32px; padding: 0 12px; font-size: 12px; border-color: var(--hold); color: var(--hold); }
+#stop.show { display: inline-block; }
+.cursor { animation: blink 1s steps(1) infinite; }
+</style>
+</head>
+<body>
+<div id="crt">
+  <div id="space" aria-hidden="true"><div class="neb a"></div><div class="neb b"></div><div class="neb c"></div></div>
+  <div class="scan" aria-hidden="true"></div>
+  <header>
+    <div id="title">DEMASCAS</div>
+    <div id="state"><span class="dot" aria-hidden="true"><i></i><b></b></span><span id="stateText">STARTING</span></div>
+  </header>
+  <div id="scope" role="img" aria-label="Voice waveform"><canvas id="wave"></canvas></div>
+  <div id="meters" role="img" aria-label="Voice level"><small>VOICE</small><div class="cols" id="cols"></div><small id="db">-∞ dB</small></div>
+  <div id="log" aria-live="polite">
+    <div id="rows"></div>
+    <div id="ask"><button class="solid" id="yes">[ Y ] YES</button><button id="no">[ N ] NO</button></div>
+  </div>
+  <footer>
+    <span id="status">BRAIN … · EYES … · SWAP … · 1ST WORD …</span>
+    <span><button id="stop">■ STOP TASK</button> <span id="ready">READY</span><span class="cursor">█</span></span>
+  </footer>
+</div>
+<script>
+(function () {
+  const space = document.getElementById('space');
+  for (let i = 0; i < 90; i++) {
+    const st = document.createElement('div'); st.className = 'star';
+    const size = Math.random() < 0.12 ? 2.4 : Math.random() < 0.5 ? 1.5 : 1;
+    st.style.cssText = `left:${Math.random() * 100}%;top:${Math.random() * 100}%;width:${size}px;height:${size}px;--d:${(2 + Math.random() * 4).toFixed(1)}s;animation-delay:-${(Math.random() * 5).toFixed(1)}s`;
+    if (size > 2) st.style.boxShadow = '0 0 6px #bcd8ff';
+    space.appendChild(st);
+  }
+  const SEGS = 18, COLS = 3;
+  const cols = document.getElementById('cols'), segs = [];
+  for (let c = 0; c < COLS; c++) {
+    const col = document.createElement('div'); col.className = 'col'; segs.push([]);
+    for (let i = 0; i < SEGS; i++) {
+      const s = document.createElement('div'); s.className = 'seg';
+      const color = i >= 15 ? '#ff5cc8' : i >= 11 ? '#a78bff' : '#5ce1ff';
+      s.style.background = color; s.style.boxShadow = '0 0 8px ' + color;
+      col.appendChild(s); segs[c].push(s);
+    }
+    cols.appendChild(col);
+  }
+  let level = 0, shown = [0, 0, 0], peak = 0;
+  const canvas = document.getElementById('wave'), ctx = canvas.getContext('2d');
+  let phase = 0;
+  function frame() {
+    // meters: left = live, middle = smoothed, right = peak hold
+    shown[0] = level; shown[1] = shown[1] * 0.8 + level * 0.2; peak = Math.max(peak * 0.97, level); shown[2] = peak;
+    for (let c = 0; c < COLS; c++) {
+      const n = Math.round(shown[c] * SEGS);
+      segs[c].forEach((s, i) => s.classList.toggle('on', i < n));
+    }
+    // oscilloscope: amplitude follows the real voice level
+    const w = canvas.width = canvas.clientWidth * 2, h = canvas.height = canvas.clientHeight * 2;
+    const ph = getComputedStyle(document.documentElement).getPropertyValue('--ph').trim();
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = 'rgba(154,216,255,.22)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+    ctx.strokeStyle = ph; ctx.lineWidth = 3; ctx.shadowColor = ph; ctx.shadowBlur = 8; ctx.beginPath();
+    const amp = 4 + shown[1] * h * 0.42;
+    for (let x = 0; x <= w; x += 4) {
+      const t = x / w * Math.PI * 2;
+      const y = h / 2 + Math.sin(t * 9 + phase) * amp * Math.cos(t * 2.3 + phase * .3) + Math.sin(t * 23 + phase * 2) * amp * .18;
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke(); phase += 0.12 + shown[1] * 0.3;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  const rows = document.getElementById('rows'), ask = document.getElementById('ask');
+  function send(cmd) { try { window.webkit.messageHandlers.dmx.postMessage({ cmd }); } catch (e) {} }
+  document.getElementById('yes').onclick = () => send('yes');
+  document.getElementById('no').onclick = () => send('no');
+  document.getElementById('stop').onclick = () => send('stop');
+
+  window.dmx = {
+    level(v) { level = Math.max(0, Math.min(1, v)); document.getElementById('db').textContent = v > 0.01 ? Math.round((v - 1) * 60) + ' dB' : '-∞ dB'; },
+    line(kind, text) {
+      const now = Date.now(), last = rows.lastElementChild;
+      // one reply spoken in several sentences → one line (it arrives sentence by sentence)
+      if (kind === 'DEMASCAS' && last && last.dataset.kind === 'DEMASCAS' && now - Number(last.dataset.at) < 4000) {
+        last.querySelector('.t').textContent += ' ' + text.trim();
+        last.dataset.at = now;
+        return;
+      }
+      const r = document.createElement('div');
+      const cls = { HOLD: ' hold', INFO: ' dim', DEMASCAS: ' dmx', YOU: ' you', TASK: ' sys', ACT: ' sys', WAKE: ' sys' }[kind] || '';
+      r.className = 'row' + cls;
+      r.dataset.kind = kind; r.dataset.at = now;
+      const t = document.createElement('span'); t.className = 't'; t.textContent = text;
+      if (kind === 'YOU') {
+        // right side: "what are you doing right now? ......... ◂ YOU"
+        const lead = document.createElement('span'); lead.className = 'lead'; lead.textContent = '◂ YOU';
+        r.append(t, lead);
+      } else {
+        const k = document.createElement('span'); k.className = 'k'; k.textContent = '>';
+        const lead = document.createElement('span'); lead.className = 'lead'; lead.textContent = kind;
+        r.append(k, lead, t);
+      }
+      rows.appendChild(r);
+      while (rows.children.length > 14) rows.removeChild(rows.firstChild);
+    },
+    confirm(q) { ask.classList.toggle('show', !!q); },
+    task(on) { document.getElementById('stop').classList.toggle('show', !!on); },
+    state(s, color) {
+      document.getElementById('stateText').textContent = s;
+      document.querySelector('.dot').style.setProperty('--c', color || '#ff3b3b');
+      document.getElementById('ready').textContent = s === 'WORKING' ? 'BUSY' : 'READY';
+    },
+    status(s) { document.getElementById('status').textContent = s; },
+    phosphor(c) { document.documentElement.style.setProperty('--ph', c); },
+  };
+  window.dmx.state('STARTING', '#9ad8ff');
+})();
+</script>
+</body>
+</html>

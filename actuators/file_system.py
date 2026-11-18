@@ -5,6 +5,8 @@ and the watchdog-based file observer for automated document processing.
 """
 
 import glob
+import re
+import sys
 import os
 import subprocess
 import time
@@ -19,7 +21,7 @@ from core.utils import resolve_safe_path
 # Configuration
 # ---------------------------------------------------------------------------
 WATCH_DIRECTORY = os.path.expanduser("~/Desktop/DEMASCAS_Inbox")
-OLLAMA_MODEL = "qwen2.5:3b"   # only used if the MLX server is unreachable
+OLLAMA_MODEL = "gemma4:e2b"   # only used if the MLX server is unreachable
 
 
 def _llm_complete(prompt: str, max_tokens: int = 300) -> str:
@@ -183,14 +185,44 @@ def summarize_selected_pdf(file_path: str = "") -> str:
     return _summarize_pdf_text(file_name, text_content)
 
 
-def list_files_in_folder(folder_path: str = "~/Downloads") -> str:
+def read_file_text(file_path: str, max_chars: int = 4000) -> dict:
+    """The text of a document — PDF, Word (.docx), or plain text (.txt, .md, .csv…)."""
+    target = str(resolve_safe_path((file_path or "").strip())) if file_path else ""
+    if not target or not os.path.isfile(target):
+        return {"success": False, "message": f"[-] File not found: {file_path}"}
+    name = os.path.basename(target)
+    low = target.lower()
+    limit = max(500, min(int(max_chars or 4000), 12000))
+    try:
+        if low.endswith(".pdf"):
+            text = _extract_pdf_text(target, max_pages=8, max_chars=limit)
+        elif low.endswith(".docx"):
+            import docx
+            text = "\n".join(p.text for p in docx.Document(target).paragraphs if p.text.strip())
+        elif low.endswith((".txt", ".md", ".csv", ".json", ".py", ".rtf", ".log", ".html", ".xml", ".yaml", ".yml")):
+            with open(target, errors="ignore") as f:
+                text = f.read(limit)
+        else:
+            return {"success": False, "message": f"[-] I can't read {name} yet (only PDF, Word and text files)."}
+    except Exception as e:
+        return {"success": False, "message": f"[-] Couldn't read {name}: {e}"}
+    text = (text or "").strip()[:limit]
+    if not text:
+        return {"success": False, "message": f"[-] {name} has no readable text (it may be scanned images)."}
+    return {"success": True, "file": name, "message": f"{name}:\n{text}"}
+
+
+def list_files_in_folder(folder_path: str = "~/Downloads", extension: str = "") -> str:
     """
     Lists files in a given folder, sorted by modification time (newest first).
-    Returns up to 20 file names with sizes.
+    Returns up to 20 file names with sizes.  Top level only (no subfolders).
 
     Args:
         folder_path: Path to the folder (default: ~/Downloads).
                      Supports ~ for home directory.
+        extension: Only files of this type ("png", ".pdf"); empty = all.
+                   (Used by the daemon's "how many PNG files…" reflex; not in
+                   the model's tool schema, so the cached prompt is unchanged.)
 
     Returns:
         A formatted list of file names, or a failure message.
@@ -202,15 +234,20 @@ def list_files_in_folder(folder_path: str = "~/Downloads") -> str:
         return f"Failed: '{folder_path}' is not a valid folder."
 
     try:
+        ext = "." + extension.lower().lstrip(".") if extension else ""
         entries = []
         for name in os.listdir(expanded):
             full = os.path.join(expanded, name)
+            if name.startswith(".") or (ext and not name.lower().endswith(ext)):
+                continue
             if os.path.isfile(full):
                 size_mb = os.path.getsize(full) / (1024 * 1024)
                 mtime = os.path.getmtime(full)
                 entries.append((name, size_mb, mtime))
 
         if not entries:
+            if ext:
+                return f"Files in {folder_path} (0 total): no {ext[1:].upper()} files."
             return f"The folder '{folder_path}' is empty."
 
         # Sort newest first
@@ -325,6 +362,81 @@ def delete_file(file_path: str) -> str:
 # File search & open
 # ---------------------------------------------------------------------------
 
+_NAME_SPLIT = re.compile(r"[\s_\-.,()]+")
+
+
+def _name_tokens(s: str) -> list[str]:
+    return [t for t in _NAME_SPLIT.split((s or "").lower()) if t]
+
+
+# Words people say for the same kind of file.
+_SYNONYMS = {
+    "resume": ["resume", "cv"], "cv": ["cv", "resume"], "curriculum": ["cv"], "vitae": ["cv"],
+    "presentation": ["presentation", "ppt", "pptx", "slides", "deck"], "slides": ["slides", "ppt", "presentation", "deck"],
+    "photo": ["photo", "img", "image", "pic"], "picture": ["picture", "img", "image", "photo", "pic"],
+}
+# Places the user's own files never are.
+_JUNK_DIR = re.compile(r"/(node_modules|site-packages|\.git|venv|\.venv|__pycache__|build|target|dist|"
+                       r"DerivedData|Pods|\.Trash|Library)/")
+
+
+def _junk(path: str) -> bool:
+    base = os.path.basename(path)
+    return bool(_JUNK_DIR.search(path)) or base.startswith(("~$", ".")) or "/." in path
+
+
+def name_score(query: str, filename: str) -> float:
+    """How well a spoken name matches a file name (0–1).  Words in any order,
+    close spellings and synonyms count: 'daksh ratthor cv' ~ 'Daksh_Rathore_CV.pdf',
+    'resume' ~ 'CV_Daksh.pdf'."""
+    import difflib
+    q = _name_tokens(query)
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    f = _name_tokens(stem)
+    if not q or not f:
+        return 0.0
+    if query.lower().replace(" ", "") in stem.lower().replace("_", "").replace("-", "").replace(" ", ""):
+        return 1.0
+
+    def one(t: str, w: str) -> float:
+        if t == w:
+            return 1.0
+        if len(t) >= 3 and len(w) >= 3 and (w.startswith(t) or t.startswith(w)):
+            return 0.9
+        return difflib.SequenceMatcher(None, t, w).ratio() if len(t) >= 4 else 0.0
+
+    hit = 0.0
+    for t in q:
+        best = max((one(alt, w) for alt in _SYNONYMS.get(t, [t]) for w in f), default=0.0)
+        hit += best if best >= 0.75 else 0.0
+    return hit / len(q)
+
+
+def _spotlight(folder: str, query: str, ext: str | None, limit: int = 300) -> list[str] | None:
+    """Spotlight's index (instant over whole folder trees).  Every spoken word
+    (and its synonyms) is looked up, so one misheard word can't hide the file.
+    None = Spotlight unavailable."""
+    if sys.platform != "darwin":
+        return None
+    toks = [t for t in _name_tokens(query) if len(t) >= 2]
+    words = list(dict.fromkeys(a for t in toks for a in _SYNONYMS.get(t, [t])))[:6]
+    if not words:
+        return None
+    seen: dict[str, None] = {}
+    for w in words:
+        try:
+            out = subprocess.run(["mdfind", "-onlyin", folder, "-name", w], capture_output=True,
+                                 text=True, timeout=3).stdout.splitlines()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for p in out:
+            if not _junk(p) and os.path.isfile(p) and (not ext or p.lower().endswith("." + ext)):
+                seen[p] = None
+        if len(seen) >= limit:
+            break
+    return list(seen)[:limit]
+
+
 def find_file(folder: str, partial_name: str, extension: str = None) -> dict:
     """
     Recursively searches `folder` for files whose name contains `partial_name`.
@@ -379,7 +491,24 @@ def find_file(folder: str, partial_name: str, extension: str = None) -> dict:
         truncated = False
 
         matches = []
-        for root, _dirs, files in os.walk(expanded):
+        # Spotlight first: instant over the whole folder tree (walking the
+        # home folder hit the 5 s cap in a live session and found nothing).
+        if not is_generic:
+            spot = _spotlight(expanded, clean_name, ext_lower)
+            if spot:
+                for p in spot:
+                    sc = name_score(clean_name, os.path.basename(p))
+                    if sc >= 0.6:
+                        try:
+                            size_bytes = os.path.getsize(p)
+                        except OSError:
+                            size_bytes = 0
+                        matches.append({"name": os.path.basename(p), "path": p,
+                                        "size_mb": round(size_bytes / (1024 * 1024), 2), "score": round(sc, 2)})
+        for root, _dirs, files in ([] if matches else os.walk(expanded)):
+            # the home folder's Library is huge and never holds the user's files
+            if os.path.realpath(root) == os.path.realpath(home):
+                _dirs[:] = [d for d in _dirs if d not in ("Library", "Applications") and not d.startswith(".")]
             # Skip hidden directories
             if any(part.startswith(".") for part in root.split(os.sep) if part):
                 continue
@@ -397,10 +526,10 @@ def find_file(folder: str, partial_name: str, extension: str = None) -> dict:
                     if ext_lower and not name_lower.endswith("." + ext_lower):
                         continue
                 else:
-                    # Normal mode: match partial name
-                    if partial_lower not in name_lower:
-                        continue
+                    # Normal mode: the spoken name, forgivingly (any order, close spellings)
                     if ext_lower and not name_lower.endswith("." + ext_lower):
+                        continue
+                    if partial_lower not in name_lower and name_score(partial_lower, fname) < 0.6:
                         continue
 
                 full_path = os.path.join(root, fname)
@@ -420,9 +549,13 @@ def find_file(folder: str, partial_name: str, extension: str = None) -> dict:
 
         # Sort by relevance: exact name match first, then by size descending
         if not is_generic and partial_lower:
+            for m in matches:
+                m.setdefault("score", round(name_score(partial_lower, m["name"]), 2))
             matches.sort(key=lambda m: (
                 0 if partial_lower == m["name"].lower().rsplit(".", 1)[0] else 1,
-                -m["size_mb"]
+                -m["score"],
+                1 if re.search(r"\(\d+\)|copy\b", m["name"], re.I) else 0,   # originals before "name(1)" copies
+                -(os.path.getmtime(m["path"]) if os.path.exists(m["path"]) else 0),
             ))
         else:
             # In generic mode, sort newest-first by modification time

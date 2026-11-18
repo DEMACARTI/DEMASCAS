@@ -94,6 +94,16 @@ class SessionThree(unittest.TestCase):
         self.assertTrue(is_risky_shortcut("cmd+option+esc"))
         self.assertFalse(is_risky_shortcut("cmd+c"))
 
+    def test_spaced_shortcuts_are_guarded_and_pressed_alike(self):
+        # Gemma 4 wrote "command q" (2026-11-17): the guard missed it.
+        from actuators.system_control import _build_key_command, _split_key_sequence, is_risky_shortcut
+        for keys in ("command q", "Command Q", "cmd-q", "command shift q", "command option escape", "command w"):
+            self.assertTrue(is_risky_shortcut(keys), keys)
+        self.assertFalse(is_risky_shortcut("command n"))
+        self.assertEqual(_build_key_command(_split_key_sequence("command q")[0]),
+                         'keystroke "q" using {command down}')
+        self.assertEqual(_split_key_sequence("page down"), ["page down"])   # not modifiers → untouched
+
     def test_menu_path_lists_and_accelerators(self):
         from actuators.app_script import is_risky_menu
         self.assertTrue(is_risky_menu(["&File", "&Close"]))
@@ -105,6 +115,30 @@ class SessionThree(unittest.TestCase):
         self.assertEqual(resolve("Dock")[0], "Dock")          # running process, not "Docker"
         self.assertNotEqual(resolve("Chrome")[0], "Home")      # 0.8 similar, different app
         self.assertEqual(resolve("Google")[0], "")
+
+
+class SendGate(unittest.TestCase):
+    """A Rust-loop test sent a Slack DM via type_text(press_enter=True)."""
+
+    def test_typing_with_enter_into_a_chat_app_needs_a_yes(self):
+        import server.tool_server as ts
+        self.assertTrue(ts._would_send_in_chat_app("type_text", {"app_name": "Slack", "text": "hi", "press_enter": True}))
+        self.assertTrue(ts._would_send_in_chat_app("type_text", {"app_name": "Discord", "text": "hi", "press_enter": "true"}))
+        self.assertFalse(ts._would_send_in_chat_app("type_text", {"app_name": "Slack", "text": "hi"}))
+        self.assertFalse(ts._would_send_in_chat_app("type_text", {"app_name": "Notes", "text": "hi", "press_enter": True}))
+
+    def test_spaced_enter_in_mail_needs_a_yes(self):
+        import server.tool_server as ts
+        for keys in ("command enter", "cmd-return", "command+enter", "enter, cmd+q", "command shift d"):
+            self.assertTrue(ts._would_send_in_chat_app("press_keyboard_shortcut", {"app_name": "Mail", "keys": keys}), keys)
+        self.assertFalse(ts._would_send_in_chat_app("press_keyboard_shortcut", {"app_name": "Mail", "keys": "command n"}))
+        self.assertFalse(ts._would_send_in_chat_app("press_keyboard_shortcut", {"app_name": "Notes", "keys": "command enter"}))
+
+    def test_forgiving_file_names(self):
+        from actuators.file_system import name_score
+        self.assertGreaterEqual(name_score("daksh ratthor cv", "Daksh_Rathore_CV.pdf"), 0.9)
+        self.assertGreaterEqual(name_score("resume", "CV_Daksh.pdf"), 0.9)
+        self.assertEqual(name_score("report", "random.txt"), 0.0)
 
 
 class Vocabulary(unittest.TestCase):

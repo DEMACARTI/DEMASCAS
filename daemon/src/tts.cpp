@@ -12,6 +12,7 @@
  */
 
 #include "tts.hpp"
+#include "textio.hpp"
 #include "aec.hpp"
 #include "config.hpp"
 
@@ -192,6 +193,7 @@ bool TTS::open_output_stream(int sample_rate, bool test_tone) {
 // ── Constructor / Destructor ────────────────────────────────────────
 
 TTS::TTS(int threads) : threads_(threads > 0 ? threads : cfg::KOKORO_THREADS) {
+    if (textio::enabled()) { std::cout << "[✓] TTS: text mode (printed, not played)\n"; return; }
     // Try Kokoro first (if enabled and model files exist)
     if (cfg::USE_KOKORO && init_kokoro()) {
         backend_ = Backend::KOKORO;
@@ -618,6 +620,7 @@ void TTS::speak_one_say(const std::string& text) {
 // ── Public API ──────────────────────────────────────────────────────
 
 void TTS::enqueue(const std::string& text) {
+    if (textio::enabled()) { if (!text.empty()) textio::emit("SAY", text); return; }
     if (text.empty()) return;
     auto pieces = split_sentences(text);
     if (pieces.empty()) return;
@@ -642,6 +645,7 @@ void TTS::speak_async(const std::string& text) {
 }
 
 void TTS::interrupt() {
+    if (textio::enabled()) return;
     // 0. Invalidate everything already synthesized or being synthesized
     //    (including the double-buffer prefetch) so it is never played.
     gen_.fetch_add(1);
@@ -670,10 +674,12 @@ void TTS::interrupt() {
 }
 
 bool TTS::is_playing() const {
+    if (textio::enabled()) return false;
     return playing_;
 }
 
 void TTS::hold(bool on) {
+    if (textio::enabled()) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         held_ = on;
@@ -683,6 +689,7 @@ void TTS::hold(bool on) {
 }
 
 float TTS::playback_level() const {
+    if (textio::enabled()) return 0.0f;
     if (backend_ == Backend::SAY) return playing_ ? -1.0f : 0.0f;
     auto cutoff = std::chrono::steady_clock::now() - std::chrono::milliseconds(400);
     std::lock_guard<std::mutex> lk(lvl_mu_);
@@ -693,6 +700,7 @@ float TTS::playback_level() const {
 }
 
 void TTS::wait_done() {
+    if (textio::enabled()) return;
     while (playing_ && !stop_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -701,6 +709,7 @@ void TTS::wait_done() {
 // ── Sound effects ───────────────────────────────────────────────────
 
 void TTS::play_sound(const std::string& name) {
+    if (textio::enabled()) return;
 #ifdef __APPLE__
     std::string path = "/System/Library/Sounds/" + name + ".aiff";
     const char* player = "afplay";
@@ -725,6 +734,7 @@ void TTS::play_sound(const std::string& name) {
 // ── PortAudio release / reacquire (sleep-wake recovery) ─────────────
 
 void TTS::release_audio() {
+    if (textio::enabled()) return;
     std::lock_guard<std::mutex> lk(pa_mu_);
     if (out_stream_) {
         Pa_AbortStream(out_stream_);
@@ -738,6 +748,7 @@ void TTS::release_audio() {
 }
 
 void TTS::reacquire_audio() {
+    if (textio::enabled()) return;
     if (backend_ != Backend::KOKORO || sample_rate_ <= 0) return;
     std::lock_guard<std::mutex> lk(pa_mu_);
     if (!open_output_stream(sample_rate_, /*test_tone=*/false))
@@ -752,6 +763,7 @@ void TTS::goodbye() { speak("Standing by."); }
 // ── Shutdown ────────────────────────────────────────────────────────
 
 void TTS::shutdown() {
+    if (textio::enabled()) return;
     stop_ = true;
     interrupt();
     cv_.notify_all();

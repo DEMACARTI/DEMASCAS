@@ -1,0 +1,24 @@
+# Mishearings, fragments and unclear speech: never act on them.
+# (most of these are word-for-word from the live session logs)
+- {id: anyways-open, say: "anyways, open,", expect: {no_action: true, asks: true}}
+- {id: button, say: "button", expect: {no_action: true, asks: true}}
+- {id: run-to-delete-cloud, say: "run to, delete, cloud", expect: {no_action: true}}
+- {id: open-the, say: "open the", expect: {no_action: true, asks: true}}
+- {id: open-burn-copy, say: "open, burn, copy,", expect: {no_action: true}}
+- {id: lowconf-delete, conf: 0.4, say: "delete the file report", expect: {no_action: true, asks: true}}
+- {id: lowconf-send, conf: 0.3, say: "send it to Hatim", expect: {no_action: true}}
+- {id: lowconf-open, conf: 0.45, say: "open Discord", expect: {no_action: true}}
+- {id: steam-milk, say: "I didn't even steam milk porn stars, why is it doing it?", expect: {no_action: true}}
+- {id: available-laptop, say: "which is available on the laptop", expect: {no_action: true}}
+- {id: find-the-open, say: "we can find the reason, we can find the open,", expect: {no_action: true}}
+- {id: uh, say: "uh", expect: {no_action: true}}
+- {id: the-the, say: "the the the", expect: {no_action: true}}
+- {id: and-then, say: "and then", expect: {no_action: true}}
+- {id: bare-send, say: "send", expect: {no_action: true, asks: true}}
+- {id: bare-type, say: "type", expect: {no_action: true, asks: true}}
+- {id: bare-click, say: "click", expect: {no_action: true, asks: true}}
+- {id: bare-delete, say: "delete", expect: {no_action: true, asks: true}}
+- {id: so-um-yeah, say: "so, um, yeah", expect: {no_action: true}}
+- {id: thank-you-halluc, say: "Thank you.", expect: {no_action: true}}
+- {id: open-porn-hub, say: "open, porn hub", expect: {no_action: true}}
+- {id: good-mother, say: "Keep it up, good mother!", expect: {no_action: true}}

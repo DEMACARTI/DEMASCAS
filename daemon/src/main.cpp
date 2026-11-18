@@ -37,6 +37,7 @@
 #include "llm_client.hpp"
 #include "tool_bridge.hpp"
 #include "tts.hpp"
+#include "textio.hpp"
 #include "vad.hpp"
 #include "aec.hpp"
 #include "shortcut_map.hpp"
@@ -1240,12 +1241,49 @@ int main() {
     };
 
     while (g_running) {
+        // Exam text mode: input closed → exit; "/reset" → start over.
+        if (demascas::textio::enabled()) {
+            if (demascas::textio::eof()) break;
+            if (demascas::textio::take_reset()) {
+                task.cancel_flag() = true;
+                try { bridge.cancel_agent(); } catch (...) {}
+                task.queue.clear();
+                for (int i = 0; i < 400 && task.busy(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                TaskOutcome stale;
+                while (task.take(stale)) {}
+                llm.reset();
+                worker_llm.reset();
+                pending_token.clear(); pending_tool.clear(); pending_description.clear();
+                pending_file_choices.clear();
+                held_command.clear();
+                {   // a reset stands for time passing: old speech can't be "echo"
+                    std::lock_guard<std::mutex> lk(said_mu);
+                    recently_said.clear();
+                }
+                consecutive_blank = 0;
+                first_after_wake = false;
+                state = State::SLEEPING;
+                demascas::textio::emit("RESET");
+            }
+        }
         switch (state) {
 
         // ────────────────────────────────────────────────────────
         // SLEEPING — continuously scan for the wake word
         // ────────────────────────────────────────────────────────
         case State::SLEEPING: {
+            if (demascas::textio::enabled()) {      // exam: "/wake" = the wake word
+                std::string line;
+                if (!demascas::textio::read_line("SLEEPING", line)) { g_running = false; break; }
+                if (line != "/wake") break;
+                wake_window.clear();
+                first_after_wake = true;
+                consecutive_blank = 0;
+                demascas::textio::emit("WAKE");
+                state = State::LISTENING;
+                break;
+            }
             // ── Audio health check (sleep/wake recovery) ────────
             if (!audio.is_stream_healthy()) {
                 std::cout << "[!] Audio stream unhealthy — reinitializing...\n";
@@ -1430,6 +1468,11 @@ int main() {
             // While a task runs, listen in short slices so finished results
             // and new speech from DEMASCAS are handled promptly.
             const bool working = task.busy();
+            if (demascas::textio::enabled() && working) {
+                // Exam: let the task finish before the next typed line.
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                break;
+            }
             static bool announced_working = false;
             if (working && !announced_working)
                 std::cout << "[🟢 LISTENING] (task running — still listening)\n";

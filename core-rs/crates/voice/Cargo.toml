@@ -1,0 +1,11 @@
+[package]
+name = "voice"
+description = "DEMASCAS's voice: Kokoro synthesis on a worker thread, streamed to the speaker"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+audio = { path = "../audio" }
+sherpa = { path = "../sherpa" }

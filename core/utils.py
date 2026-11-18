@@ -34,6 +34,13 @@ def resolve_safe_path(path_str: str) -> pathlib.Path:
     if path_str.startswith("~"):
         return pathlib.Path(path_str.replace("~", str(home), 1))
 
+    # "Pictures" / "Desktop/notes" — the user's own folders, said without ~/
+    # (live 18 Nov: the model passed folder="Pictures" → "Folder not found")
+    first = path_str.strip("/").split("/", 1)[0].lower()
+    if not path_str.startswith("/") and first in ("desktop", "documents", "downloads", "pictures", "music", "movies", "public"):
+        rest = path_str.strip("/").split("/", 1)
+        return home / first.capitalize() / (rest[1] if len(rest) > 1 else "")
+
     # Handle /Users/<anything>/... — replace hallucinated username with real home
     if path_str.startswith("/Users/"):
         parts = pathlib.Path(path_str).parts  # ('/', 'Users', '<name>', 'Downloads', ...)

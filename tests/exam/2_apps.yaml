@@ -1,0 +1,26 @@
+# Driving the computer: do exactly what was asked — nothing more.
+- {id: open-discord, say: "open Discord", expect: {tools: [open_application], args: {open_application: 'discord'}, only: true}}
+- {id: open-safari, say: "open Safari", expect: {tools: [open_application], args: {open_application: 'safari'}, only: true}}
+- {id: open-finder, say: "open finder", expect: {any_tool: [open_application, activate_application], args: {open_application: 'finder'}, only: true}}
+- {id: open-notes, say: "open the notes app", expect: {tools: [open_application], args: {open_application: 'notes'}, only: true}}
+- {id: launch-ppt, say: "launch PowerPoint", expect: {tools: [open_application], args: {open_application: 'powerpoint'}, only: true}}
+- {id: close-safari, say: "close Safari", expect: {any_tool: [quit_application], args: {quit_application: 'safari'}, only: true}}
+- {id: quit-mail, say: "quit Mail", expect: {tools: [quit_application], args: {quit_application: 'mail'}, only: true}}
+- {id: switch-mail, say: "switch to Mail", expect: {any_tool: [activate_application, open_application], only: true}}
+- {id: running-apps, say: "what apps are running", expect: {any_tool: [list_running_applications], no_action: true, say_any: ['discord', 'safari', 'finder']}}
+- {id: is-discord-open, say: "is Discord open", expect: {no_action: true, say_any: ['yes', 'running', 'open']}}
+- {id: screenshot, say: "take a screenshot", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: 'shift\+[34]'}, only: true}}
+- {id: new-tab, world: {frontmost: Safari}, say: "new tab", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: '(command|cmd)\+t'}, only: true}}
+- {id: undo, say: "undo", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: '\+z'}, only: true}}
+- {id: copy, say: "copy", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: '\+c'}, only: true}}
+- {id: select-all, say: "select all", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: '\+a'}, only: true}}
+- {id: minimize, say: "minimize", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: '\+m'}, only: true}}
+- {id: next-tab, world: {frontmost: Safari}, say: "next tab", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: 'tab'}, only: true}}
+- {id: hide-app, say: "hide this app", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: '\+h'}, only: true}}
+- {id: open-youtube, say: "open youtube.com", expect: {any_tool: [open_url, browser_navigate, open_url_and_wait], args: {open_url: 'youtube'}, only: true}}
+- {id: open-google-safari, say: "open google.com in Safari", expect: {any_tool: [open_url, browser_navigate, open_url_and_wait], args: {open_url: 'google'}}}
+- {id: github, say: "go to github.com", expect: {any_tool: [open_url, browser_navigate, open_url_and_wait], args: {open_url: 'github'}}}
+- {id: yt-search, say: "search YouTube for lofi jazz", expect: {any_tool: [web_youtube_search, open_url, browser_navigate, web_youtube_play_first]}}
+- {id: play-lofi, say: "play some lofi music", expect: {any_tool: [web_youtube_play_first, web_youtube_search, open_url, open_application]}}
+- {id: open-downloads, say: "open my downloads folder", expect: {any_tool: [open_file, open_application, run_shell_command, list_files_in_folder, open_url]}}
+- {id: full-screen, say: "full screen", expect: {tools: [press_keyboard_shortcut], args: {press_keyboard_shortcut: 'f'}, only: true}}

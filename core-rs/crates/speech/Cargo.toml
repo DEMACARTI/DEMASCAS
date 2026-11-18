@@ -1,0 +1,9 @@
+[package]
+name = "speech"
+description = "Speech recognition (whisper.cpp) + recogniser confidence"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+whisper-rs.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "audio"
+description = "Microphone, speaker, echo cancellation and barge-in detection"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+links = "speexdsp"
+build = "build.rs"
+
+[dependencies]
+cpal.workspace = true

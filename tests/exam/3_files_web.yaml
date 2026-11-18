@@ -1,0 +1,20 @@
+# Files, information and the web.
+- {id: find-resume, cat: files, say: "find my resume", expect: {tools: [find_file], args: {find_file: 'resume'}, no_action: true}}
+- {id: find-budget, cat: files, say: "find the budget spreadsheet in downloads", expect: {tools: [find_file], args: {find_file: 'budget'}, no_action: true}}
+- {id: list-downloads, cat: files, say: "list the files in my downloads folder", expect: {any_tool: [list_files_in_folder, find_file], no_action: true, speaks: true}}
+- {id: open-resume, cat: files, say: "open my resume", expect: {tools: [open_file], only: true}}
+- {id: latest-pdf, cat: files, say: "summarize the latest PDF", expect: {any_tool: [summarize_latest_pdf]}}
+- {id: create-notes-file, cat: files, say: "create a file called notes.txt on the desktop", expect: {any_tool: [create_file, create_document], only: true}}
+- {id: finder-list, cat: files, world: {frontmost: Finder}, say: "list all the files which you see inside the Finder app right now", expect: {any_tool: [get_active_window_tree, list_files_in_folder, find_file, read_screen_text], no_action: true, speaks: true}}
+- {id: clipboard-read, cat: files, say: "what's on my clipboard", expect: {any_tool: [get_clipboard], say_any: ['4 ?pm', 'meeting']}}
+- {id: clipboard-set, cat: files, say: "copy hello world to my clipboard", expect: {any_tool: [set_clipboard], args: {set_clipboard: 'hello'}, only: true}}
+
+- {id: weather-delhi, cat: info, say: "what's the weather in Delhi", expect: {tools: [get_weather], args: {get_weather: 'delhi'}, say_any: ['24', 'clear']}}
+- {id: news, cat: info, say: "what's the latest news", expect: {any_tool: [get_news, search_web, web_search, smart_search, research_web, web_research]}}
+- {id: cricket, cat: info, say: "who won the last cricket world cup", expect: {any_tool: [search_web, web_search, smart_search, research_web, web_research, get_news], no_action: true}}
+- {id: research-bh, cat: info, say: "research black holes for me", expect: {any_tool: [research_web, web_research, web_research_and_report, search_web, web_search, smart_search]}}
+- {id: bitcoin, cat: info, say: "what's the price of bitcoin right now", expect: {any_tool: [search_web, web_search, smart_search, research_web, web_research, get_news], no_action: true}}
+- {id: time-now, cat: info, say: "what time is it", expect: {no_action: true, say_any: ['\d{1,2}[: ]\d{2}', "o'?clock", '\b(am|pm)\b', 'a\.m|p\.m']}}
+- {id: date-today, cat: info, say: "what's today's date", expect: {no_action: true, say_any: ['2026', 'november', '16']}}
+- {id: battery, cat: info, say: "how much battery do I have", expect: {any_tool: [get_system_info, run_shell_command], say_any: ['76', 'percent', '%']}}
+- {id: read-page, cat: info, world: {frontmost: Safari}, say: "read this page to me", expect: {any_tool: [browser_get_page_text, read_webpage, web_read_article, web_analyze_page, get_active_window_tree, read_screen_text], no_action: true}}

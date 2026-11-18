@@ -1,13 +1,13 @@
 """
 DEMASCAS — main.py
-Entry point: Launches the Python tool server that the bare-metal
-C++ daemon connects to over HTTP.
+Entry point: Launches the Python tool server that the Rust daemon
+(core-rs) connects to over HTTP.
 
-Architecture (polyglot):
-  C++ daemon (daemon/build/demascas_daemon)
-    → PortAudio mic capture + whisper.cpp STT
-    → Streaming MLX LLM (libcurl SSE, OpenAI-compatible)
-    → Streaming TTS with barge-in interrupt
+Architecture:
+  Rust daemon (core-rs/target/release/demascasd)
+    → mic capture + whisper STT, wake word, barge-in
+    → the brain: reflexes, router, planner, governance
+    → streaming local LLM (OpenAI-compatible) + Kokoro TTS
     → Calls this tool server for OS actions, MCP, memory, learning
 
   Python tool server (this process)
@@ -22,7 +22,7 @@ Usage:
     python main.py              # start tool server (port 5001)
     python main.py setup        # plug in a local LLM sized to this laptop
     python main.py doctor       # hardware / model / runtime status (--bench for speed)
-    ./daemon/build/demascas_daemon  # start voice engine (separate terminal)
+    ./scripts/run.sh            # everything: LLM check, tool server, Rust daemon
 """
 
 import os
@@ -47,9 +47,9 @@ def main() -> None:
     print("   DEMASCAS SYSTEM CORE INITIALIZED     ")
     print("========================================")
     print("[*] Starting Python tool server...")
-    print("[*] The C++ daemon connects to this server over HTTP.")
-    print("[*] Launch the daemon separately:")
-    print("      ./daemon/build/demascas_daemon\n")
+    print("[*] The Rust daemon connects to this server over HTTP.")
+    print("[*] Launch everything with:")
+    print("      ./scripts/run.sh\n")
 
     from server.tool_server import run_server  # noqa: E402
 

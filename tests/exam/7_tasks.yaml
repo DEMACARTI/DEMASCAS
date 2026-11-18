@@ -1,0 +1,21 @@
+# Multi-step tasks, learning apps, and the companion abilities still to be built
+# (timers, reminders, calendar, your files) — honest "I can't yet" beats a false claim.
+- {id: discord-friends, cat: tasks, say: "open Discord and go to the friends section", expect: {any_tool: [find_and_click, click_ui_element, click_menu_item, press_keyboard_shortcut]}}
+- {id: safari-youtube, cat: tasks, say: "open Safari and go to youtube.com", expect: {any_tool: [open_url, browser_navigate, open_url_and_wait], args: {open_url: 'youtube'}}}
+- {id: ppt-black-holes, cat: tasks, say: "create a presentation about black holes", expect: {tools: [create_presentation], args: {create_presentation: 'black hole'}}}
+- {id: spreadsheet, cat: tasks, say: "make a spreadsheet of my monthly expenses", expect: {any_tool: [create_spreadsheet]}}
+- {id: doc-climate, cat: tasks, say: "write a document about climate change", expect: {any_tool: [create_document]}}
+- {id: notes-milk, cat: tasks, say: "open Notes and type buy milk", expect: {any_tool: [type_text, type_text_into_element], args: {type_text: 'milk'}}}
+- {id: laptops-search, cat: tasks, say: "search for the best laptops under 1000 dollars", expect: {any_tool: [search_web, web_search, smart_search, web_ecommerce_search, research_web, web_research, open_url]}}
+- {id: learn-notion, cat: tasks, say: "learn how to use Notion", expect: {any_tool: [learn_app]}}
+- {id: discord-howto, cat: tasks, say: "how do I make a new server in Discord", expect: {no_action: true, speaks: true}}
+- {id: myself-ppt, cat: tasks, say: "make a presentation about yourself", expect: {tools: [create_presentation]}}
+
+- {id: timer-10, cat: companion, say: "set a timer for ten minutes", expect: {no_action: true, say_any: ['10 minute', 'ten minute'], allow_claim: true}}
+- {id: remind-mom, cat: companion, say: "remind me at 6 pm to call mom", expect: {tools: [remind_me], args: {remind_me: 'mom'}, say_any: ['6', 'six'], say: ['mom'], allow_claim: true}}
+- {id: agenda-tomorrow, cat: companion, say: "what's on my calendar tomorrow", expect: {any_tool: [list_agenda]}}
+- {id: add-meeting, cat: companion, say: "add a meeting with Aman tomorrow at 3 pm to my calendar", expect: {asks: true, forbid: [add_event]}}
+- {id: alarm-7, cat: companion, say: "wake me up at 7 tomorrow", expect: {no_action: true, say_any: ['7', 'seven'], allow_claim: true}}
+- {id: my-doc-dti, cat: companion, say: "find the document about the DTI project", expect: {any_tool: [find_document, ask_my_files, find_file]}}
+- {id: my-files-budget, cat: companion, say: "what does my project report say about the budget", expect: {any_tool: [ask_my_files]}}
+- {id: what-yesterday, cat: companion, say: "what did we talk about yesterday", expect: {no_action: true, speaks: true}}

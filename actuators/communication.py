@@ -22,6 +22,8 @@ RAM BUDGET: 0 MB extra.
 from __future__ import annotations
 
 import json
+import re
+import sys
 import os
 import subprocess
 import time
@@ -107,8 +109,8 @@ def read_current_email() -> str:
             if "error" in parsed:
                 return f"[-] {parsed['error']}"
             return json.dumps(parsed, indent=2)
-    except (json.JSONDecodeError, KeyError):
-        pass
+    except (json.JSONDecodeError, KeyError) as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     return f"[-] Could not parse email from screen: {resp[:200]}"
 
@@ -116,6 +118,46 @@ def read_current_email() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 # 2. COMPOSE EMAIL — creates an email draft using task-specific prompts
 # ═══════════════════════════════════════════════════════════════════════
+
+def _resolve_address(recipient: str) -> str:
+    """An address the user actually has: typed in the request, or in Contacts.
+    Never made up."""
+    if "@" in recipient:
+        return recipient.strip()
+    if not recipient or sys.platform != "darwin":
+        return ""
+    try:
+        from actuators.apple import find_contact
+        r = find_contact(recipient)
+        m = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", str(r.get("message", "")))
+        return m.group(0) if m else ""
+    except Exception as e:
+        print(f"[📧 COMM] contact lookup failed: {e}")
+        return ""
+
+
+def _owner_name() -> str:
+    try:
+        return subprocess.run(["id", "-F"], capture_output=True, text=True, timeout=2).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _finish_draft(recipient: str, subject: str, body: str, tone: str) -> dict:
+    """Clean the model's draft and say honestly what exists: a draft, not sent."""
+    name = _owner_name()
+    body = re.sub(r"\[(your|my) name\]", name, body, flags=re.I).strip()
+    addr = _resolve_address(recipient)
+    who = recipient.strip() or "them"
+    first = re.split(r"(?<=[.!?])\s+", re.sub(r"^(dear|hi|hello|hey)\b[^,\n]*,?\s*", "", body, flags=re.I).strip())[0][:140]
+    where = f" ({addr})" if addr else ""
+    msg = (f"I drafted an email to {who}{where}, subject “{subject}”: {first} "
+           "It isn't sent — it's just a draft.")
+    if not addr:
+        msg += f" I don't have an email address for {who}."
+    return {"success": True, "subject": subject, "body": body, "to": addr, "to_name": recipient,
+            "tone": tone, "message": msg, "confirm": msg}
+
 
 def compose_email(
     recipient: str = "",
@@ -153,6 +195,10 @@ def compose_email(
     from core.prompt_templates import compose_email_prompt
     from core.screen_context import get_screen_context_block
 
+    # the screen only when the request points at it ("reply to this", "the page")
+    # — live log: "write a mail to X saying hi" became an email about project updates
+    kp = f" {key_points.lower()} "
+    use_screen = use_screen and any(w in kp for w in (" this ", " the page", " screen", " above", " here ", " that email", " this email"))
     screen_ctx = get_screen_context_block() if use_screen else ""
 
     # Build prompt
@@ -188,27 +234,10 @@ def compose_email(
         content = resp.json()["choices"][0]["message"]["content"]
 
         # Try to extract first valid JSON object from potentially noisy output
-        parsed = _extract_first_json_object(content)
-        if parsed is not None:
-            # Ensure required fields
-            result = {
-                "subject": parsed.get("subject", subject or "No subject"),
-                "body": parsed.get("body", content),
-                "to": parsed.get("to", recipient),
-                "tone": parsed.get("tone", tone),
-                "confirm": parsed.get("confirm",
-                    f"I've drafted an email to {recipient or 'them'}. Want me to proceed?"),
-            }
-            return json.dumps(result, indent=2)
-
-        # If no JSON, wrap raw content
-        return json.dumps({
-            "subject": subject or "Email",
-            "body": content,
-            "to": recipient,
-            "tone": tone,
-            "confirm": f"I've drafted an email. Want me to proceed?",
-        }, indent=2)
+        parsed = _extract_first_json_object(content) or {}
+        body = str(parsed.get("body") or content).strip()
+        subj = str(parsed.get("subject") or subject or "Hello").strip().rstrip(".")
+        return json.dumps(_finish_draft(recipient, subj, body, tone), indent=2)
 
     except Exception as e:
         return f"[-] Email composition failed: {e}"
@@ -398,8 +427,8 @@ def extract_contact() -> str:
                 pass  # non-fatal
 
             return json.dumps(parsed, indent=2)
-    except (json.JSONDecodeError, KeyError):
-        pass
+    except (json.JSONDecodeError, KeyError) as _e:  # was silent
+        __import__("logging").getLogger(__name__).warning("ignored error: %r", _e)
 
     return f"[-] Could not extract contact info: {resp[:200]}"
 

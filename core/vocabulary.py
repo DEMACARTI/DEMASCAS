@@ -101,7 +101,11 @@ def apply_corrections(text: str) -> str:
         return text
     out = text
     for heard, meant in sorted(_load()["corrections"].items(), key=lambda kv: -len(kv[0])):
-        out = re.sub(rf"\b{re.escape(heard)}\b", meant, out, flags=re.IGNORECASE)
+        # "brave" → "Brave Browser" must leave an already-complete
+        # "Brave Browser" alone (live log: "Brave Browser Browser")
+        def _fix(m: re.Match, meant: str = meant, src: str = out) -> str:
+            return m.group(0) if src[m.start():m.start() + len(meant)].lower() == meant.lower() else meant
+        out = re.sub(rf"\b{re.escape(heard)}\b", _fix, out, flags=re.IGNORECASE)
     # Taught terms: fix case ("discord" → "Discord") so names reach tools intact.
     for t in terms():
         if len(t) > 3:

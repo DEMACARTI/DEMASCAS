@@ -1,0 +1,49 @@
+# The requests from the live session of 17 Nov 2026 (which ran the old C++
+# daemon and failed them).  The Rust core must handle every one.
+
+- {id: log-time, cat: live-log, say: "what is the current time?", expect: {no_action: true, say_any: ['\d{1,2}:\d{2}'], max_s: 2}}
+
+- {id: log-latest-mail, cat: live-log, say: "what are the latest emails that I received?", expect: {tools: [read_mail], no_action: true, say_any: ['demo', 'friday'], say_not: ['"tool"', 'gmail_read_email']}}
+- {id: log-read-me-mail, cat: live-log, say: "can you read me the latest mail that I have received?", expect: {tools: [read_mail], no_action: true}}
+- {id: log-mail-on-gmail, cat: live-log, say: "I want you to read the latest mail that I have received on Gmail", expect: {tools: [read_mail], no_action: true}}
+
+# Mail has no account on this Mac: say so plainly — never open a browser or speak tool JSON
+- id: log-no-mail-account
+  cat: live-log
+  world: {stubs: {read_mail: {"success": false, "no_accounts": true, "message": "The Mail app on this Mac has no email account yet, so I can't read your mail. Add your Gmail once in System Settings, Internet Accounts, and then I can."}}}
+  say: "what are the latest emails that I received?"
+  expect: {tools: [read_mail], only: true, say_any: ['internet accounts'], say_not: ['"tool"', '\{']}
+
+# make a presentation, then open exactly that file
+- id: log-create-then-open
+  cat: live-log
+  world: {stubs: {create_presentation: {"success": true, "message": "Created a 6-slide presentation \"Saudi Arabia\".", "path": "/Users/exam/Documents/Saudi Arabia.pptx", "slides": 6}}}
+  turns:
+    - {say: "create a powerpoint presentation on Saudi Arabia", expect: {tools: [create_presentation]}}
+    - {say: "open the presentation and show it to me", wake: false, expect: {tools: [open_file], args: {open_file: 'saudi arabia\.pptx'}, only: true}}
+- id: log-create-then-open-it
+  cat: live-log
+  world: {stubs: {create_document: {"success": true, "message": "Wrote a 1-page cover letter.", "path": "/Users/exam/Documents/Cover letter.docx"}}}
+  turns:
+    - {say: "write a cover letter for an internship", expect: {any_tool: [create_document]}}
+    - {say: "open it", wake: false, expect: {tools: [open_file], args: {open_file: 'cover letter\.docx'}, only: true}}
+
+# ── second live session (Rust, 17 Nov 2026)
+# a reminder must really be set — chat once said "I'll set a reminder" and set nothing
+- {id: log2-reminder-338, cat: live-log, say: "give me a reminder at 338 pm that I have a meeting.", expect: {tools: [remind_me], say_any: ['3:38'], allow_claim: true}}
+- {id: log2-internet, cat: live-log, say: "check, how is the internet connection?", expect: {tools: [check_internet], only: true, forbid: [web_search, search_web, web_knowledge]}}
+- {id: log2-screen, cat: live-log, world: {frontmost: Safari}, say: "can you tell me what is being currently displayed on the screen?", expect: {any_tool: [describe_screen, read_screen_text], no_action: true, forbid: [web_knowledge, get_active_window_tree]}}
+- {id: log2-screen-named, cat: live-log, world: {frontmost: Safari}, say: "DEMASCAS tell me what is currently being displayed on the screen.", expect: {any_tool: [describe_screen, read_screen_text], no_action: true}}
+- {id: log2-barely-heard, cat: live-log, conf: 0.53, say: "okay, what is the visual doing?", expect: {no_action: true, asks: true, tools: []}}
+- {id: log2-gmail-brave, cat: live-log, say: "mailed that I have received on Gmail on Brave Browser.", expect: {tools: [read_mail], args: {read_mail: 'gmail'}, no_action: true}}
+- id: log2-write-mail
+  cat: live-log
+  world: {stubs: {compose_email: {"success": true, "subject": "Hi", "body": "Hi Visual,\n\nJust saying hi!\n\nDaksh", "to": "", "message": "I drafted an email to visual comar, subject “Hi”: Just saying hi! It isn't sent — it's just a draft."}}}
+  say: "write a mail to visual comar saying hi."
+  expect: {any_tool: [compose_email], say_any: ["isn't sent", "draft"], say_not: ['\{', '"subject"'], forbid: [deliver_chat_message, message_contact]}
+# after "say that again?", the TV is not the user
+- id: log2-tv-after-clarify
+  cat: live-log
+  turns:
+    - {say: "battery", conf: 0.02, expect: {asks: true, no_action: true}}
+    - {say: "Don't worry, you'll be fine. You won't be able to do this.", wake: false, expect: {no_action: true, silent: true}}

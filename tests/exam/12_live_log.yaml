@@ -1,0 +1,52 @@
+# The live Rust voice session of 18 Nov 2026.  Every turn here went wrong.
+
+# "what is up?" is small talk: answer it, no tool loop, no web research
+- {id: n18-whats-up, cat: live-log-2, say: "what is up?", expect: {no_action: true, speaks: true, forbid: [find_file, search_web, research_web], max_s: 6}}  # first request after start: shares the server with the warm-up
+
+# a request made in the follow-up window is not side talk just because it
+# starts with "before…" (it was ignored)
+- id: n18-before-the-test
+  cat: live-log-2
+  world: {stubs: {list_files_in_folder: "Files in ~/Desktop (7 total, showing newest 20):\n  Screenshot 2026-09-26 at 4.34.00 PM.png (310 KB)\n  Screenshot 2026-09-25 at 2.33.49 AM.png (290 KB)\n  Screenshot 2026-08-12 at 10.12.53 PM.png (1.2 MB)\n  Screenshot 2026-07-15 at 12.11.51 PM.png (800 KB)\n  Screenshot 2026-07-01 at 7.07.33 PM.png (400 KB)\n  Screenshot 2026-06-11 at 9.01.02 AM.png (200 KB)\n  Screenshot 2026-05-02 at 3.15.40 PM.png (210 KB)", find_file: {"success": true, "found": true, "count": 7, "first_match_path": "/Users/exam/Desktop/Screenshot 1.png", "matches": [{"name": "Screenshot 2026-09-26 at 4.34.00 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-09-26 at 4.34.00 PM.png"}, {"name": "Screenshot 2026-09-25 at 2.33.49 AM.png", "path": "/Users/exam/Desktop/Screenshot 2026-09-25 at 2.33.49 AM.png"}, {"name": "Screenshot 2026-08-12 at 10.12.53 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-08-12 at 10.12.53 PM.png"}, {"name": "Screenshot 2026-07-15 at 12.11.51 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-07-15 at 12.11.51 PM.png"}, {"name": "Screenshot 2026-07-01 at 7.07.33 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-07-01 at 7.07.33 PM.png"}], "message": "Found 7 file(s) (.png) in ~/Desktop."}}}
+  turns:
+    - {say: "I want you to do a test for me.", expect: {no_action: true, speaks: true}}
+    - {say: "before doing the test can you tell me how many PNG files are in my desktop folder.", wake: false, expect: {any_tool: [find_file, list_files_in_folder], say_any: ['\b7\b', 'seven'], max_s: 2}}
+
+# list = list: the right count, short names, no "which one should I open?"
+- id: n18-list-pngs
+  cat: live-log-2
+  world: {stubs: {list_files_in_folder: "Files in ~/Desktop (7 total, showing newest 20):\n  Screenshot 2026-09-26 at 4.34.00 PM.png (310 KB)\n  Screenshot 2026-09-25 at 2.33.49 AM.png (290 KB)\n  Screenshot 2026-08-12 at 10.12.53 PM.png (1.2 MB)\n  Screenshot 2026-07-15 at 12.11.51 PM.png (800 KB)\n  Screenshot 2026-07-01 at 7.07.33 PM.png (400 KB)\n  Screenshot 2026-06-11 at 9.01.02 AM.png (200 KB)\n  Screenshot 2026-05-02 at 3.15.40 PM.png (210 KB)", find_file: {"success": true, "found": true, "count": 7, "first_match_path": "/Users/exam/Desktop/Screenshot 1.png", "matches": [{"name": "Screenshot 2026-09-26 at 4.34.00 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-09-26 at 4.34.00 PM.png"}, {"name": "Screenshot 2026-09-25 at 2.33.49 AM.png", "path": "/Users/exam/Desktop/Screenshot 2026-09-25 at 2.33.49 AM.png"}, {"name": "Screenshot 2026-08-12 at 10.12.53 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-08-12 at 10.12.53 PM.png"}, {"name": "Screenshot 2026-07-15 at 12.11.51 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-07-15 at 12.11.51 PM.png"}, {"name": "Screenshot 2026-07-01 at 7.07.33 PM.png", "path": "/Users/exam/Desktop/Screenshot 2026-07-01 at 7.07.33 PM.png"}], "message": "Found 7 file(s) (.png) in ~/Desktop."}}}
+  turns:
+    - {say: "I want you to list me all the PNG files which are in my desktop folder.", expect: {any_tool: [find_file, list_files_in_folder], no_action: true, say_any: ['\b7\b', 'seven'], say_not: ['which one should I open', '\.png', '4\.34\.00'], max_s: 2}}
+    # "stop" (Whisper wrote two voices as dialogue) is a stop, not a model question.
+    # (Live it was a barge-in: DEMASCAS just goes quiet.  Typed, it stands by.)
+    - {say: "- DNG. - Stop!", wake: false, expect: {no_action: true, say_not: ['taking too long'], max_s: 1}}
+    # …and the list is still there to pick from after "DEMASCAS…"
+    - {say: "I want you to open any random file from the files that you listed.", expect: {tools: [open_file], args: {open_file: 'screenshot 2026'}, only: true, max_s: 1}}
+
+# "what's the exact file name?" must not swallow goodbyes forever
+- id: n18-exact-name-trap
+  cat: live-log-2
+  world: {stubs: {list_files_in_folder: "Files in ~/Desktop (7 total, showing newest 20):\n  Screenshot 2026-09-26 at 4.34.00 PM.png (310 KB)\n  Screenshot 2026-09-25 at 2.33.49 AM.png (290 KB)\n  Screenshot 2026-08-12 at 10.12.53 PM.png (1.2 MB)\n  Screenshot 2026-07-15 at 12.11.51 PM.png (800 KB)\n  Screenshot 2026-07-01 at 7.07.33 PM.png (400 KB)\n  Screenshot 2026-06-11 at 9.01.02 AM.png (200 KB)\n  Screenshot 2026-05-02 at 3.15.40 PM.png (210 KB)", find_file: {"success": true, "found": false, "matches": [], "count": 0, "message": "No files matching 'budget plan' found in ~."}}}
+  turns:
+    - {say: "open my budget plan file", expect: {tools: [find_file], asks: true}}
+    - {say: "all right, go and standby for now.", wake: false, expect: {no_action: true, forbid: [find_file], sleeps: true}}
+- id: n18-dont-need-you
+  cat: live-log-2
+  world: {stubs: {list_files_in_folder: "Files in ~/Desktop (7 total, showing newest 20):\n  Screenshot 2026-09-26 at 4.34.00 PM.png (310 KB)\n  Screenshot 2026-09-25 at 2.33.49 AM.png (290 KB)\n  Screenshot 2026-08-12 at 10.12.53 PM.png (1.2 MB)\n  Screenshot 2026-07-15 at 12.11.51 PM.png (800 KB)\n  Screenshot 2026-07-01 at 7.07.33 PM.png (400 KB)\n  Screenshot 2026-06-11 at 9.01.02 AM.png (200 KB)\n  Screenshot 2026-05-02 at 3.15.40 PM.png (210 KB)", find_file: {"success": true, "found": false, "matches": [], "count": 0, "message": "No files matching 'budget plan' found in ~."}}}
+  turns:
+    - {say: "open my budget plan file", expect: {tools: [find_file], asks: true}}
+    - {say: "I don't need you right now, bye.", wake: false, expect: {no_action: true, forbid: [find_file], sleeps: true}}
+- id: n18-shut-down-yourself
+  cat: live-log-2
+  world: {stubs: {list_files_in_folder: "Files in ~/Desktop (7 total, showing newest 20):\n  Screenshot 2026-09-26 at 4.34.00 PM.png (310 KB)\n  Screenshot 2026-09-25 at 2.33.49 AM.png (290 KB)\n  Screenshot 2026-08-12 at 10.12.53 PM.png (1.2 MB)\n  Screenshot 2026-07-15 at 12.11.51 PM.png (800 KB)\n  Screenshot 2026-07-01 at 7.07.33 PM.png (400 KB)\n  Screenshot 2026-06-11 at 9.01.02 AM.png (200 KB)\n  Screenshot 2026-05-02 at 3.15.40 PM.png (210 KB)", find_file: {"success": true, "found": false, "matches": [], "count": 0, "message": "No files matching 'budget plan' found in ~."}}}
+  turns:
+    - {say: "open my budget plan file", expect: {tools: [find_file], asks: true}}
+    - {say: ", shut down yourself.", conf: 0.57, wake: false, expect: {no_action: true, forbid: [find_file, shut_down, shutdown_computer], sleeps: true}}
+
+# The app session of 18 Nov evening — easy things that caused friction
+- {id: n18b-apps-count, cat: live-log-2, say: "how many apps are open right now?", expect: {tools: [list_running_applications], no_action: true, forbid: [search_web, web_search, smart_search], max_s: 1.5}}
+- {id: n18b-clipboard, cat: live-log-2, say: "tell me what I have currently copied in the clipboard.", expect: {tools: [get_clipboard], no_action: true, forbid: [search_web, web_search, smart_search], max_s: 1.5}}
+- {id: n18b-open-copied, cat: live-log-2, say: "I have copied a file path in the clipboard, I want you to open that file path and tell me what it is.", expect: {tools: [open_copied_path], max_s: 1.5}}
+- {id: n18b-settings, cat: live-log-2, say: "open the permission settings so that I can enable your screen recording option.", expect: {tools: [open_settings_pane], args: {open_settings_pane: 'screen recording'}, forbid: [press_keyboard_shortcut], max_s: 1.5}}
+- {id: n18b-apps-folder, cat: live-log-2, say: "open the Applications folder.", expect: {tools: [open_file], args: {open_file: '/applications'}, forbid: [press_keyboard_shortcut], max_s: 1.5}}
