@@ -7,6 +7,22 @@ import AVFoundation
 import Network
 import WebKit
 
+/// The page fills the whole window (title bar included), so it receives every
+/// click and macOS never saw a window drag.  A click in the top strip — the
+/// DEMASCAS title row — now moves the window; double-click zooms it.
+final class DragWebView: WKWebView {
+    static let dragStrip: CGFloat = 56
+    private func inStrip(_ e: NSEvent) -> Bool {
+        let p = convert(e.locationInWindow, from: nil)
+        return (isFlipped ? p.y : bounds.height - p.y) <= DragWebView.dragStrip
+    }
+    override func mouseDown(with event: NSEvent) {
+        guard inStrip(event), let w = window else { return super.mouseDown(with: event) }
+        if event.clickCount == 2 { w.zoom(nil) } else { w.performDrag(with: event) }
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 final class NoirWindow: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     let panel: NSPanel
     let web: WKWebView
@@ -25,10 +41,10 @@ final class NoirWindow: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let cfg = WKWebViewConfiguration()
         let ucc = WKUserContentController()
         cfg.userContentController = ucc
-        web = WKWebView(frame: NSRect(x: 0, y: 0, width: 880, height: 600), configuration: cfg)
+        web = DragWebView(frame: NSRect(x: 0, y: 0, width: 880, height: 600), configuration: cfg)
         web.setValue(false, forKey: "drawsBackground")
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 880, height: 600),
-                        styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
+                        styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                         backing: .buffered, defer: false)
         super.init()
         ucc.add(self, name: "dmx")
@@ -36,7 +52,8 @@ final class NoirWindow: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         panel.titlebarAppearsTransparent = true
         panel.titleVisibility = .hidden
         panel.isMovableByWindowBackground = true
-        panel.level = .floating
+        panel.level = .normal                 // a normal window: others can go in front of it
+        panel.isFloatingPanel = false
         panel.backgroundColor = NSColor(red: 0.03, green: 0.016, blue: 0, alpha: 1)
         panel.minSize = NSSize(width: 640, height: 440)
         panel.contentView = web
@@ -54,7 +71,10 @@ final class NoirWindow: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         startMic()
     }
 
-    func show() { panel.orderFrontRegardless() }
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
     func toggle() { panel.isVisible ? panel.orderOut(nil) : show() }
 
     // MARK: JS bridge

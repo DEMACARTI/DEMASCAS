@@ -73,11 +73,7 @@ PY
 echo ""
 echo "━━ 4/5  App ━━"
 if [ "$OS" = "Darwin" ]; then
-    if pgrep -x DEMASCAS >/dev/null; then
-        echo "  DEMASCAS is running — quit it from the menu bar, then run ./install.sh again to update the app."
-    else
-        ./scripts/build_app.sh
-    fi
+    ./scripts/build_app.sh --no-open      # quits a running copy, installs in /Applications
 else
     mkdir -p "$HOME/.local/share/applications"
     cat > "$HOME/.local/share/applications/demascas.desktop" <<DESK
